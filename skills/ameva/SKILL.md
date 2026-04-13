@@ -1,6 +1,6 @@
 ---
 name: ameva
-description: "Ameva (Iter 36) — Entity에 Corpus Registry를 추가한 도메인 전문가 계층. 등록된 도메인(WTP/VALUE GAP/L1-L5, viral growth/K-factor, SaaS monetization/pricing)에 대해 논문급 grounding을 보장: 모든 주장에 [GROUNDED:doc_id] 필수, 12-check Quality Gate, dual-corpus cross-domain mode (P5), corpus-agnostic L2 pass-through (P6), draft corpus status guard (P7), CRAG-lite heuristic retrieval check (P8), multi-turn routing continuity (P9), MoA L2 explicit aggregation (P10), SELF-RAG [IsUse]+multi-doc grounding (P11), corpus-aware template routing (P12), evidence grade draft-downgrade (P13), corpus sycophancy 전 모드 주입 (P14), Generic Fallback 3단계 템플릿+intensity markers+closure (P15). 미등록 도메인은 entity fallback + Auto-Corpus Builder 자동 트리거. /entity가 일반 추론이면 /ameva는 도메인 전문가 — grounding 없는 도메인 질문엔 entity, corpus 기반 검증이 필요하면 ameva."
+description: "Ameva (Iter 37) — Entity에 Corpus Registry를 추가한 도메인 전문가 계층. 등록된 도메인(WTP/VALUE GAP/L1-L5, viral growth/K-factor, SaaS monetization/pricing)에 대해 논문급 grounding을 보장: 모든 주장에 [GROUNDED:doc_id] 필수, 12-check Quality Gate, dual-corpus cross-domain mode (P5), corpus-agnostic L2 pass-through (P6), draft corpus status guard (P7), CRAG-lite heuristic retrieval check (P8), multi-turn routing continuity (P9), MoA L2 explicit aggregation (P10), SELF-RAG [IsUse]+multi-doc grounding (P11), corpus-aware template routing (P12), evidence grade draft-downgrade (P13), corpus sycophancy 전 모드 주입 (P14), Generic Fallback 3단계 템플릿+intensity markers+closure (P15), corpus-agnostic deprecated 주장 체크 — deprecated_claims 필드 기반 Stage 1.5 Step C + Quality Gate (P16). 미등록 도메인은 entity fallback + Auto-Corpus Builder 자동 트리거. /entity가 일반 추론이면 /ameva는 도메인 전문가 — grounding 없는 도메인 질문엔 entity, corpus 기반 검증이 필요하면 ameva."
 condition: "사용자가 Corpus Registry에 등록된 도메인 질문을 할 때 (현재: WTP/VALUE GAP/L1-L5/Career Mirror, viral growth/K-factor, SaaS/AI monetization/pricing). 미등록 도메인은 entity 모드로 실행 + miss 카운터 증가 → ≥1회 시 Auto-Corpus Builder 자동 트리거. Corpus Router: primary trigger 매칭 → confidence-scored; related_domain 매칭 → confidence=0.30 + context modifier filter; no-match → entity fallback."
 termination: "모든 핵심 주장에 [GROUNDED:doc_id] 또는 [UNCERTAIN+검증방법] 태그 부여 완료 AND active_corpus.scope_gate 통과 AND Outward Profile (user_domain_knowledge 포함) 적용 완료 AND Stage 2 Q0+corpus.sycophancy_checks 실행 완료 AND Pre-output Quality Gate 12개 체크 통과 (product-scope WARN + dual-corpus: [X-GROUNDED] 태그 + primary-secondary 모순 검사 포함)"
 status: stable
@@ -1508,9 +1508,16 @@ For each domain claim in draft:
     YES → 태그 추가 [GROUNDED: doc_id] + Draft 수정
     NO  → [UNCERTAIN] 태그로 교체 + 검증 방법 병기
 
-  Step C: 도메인 팩트가 v1 폐기 주장인가?
-    "직장인 L5 WTP 낮다" → v2 기준으로 교체 [T2]
-    "Social_Amplifier 순수 곱셈" → v2 재정의로 교체 [T2]
+  Step C: 도메인 팩트가 corpus의 deprecated 주장인가? **(P16: corpus-agnostic 버전)**
+    if active_corpus has `deprecated_claims` field:
+        for claim in active_corpus.deprecated_claims:
+            draft에 해당 표현 있으면 → 최신 버전으로 교체 + [ANTI-PATTERN: deprecated] 태그
+    elif active_corpus.name == "wtp":
+        # WTP 전용 하위 호환 (deprecated_claims 필드 없는 legacy corpus용)
+        "직장인 L5 WTP 낮다" → v2 기준으로 교체 [T2]
+        "Social_Amplifier 순수 곱셈" → v2 재정의로 교체 [T2]
+    else:
+        # 다른 corpus: deprecated 정의 없음 → Step C skip
 
 결과: Stage 2 Adversarial 진입 시 모든 도메인 팩트에 grounding 태그 보장
 ```
@@ -1976,10 +1983,15 @@ Stage 3 Deliver 진입 전, ALL 체크 통과 필수.
   PASS → 계속
   FAIL → repair: 각 [UNCERTAIN] 뒤에 검증 방법 추가. 형식: "→ 검증: {방법}" (예: BDM 경매 N≥200, D1 13문항 인터뷰)
 
-□ v1 폐기 주장 없음?
-  PASS → 계속
-  FAIL → repair: "직장인 L5 WTP 낮다" → "[ANTI-PATTERN: v1 폐기] ICP = identity portability [T2]"로 교체
-         "Social_Amplifier 순수 곱셈" → "[ANTI-PATTERN: v1 폐기] Social_Amplifier = 신호 전달 계수 [T2]"로 교체
+□ deprecated 주장 없음? **(P16: corpus-agnostic)**
+  조건: active_corpus.deprecated_claims 필드 또는 active_corpus.name=="wtp" 일 때만 실행
+  active_corpus.name=="wtp":
+    FAIL → repair: "직장인 L5 WTP 낮다" → "[ANTI-PATTERN: v1 폐기] ICP = identity portability [T2]"로 교체
+           "Social_Amplifier 순수 곱셈" → "[ANTI-PATTERN: v1 폐기] Social_Amplifier = 신호 전달 계수 [T2]"로 교체
+  active_corpus has deprecated_claims:
+    FAIL → repair: deprecated_claims 목록의 표현을 최신 버전으로 교체 + [ANTI-PATTERN: deprecated] 태그
+  else (wtp 아닌 corpus, deprecated_claims 없음):
+    → 이 체크 skip (해당 없음)
 
 □ Stage 2 Adversarial Q0 + sycophancy checklist 실행? ([PASS/FLAGGED] 증거 있음?)
   PASS → 계속
