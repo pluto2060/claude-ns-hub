@@ -41,9 +41,11 @@ fi
 
 # Try to open browser (best-effort, no error if headless)
 URL="http://127.0.0.1:$PORT"
-if command -v xdg-open >/dev/null 2>&1; then xdg-open "$URL" >/dev/null 2>&1 || true
+WSL_EXPLORER="/mnt/c/Windows/explorer.exe"
+if command -v wslview    >/dev/null 2>&1; then wslview    "$URL" >/dev/null 2>&1 || true
+elif [[ -x "$WSL_EXPLORER" ]];              then "$WSL_EXPLORER" "$URL" >/dev/null 2>&1 || true
+elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$URL" >/dev/null 2>&1 || true
 elif command -v open       >/dev/null 2>&1; then open       "$URL" >/dev/null 2>&1 || true
-elif command -v wslview    >/dev/null 2>&1; then wslview    "$URL" >/dev/null 2>&1 || true
 fi
 
 echo "Logs: $LOG    Stop: ctx-stop   (or: kill \$(cat $PIDFILE))"
