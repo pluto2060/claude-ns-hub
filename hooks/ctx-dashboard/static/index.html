@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CTX Dashboard</title>
+<link rel="icon" href="data:," />
+<link rel="stylesheet" href="/static/styles.css" />
+<!-- uPlot for time-series (tiny, ~40KB) -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css" />
+<script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="dot pulse"></span>
+    <span class="title">CTX Telemetry</span>
+    <span class="sub" id="meta">—</span>
+  </div>
+  <div class="grade" id="grade">—</div>
+  <div class="updated">
+    <span id="updated">—</span>
+    <span class="window" id="window">7d</span>
+  </div>
+</header>
+
+<main>
+  <section class="panel" id="health-panel">
+    <h2>System Health</h2>
+    <div class="rows" id="health-rows"></div>
+  </section>
+
+  <section class="panel" id="activity-panel">
+    <h2>Activity <span class="hint">events / minute (last 2h)</span></h2>
+    <div id="activity-chart"></div>
+  </section>
+
+  <section class="panel" id="latency-panel">
+    <h2>Latency distribution <span class="hint">bm25-memory hook</span></h2>
+    <div class="bars" id="latency-bars"></div>
+  </section>
+
+  <section class="panel" id="notices-panel">
+    <h2>Quality notices <span class="hint">rate-based, informational</span></h2>
+    <div id="notices"></div>
+  </section>
+
+  <section class="panel" id="other-panel">
+    <h2>Other signals</h2>
+    <div class="pills" id="other"></div>
+  </section>
+
+  <section class="panel wide" id="events-panel">
+    <h2>Recent events <span class="hint">newest first, last 30</span></h2>
+    <div class="events" id="events"></div>
+  </section>
+</main>
+
+<footer>
+  <span id="thresholds">—</span>
+  <span class="right">connected: <span id="conn-status" class="conn ok">live</span></span>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
