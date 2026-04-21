@@ -357,6 +357,7 @@ main {
 .sample .q .util.mid     { color: var(--yellow); border-color: var(--yellow); background: var(--yellow-soft); }
 .sample .q .util.low     { color: var(--red);    border-color: var(--red);    background: var(--red-soft); }
 .sample .q .util.pending { color: var(--text-dim); border-color: var(--panel-border); background: transparent; }
+.sample .q .util-ratio { font-weight: 400; opacity: 0.75; letter-spacing: 0; margin-left: 2px; }
 
 /* Legend chip (in Function Proof panel note) */
 .legend-note {

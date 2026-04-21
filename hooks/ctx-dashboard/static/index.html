@@ -95,9 +95,11 @@
       <span class="util-chip low">&lt;25%</span>
       <span class="util-chip pending">—</span>
       <span class="legend-sub">
-        = share of injected items that appeared in Claude's actual response.
-        <b>—</b> means the response hasn't been persisted to vault.db yet (persists on Stop hook, usually ~30s after the reply finishes);
-        refresh once the reply is complete and the score will fill in. CM entries are project-scoped history — they are NOT this prompt's reply.
+        = how much of what CTX <em>surfaced</em> was actually <em>used</em> in Claude's response.
+        Blocks below show what CTX surfaced into context. A <b>filled block with 0% utility</b> = CTX injected items
+        but Claude didn't reference them — honest signal, not a bug; usually means the prompt was about a different topic than what BM25 matched.
+        <b>—</b> = the reply isn't persisted yet (lands on Stop hook ~30s after the turn); score fills in on next refresh.
+        CM entries are project-scoped <em>history</em>, not this prompt's reply.
       </span>
     </div>
     <div id="samples"></div>

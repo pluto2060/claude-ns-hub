@@ -328,9 +328,11 @@ function renderSamples(samples) {
     if (p.utility) {
       const pct = Math.round(p.utility.rate * 100);
       const cls = pct >= 50 ? "ok" : (pct >= 25 ? "mid" : "low");
-      score = `<span class="util ${cls}" title="${esc(p.utility.referenced)}/${esc(p.utility.total)} items referenced in Claude's response">utility ${pct}%</span>`;
+      // Always show ratio inline so "0% with filled blocks" makes sense at a glance —
+      // it means CTX surfaced N items but Claude referenced none of them.
+      score = `<span class="util ${cls}" title="${esc(p.utility.referenced)} of ${esc(p.utility.total)} injected items were referenced in Claude's response. Filled blocks below show what was surfaced; this pill shows what was actually used.">utility ${pct}% <span class="util-ratio">(${esc(p.utility.referenced)}/${esc(p.utility.total)})</span></span>`;
     } else if (p.has_response === false) {
-      score = `<span class="util pending" title="No assistant response yet">utility —</span>`;
+      score = `<span class="util pending" title="Assistant response not yet persisted — score will appear once the reply lands">utility —</span>`;
     }
     return `
       <div class="sample">
