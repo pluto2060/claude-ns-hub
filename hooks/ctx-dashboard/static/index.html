@@ -27,7 +27,7 @@ main{display:grid;grid-template-columns:1.4fr 1fr;gap:14px;padding:20px 24px;max
 .panel.wide{grid-column:1/-1}
 .panel h2{margin:0 0 14px;font-family:var(--serif);font-size:17px;font-weight:500;color:var(--text)}
 </style>
-<link rel="stylesheet" href="/static/styles.css" />
+<link rel="stylesheet" href="/static/styles.css?v=mobile9" />
 <!-- uPlot for time-series (tiny, ~40KB) -->
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css" />
 <script defer src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
@@ -51,8 +51,10 @@ main{display:grid;grid-template-columns:1.4fr 1fr;gap:14px;padding:20px 24px;max
       <span class="lang-sep">|</span>
       <span class="lang-seg" data-lang="ko">KO</span>
     </button>
+    <button id="theme-toggle" onclick="(function(){const d=document.documentElement,dk=d.getAttribute('data-theme')==='dark';d.setAttribute('data-theme',dk?'light':'dark');localStorage.setItem('hub-theme',dk?'light':'dark');})()" title="Toggle dark mode" style="background:none;border:1px solid var(--panel-border);border-radius:4px;padding:2px 7px;font-size:13px;cursor:pointer;color:var(--text-dim);margin-left:6px">◑</button>
   </div>
 </header>
+<script>(function(){const s=localStorage.getItem('hub-theme');if(s==='dark'||(s==null&&matchMedia('(prefers-color-scheme:dark)').matches))document.documentElement.setAttribute('data-theme','dark')})();</script>
 
 <div id="wow-banner" class="wow-banner" style="display:none"></div>
 

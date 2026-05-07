@@ -26,6 +26,16 @@
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Roboto, sans-serif;
   --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
+[data-theme="dark"] {
+  --bg: #181614; --bg-deep: #111009; --panel: #222019; --panel-border: #333028;
+  --panel-soft: #1e1c1a; --text: #e8e0d6; --text-soft: #b0a89e; --text-dim: #6b6358;
+  --accent: #cc785c; --accent-deep: #e8926e; --accent-soft: #2a1e17;
+  --green: #4caf78; --green-soft: #0e2318;
+  --yellow: #d4a017; --yellow-soft: #1e1800;
+  --red: #e05252; --red-soft: #250e0e;
+  --cyan: #5b9bd5; --purple: #a57cc7;
+  --graph-bg: #111009;
+}
 
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; }
@@ -147,6 +157,7 @@ main {
   box-shadow: 0 1px 2px rgba(31,28,26,0.03);
 }
 .panel.wide { grid-column: 1 / -1; }
+#retrieval-method-panel, #status-panel { align-self: start; }
 .panel h2 {
   margin: 0 0 14px;
   font-family: var(--serif);
@@ -579,11 +590,32 @@ main {
   margin-bottom: 14px;
   font-size: 12px;
   color: var(--text-soft);
-  line-height: 1.65;
+  line-height: 1.5;
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  flex-wrap: wrap;
 }
-.legend-note strong { color: var(--text); font-family: var(--serif); font-weight: 500; }
+.legend-note strong {
+  color: var(--text); font-family: var(--serif); font-weight: 500;
+  white-space: nowrap; margin-right: 4px; flex-shrink: 0;
+}
 .legend-note b { color: var(--text); font-weight: 600; }
-.legend-note .legend-sub { display: block; margin-top: 6px; color: var(--text-dim); }
+.legend-note .legend-chips {
+  display: flex; align-items: center; gap: 4px; flex-shrink: 0;
+}
+.legend-note .legend-sub {
+  display: none; /* prose replaced by chip tooltips */
+}
+.legend-note .legend-rows {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 3px 10px;
+  align-items: center;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.legend-note .legend-rows .util-chip { margin: 0; }
 .util-chip {
   display: inline-block; margin: 0 3px;
   padding: 2px 10px; border-radius: 12px;
@@ -645,6 +677,7 @@ main {
 }
 .block.cm .name .tag { background: rgba(166,140,190,0.18); color: var(--purple); }
 .block.empty .items  { color: var(--text-dim); font-style: italic; }
+.empty-block { color: var(--text-dim); font-style: italic; font-size: 0.9em; }
 .block .cm-entry { padding: 3px 0; border-top: 1px solid var(--panel-border); }
 .block .cm-entry:first-child { border-top: 0; }
 .block .cm-entry .who { color: var(--purple); font-size: 10px; margin-right: 6px; font-weight: 500; }
@@ -669,4 +702,180 @@ footer {
 
 @media (max-width: 900px) {
   main { grid-template-columns: 1fr; }
+}
+
+/* ── Mobile (≤640px) ─────────────────────────────────── */
+@media (max-width: 640px) {
+  /* Fix grid min-content overflow */
+  main { overflow-x: hidden; }
+  main > * { min-width: 0; }
+  .panel { min-width: 0; overflow: hidden; }
+  /* Allow .events to scroll horizontally — don't clip it */
+  .panel:has(.events) { overflow: visible; }
+  .panel > *:not(.events) { min-width: 0; overflow: hidden; }
+  canvas { max-width: 100% !important; }
+
+  /* ── Graph nav (prompt navigator) — keep single horizontal row ── */
+  .graph-nav {
+    flex-wrap: nowrap; gap: 5px;
+    padding: 6px 8px; overflow: hidden;
+  }
+  .graph-nav .nav-label {
+    min-width: 0;          /* remove 200px floor */
+    flex: 1;               /* fill remaining space */
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+  }
+  .graph-nav .nav-btn { padding: 3px 7px; font-size: 11px; flex-shrink: 0; }
+  /* Hide signal toggle on mobile to save space */
+  .graph-nav .signal-toggle { display: none; }
+
+  /* ── Panel h2 header (title + hint + stats) ── */
+  .panel h2 {
+    flex-wrap: wrap;
+    gap: 4px;
+    font-size: 15px;
+  }
+  /* hint spans inside h2 go to their own line */
+  .panel h2 .hint {
+    flex: 1 1 100%;   /* take full row */
+    font-size: 11px;
+    line-height: 1.5;
+    word-break: break-word;
+    min-width: 0;
+  }
+  /* stats span (hint right) — remove margin-left auto, stack below */
+  .panel h2 .hint.right {
+    margin-left: 0 !important;
+    flex: 1 1 100%;
+  }
+  /* refresh button stays compact */
+  .panel h2 .btn-small { flex-shrink: 0; font-size: 10px; padding: 2px 7px; }
+
+  /* Updated / grade / sub text in panel headers */
+  .updated { flex-wrap: wrap; gap: 6px; font-size: 11px; }
+  .sub { font-size: 11px; word-break: break-word; }
+
+  /* ── Prevent any text node from causing horizontal scroll ── */
+  .panel, .panel * {
+    max-width: 100%;
+    overflow-wrap: break-word;
+    word-break: break-word;
+  }
+
+  header { padding: 12px 16px; flex-wrap: wrap; gap: 8px; }
+  .brand { gap: 8px; }
+  .brand .title { font-size: 16px; }
+  .brand .sub { font-size: 11px; }
+  .header-right { flex-wrap: wrap; gap: 6px; font-size: 11px; }
+
+  main {
+    grid-template-columns: 1fr;
+    gap: 10px;
+    padding: 12px 14px;
+  }
+
+  /* Panels: reduce padding */
+  .panel { padding: 14px 14px; }
+  .panel h2 { font-size: 15px; margin-bottom: 10px; }
+
+  /* ── Main .row grid ── */
+  /* Desktop: 120px label | bar | 90px value | 16px sym | msg */
+  /* Mobile: label | bar | value — prevent vertical text wrap */
+  .row {
+    grid-template-columns: 90px 1fr 80px 14px;
+    gap: 5px; font-size: 11px;
+  }
+  .row .value { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .msg   { display: none; }   /* hide verbose message on mobile */
+  .row .sym   { font-size: 12px; }
+
+  /* Notice rows */
+  .notice { grid-template-columns: 14px 60px 1fr; gap: 6px; font-size: 11px; }
+
+  /* Blocks (chat memory, G1, G2) */
+  .blocks { grid-template-columns: 1fr; }
+
+  /* Panel tabs: horizontal scroll */
+  .panel-tabs { overflow-x: auto; -webkit-overflow-scrolling: touch; flex-wrap: nowrap; }
+  .panel-tab  { white-space: nowrap; padding: 6px 10px; font-size: 11px; }
+
+  /* Graph panel */
+  #graph-panel { min-height: 280px; }
+
+  /* Utility body rows — same columns as .row */
+  #utility-body .row {
+    grid-template-columns: 90px 1fr 80px 14px;
+    gap: 5px; font-size: 11px;
+  }
+  #utility-body .row .value { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #utility-body .row .count { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* Ensure no grid cell wraps text vertically */
+  .row > * { min-width: 0; white-space: nowrap; overflow: hidden; }
+  .row .bar { overflow: hidden; flex-shrink: 1; }
+
+  /* ── Recent events: horizontal scroll (preserve column layout) ── */
+  .events {
+    overflow-x: auto !important;
+    -webkit-overflow-scrolling: touch;
+    overflow-y: auto !important;
+  }
+  .events .ev {
+    grid-template-columns: 60px 120px 100px 100px 55px;
+    gap: 5px; padding: 4px 6px; font-size: 11px;
+  }
+  .events .ev > * {
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
+  }
+
+  /* ── Block entries (cm-entry, hook_invoked, etc.) ── */
+  .block .cm-entry {
+    white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; display: block; font-size: 11px;
+  }
+  .block .cm-entry .who { display: inline; }
+  .block .items .it {
+    white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; font-size: 11px;
+  }
+  .block .name { white-space: nowrap; overflow: hidden; }
+  .block .name .tag { flex-shrink: 0; white-space: nowrap; }
+
+  /* ── Sample prompt text (hook_invoked query display) ── */
+  .sample .q .prompt {
+    white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; display: block;
+    font-size: 13px;
+  }
+  .sample .q { margin-bottom: 6px; padding-bottom: 6px; }
+
+  /* ── Legend-rows descriptions (per-prompt utility pill) ── */
+  /* grid: auto(chip) | 1fr(text) — keep text single line */
+  .legend-note .legend-rows {
+    grid-template-columns: auto 1fr;
+  }
+  .legend-note .legend-rows > span:not(.util-chip) {
+    white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; min-width: 0;
+  }
+
+  /* Wide panels: single column */
+  .panel.wide { grid-column: 1; }
+
+  /* Footer */
+  footer { padding: 10px 14px; font-size: 10px; flex-direction: column; gap: 4px; }
+
+  /* Header right */
+  .header-right .lang-btn { padding: 3px 7px; font-size: 10px; }
+}
+
+/* ── Small phone (≤380px) ─────────────────────────────── */
+@media (max-width: 380px) {
+  header { padding: 10px 12px; }
+  main { padding: 10px; gap: 8px; }
+  .panel { padding: 12px 12px; }
+  .bars .b { grid-template-columns: 60px 1fr 40px; }
 }

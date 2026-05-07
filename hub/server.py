@@ -879,6 +879,22 @@ async def terminal_session(websocket: WebSocket, proj_id: str):
     await asyncio.gather(pty_to_ws(), ws_to_pty())
 
 
+@app.get("/api/northstar/sessions")
+async def ns_sessions():
+    """Return terminal session status for all projects."""
+    result = {}
+    now = time.time()
+    for proj_id, proc in list(_sessions.items()):
+        if not proc.isalive():
+            result[proj_id] = "dead"
+        elif proj_id in _session_idle_since:
+            idle_secs = int(now - _session_idle_since[proj_id])
+            result[proj_id] = f"idle:{idle_secs}"
+        else:
+            result[proj_id] = "active"
+    return JSONResponse(result)
+
+
 @app.get("/health/{service}")
 async def health(service: str):
     if service in ("northstar", "market-signals"):

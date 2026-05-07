@@ -21,6 +21,14 @@
   --mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
   --nav-h: 50px;
 }
+[data-theme="dark"] {
+  --bg: #181614; --bg-deep: #111009; --panel: #222019; --panel-border: #333028;
+  --panel-soft: #1e1c1a; --text: #e8e0d6; --text-soft: #b0a89e; --text-dim: #6b6358;
+  --accent: #cc785c; --accent-deep: #e8926e; --accent-soft: #2a1e17;
+  --green: #4caf78; --green-soft: #0e2318;
+  --red: #e05252; --red-soft: #250e0e;
+  --yellow: #d4a017;
+}
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { height: 100%; overflow: hidden; }
 body { background: var(--bg); color: var(--text-soft); font: 14px/1.55 var(--sans);
@@ -74,8 +82,29 @@ nav {
 }
 .open-btn:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
 .open-btn svg { opacity: 0.6; }
+.open-label { }
 .clock { font-family: var(--mono); font-size: 11px; color: var(--text-dim);
   letter-spacing: 0.02em; }
+
+/* ── Mobile responsive ── */
+@media (max-width: 600px) {
+  :root { --nav-h: 44px; }
+  .brand { padding-right: 14px; margin-right: 2px; }
+  .brand-name { font-size: 15px; }
+  .tab { padding: 0 10px; gap: 5px; }
+  .tab-name { font-size: 13px; }
+  .open-label { display: none; }
+  .clock { display: none; }
+  .open-btn { padding: 4px 7px; }
+  .nav-right { gap: 6px; }
+}
+
+@media (max-width: 420px) {
+  .brand { display: none; }
+  .tab { padding: 0 8px; }
+  .tab-name { font-size: 12px; }
+  .status-dot { width: 5px; height: 5px; }
+}
 
 /* ── Pane container ── */
 .content { height: calc(100vh - var(--nav-h)); position: relative; overflow: hidden; }
@@ -109,6 +138,9 @@ nav {
 }
 .retry-btn:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
 </style>
+<script>
+(function(){const s=localStorage.getItem('hub-theme');if(s==='dark'||(s==null&&matchMedia('(prefers-color-scheme:dark)').matches))document.documentElement.setAttribute('data-theme','dark')})();
+</script>
 </head>
 <body>
 
@@ -138,11 +170,12 @@ nav {
   </div>
 
   <div class="nav-right">
-    <button class="open-btn" id="open-standalone">
+    <button class="open-btn" id="theme-toggle" onclick="(function(){const d=document.documentElement,dk=d.getAttribute('data-theme')==='dark';d.setAttribute('data-theme',dk?'light':'dark');localStorage.setItem('hub-theme',dk?'light':'dark');})()" title="Toggle dark mode" style="padding:0 8px;font-size:13px">◑</button>
+    <button class="open-btn" id="open-standalone" title="Open in new tab">
       <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
         <path d="M1 9L9 1M9 1H4M9 1V6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
       </svg>
-      open
+      <span class="open-label">open</span>
     </button>
     <span class="clock" id="clock">—</span>
   </div>

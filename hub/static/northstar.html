@@ -98,6 +98,16 @@ header {
 /* Table column styles */
 .col-num  { width: 32px; color: var(--text-dim); font-family: var(--mono); font-size: 11px; text-align: right; padding-right: 6px; }
 .col-drag { width: 22px; text-align: center; }
+.col-cat  { width: 72px; font-family: var(--mono); font-size: 10px; }
+.cat-pill { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 10px;
+  font-family: var(--mono); background: var(--panel-soft); border: 1px solid var(--panel-border);
+  color: var(--text-dim); white-space: nowrap; }
+.col-sess { width: 68px; }
+.sess-dot { display: inline-flex; align-items: center; gap: 5px; font-family: var(--mono); font-size: 10px; }
+.sess-indicator { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.sess-active  .sess-indicator { background: var(--green); box-shadow: 0 0 4px var(--green); }
+.sess-idle    .sess-indicator { background: var(--yellow); }
+.sess-none    .sess-indicator { background: var(--panel-border); }
 .drag-handle { cursor: grab; color: var(--text-dim); font-size: 14px; line-height: 1; user-select: none; }
 .drag-handle:active { cursor: grabbing; }
 .col-name { min-width: 110px; }
@@ -642,8 +652,10 @@ header {
           <tr>
             <th class="col-num">#</th>
             <th class="col-drag"></th>
+            <th class="col-cat hide-mobile">Category</th>
             <th>Project</th>
             <th class="col-status">Status</th>
+            <th class="col-sess hide-mobile">Session</th>
             <th class="col-metric hide-mobile">Metric</th>
             <th class="col-progress">Progress</th>
             <th class="col-gap hide-mobile">Gap</th>
@@ -741,6 +753,7 @@ async function loadData() {
     const [projRes, ctxRes] = await Promise.all([
       fetch('/api/northstar'),
       fetch('/api/ctx-pulse').catch(() => ({ json: () => ({ ok: false, topics: [] }) })),
+      refreshSessionStatus(),
     ]);
     projects = await projRes.json();
     const ctxData = await ctxRes.json();
@@ -958,6 +971,26 @@ function rowHtml(p, i) {
 // ── Table render ──────────────────────────────────────────────────────────────
 
 let _rowOrder = null; // persisted drag-drop order
+let _sessionStatus = {}; // proj_id → "active"|"idle:N"|"none"
+
+async function refreshSessionStatus() {
+  try {
+    const r = await fetch('/api/northstar/sessions');
+    _sessionStatus = await r.json();
+  } catch(_) {}
+}
+
+function sessCell(projId) {
+  const s = _sessionStatus[projId];
+  if (!s || s === 'dead') return `<span class="sess-dot sess-none"><span class="sess-indicator"></span>—</span>`;
+  if (s === 'active') return `<span class="sess-dot sess-active"><span class="sess-indicator"></span>live</span>`;
+  if (s.startsWith('idle:')) {
+    const secs = parseInt(s.split(':')[1]);
+    const label = secs < 60 ? `${secs}s` : secs < 3600 ? `${Math.round(secs/60)}m` : `${Math.round(secs/3600)}h`;
+    return `<span class="sess-dot sess-idle"><span class="sess-indicator"></span>${label}</span>`;
+  }
+  return `<span class="sess-dot sess-none"><span class="sess-indicator"></span>—</span>`;
+}
 
 function getRowOrder() {
   if (_rowOrder && _rowOrder.length === projects.length) return _rowOrder;
@@ -1010,13 +1043,18 @@ function render() {
     const lastLog = p.log && p.log.length ? p.log[p.log.length - 1] : null;
     const logDate = lastLog ? (lastLog.date || '').slice(5) : '—';
 
+    const cat = p.category || '';
+    const catHtml = cat ? `<span class="cat-pill">${esc(cat)}</span>` : '<span style="color:var(--text-dim)">—</span>';
+
     return `<tr class="${displayActive}" data-orig-idx="${origIdx}" draggable="true">
       <td class="col-num">${rowNum + 1}</td>
       <td class="col-drag"><span class="drag-handle">⠿</span></td>
+      <td class="col-cat hide-mobile">${catHtml}</td>
       <td class="col-name"><span class="row-name">${esc(p.name)}</span></td>
       <td class="col-status"><span class="status-label ${statusKey}">
         <span class="row-status-dot" style="background:${dotColor}"></span>${STATUS_LABEL[statusKey] || statusKey}
       </span></td>
+      <td class="col-sess hide-mobile">${sessCell(p.id || p.name)}</td>
       <td class="col-metric hide-mobile" title="${esc(p.metric || '')}">${esc((p.metric || '—').substring(0, 26))}</td>
       <td class="col-progress">
         <div class="progress-wrap">
@@ -1759,7 +1797,8 @@ document.getElementById('doc-overlay').addEventListener('click', e => {
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
 loadData();
-setInterval(loadData, 30000);  // refresh every 30s (no SSE needed — static files)
+setInterval(loadData, 30000);
+setInterval(async () => { await refreshSessionStatus(); render(); }, 15000); // session status every 15s
 </script>
 </body>
 </html>
