@@ -1732,8 +1732,9 @@ function render() {
   });
 
   // Apply card alignment + draw connection lines
+  // Double-rAF: first frame triggers layout, second reads final positions
   applyAlign();
-  requestAnimationFrame(() => drawParentLines());
+  requestAnimationFrame(() => requestAnimationFrame(() => drawParentLines()));
 }
 
 // Inline rename in swimlane
@@ -1787,7 +1788,26 @@ function showInlineInput(placeholder, initial, onConfirm) {
 // Compat stubs (called from context menu)
 function fitGraph() {}
 function resetLayout() { render(); }
-function drawConnections() { requestAnimationFrame(() => drawParentLines()); }
+function drawConnections() { requestAnimationFrame(() => requestAnimationFrame(() => drawParentLines())); }
+
+// Redraw lines on scroll (grid-wrap scroll) and resize
+(function() {
+  let _scrollTimer = null, _resizeObs = null;
+  document.addEventListener('DOMContentLoaded', () => {
+    const gw = document.querySelector('.grid-wrap');
+    if (gw) {
+      gw.addEventListener('scroll', () => {
+        clearTimeout(_scrollTimer);
+        _scrollTimer = setTimeout(() => drawParentLines(), 40);
+      }, { passive: true });
+    }
+    _resizeObs = new ResizeObserver(() => {
+      requestAnimationFrame(() => drawParentLines());
+    });
+    const sw = document.getElementById('ns-swimlane');
+    if (sw) _resizeObs.observe(sw);
+  });
+})();
 
 // Get element's position relative to a specific ancestor (ignores scroll/viewport drift)
 function offsetRelTo(el, ancestor) {
