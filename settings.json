@@ -1,6 +1,6 @@
 {
   "env": {
-    "PATH": "/home/jayone/google-cloud-sdk/bin:/home/jayone/.local/bin:/home/jayone/bin:/home/jayone/.nvm/versions/node/v22.19.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "PATH": "/home/desk-1/google-cloud-sdk/bin:/home/desk-1/.local/bin:/home/desk-1/bin:/home/desk-1/.nvm/versions/node/v22.19.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     "BASH_DEFAULT_TIMEOUT_MS": "600000",
     "BASH_MAX_TIMEOUT_MS": "1800000",
     "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "20000",
@@ -10,7 +10,9 @@
     "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-7",
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
     "CLAUDE_REMOTE_NOTIFY_URL": "http://localhost:6789/notify",
-    "CLAUDE_REMOTE_NOTIFY_ONLY": "1"
+    "CLAUDE_REMOTE_NOTIFY_ONLY": "1",
+    "CTX_BGE_ENABLE": "1",
+    "CHAT_MEMORY_EXCLUDED_PROJECTS": "/home/desk-1/Project/Secure:/home/jayone/Project/Secure"
   },
   "permissions": {
     "allow": [
@@ -92,7 +94,7 @@
       "mcp__playwright-session-*__*",
       "mcp__claude-flow__*",
       "Skill(commit)",
-      "Bash(/home/jayone/Project/TSP/.omc/progress.log:*)"
+      "Bash(/home/desk-1/Project/TSP/.omc/progress.log:*)"
     ],
     "deny": [
       "Bash(rm -rf /*)",
@@ -109,9 +111,10 @@
     "ask": [],
     "defaultMode": "dontAsk",
     "additionalDirectories": [
-      "/home/jayone/.claude"
+      "/home/desk-1/.claude"
     ]
   },
+  "model": "sonnet",
   "hooks": {
     "SessionStart": [
       {
@@ -119,12 +122,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'python3 -c \"import socket,os; s=socket.socket(socket.AF_UNIX); s.settimeout(0.3); s.connect(os.path.expanduser(\\\"~/.local/share/claude-vault/vec-daemon.sock\\\"))\" 2>/dev/null || { rm -f $HOME/.local/share/claude-vault/vec-daemon.sock; nohup python3 $HOME/.local/share/claude-vault/vec-daemon.py > /tmp/vec-daemon.log 2>&1 & }'",
+            "command": "bash -c 'VD=$HOME/.local/share/claude-vault; PY=$VD/venv/bin/python; \\\nif [ -x \"$PY\" ] && $PY -c \"import sentence_transformers\" 2>/dev/null; then \\\n  python3 -c \"import socket,os; s=socket.socket(socket.AF_UNIX); s.settimeout(0.3); s.connect(os.path.expanduser(\\\"~/.local/share/claude-vault/vec-daemon.sock\\\"))\" 2>/dev/null || { rm -f $VD/vec-daemon.sock; nohup $PY $VD/vec-daemon.py > /tmp/vec-daemon.log 2>&1 & }; \\\n  if [ \"${CTX_BGE_ENABLE}\" = \"1\" ]; then python3 -c \"import socket,os; s=socket.socket(socket.AF_UNIX); s.settimeout(0.3); s.connect(os.path.expanduser(\\\"~/.local/share/claude-vault/bge-daemon.sock\\\"))\" 2>/dev/null || { rm -f $VD/bge-daemon.sock; nohup $PY $VD/bge-daemon.py > /tmp/bge-daemon.log 2>&1 & }; fi; \\\nelse \\\n  echo \"[CTX] vec-daemon venv not found — semantic layer disabled\" > /tmp/ctx-daemon-hint.txt; \\\nfi'",
             "async": true
           },
           {
             "type": "command",
-            "command": "/home/jayone/.claude/snippets/pw-cdp-start.sh >/dev/null 2>&1",
+            "command": "bash -c '[ -f /tmp/wsl-expose-6901.boot ] || { /home/desk-1/.claude/bin/wsl-expose 6901 > /tmp/wsl-expose-6901.log 2>&1 && touch /tmp/wsl-expose-6901.boot; }'",
             "async": true
           }
         ]
@@ -216,7 +219,7 @@
           },
           {
             "type": "command",
-            "command": "bash $HOME/.claude/hooks/stop-playwright-detect.sh"
+            "command": "python3 $HOME/.claude/hooks/stop-playwright-detect.py"
           },
           {
             "type": "command",
@@ -232,6 +235,16 @@
             "type": "command",
             "command": "python3 $HOME/.claude/hooks/utility-rate.py",
             "async": true
+          },
+          {
+            "type": "command",
+            "command": "/home/desk-1/.local/bin/backup-vault-filtered-gdrive.sh",
+            "async": true
+          },
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/hooks/northstar-session-update.py",
+            "async": true
           }
         ]
       }
@@ -243,6 +256,11 @@
           {
             "type": "command",
             "command": "bash $HOME/.claude/hooks/post-write-doc-index.sh"
+          },
+          {
+            "type": "command",
+            "command": "python3 $HOME/.claude/hooks/northstar-doc-extract.py",
+            "async": true
           }
         ]
       },
@@ -270,7 +288,9 @@
     "feature-dev@claude-plugins-official": true,
     "security-guidance@claude-plugins-official": true,
     "superpowers@claude-plugins-official": true,
-    "claude-mem@thedotmack": false
+    "claude-mem@thedotmack": false,
+    "ctx@jaytoone": true,
+    "vercel@claude-plugins-official": true
   },
   "extraKnownMarketplaces": {
     "claude-plugins-official": {
@@ -284,11 +304,16 @@
         "source": "github",
         "repo": "thedotmack/claude-mem"
       }
+    },
+    "jaytoone": {
+      "source": {
+        "source": "github",
+        "repo": "jaytoone/CTX"
+      }
     }
   },
   "awaySummaryEnabled": false,
   "autoUpdatesChannel": "stable",
   "skipDangerousModePermissionPrompt": true,
-  "mcpServers": {},
-  "model": "sonnet"
+  "mcpServers": {}
 }
