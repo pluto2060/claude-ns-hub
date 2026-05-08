@@ -751,6 +751,14 @@ header {
       </div>
     </div>
 
+    <!-- Inline rename input (replaces prompt() which is blocked in iframe) -->
+    <div id="ns-rename-wrap" style="display:none;position:fixed;z-index:500">
+      <input id="ns-rename-input" type="text"
+        style="background:var(--panel);border:2px solid var(--accent);border-radius:6px;
+               padding:5px 10px;font-family:var(--serif);font-size:13px;font-weight:500;
+               color:var(--text);outline:none;width:160px;box-shadow:0 4px 12px rgba(31,28,26,.18)"/>
+    </div>
+
     <!-- Right-click context menu -->
     <div class="ns-ctx-menu" id="ns-ctx-menu">
       <div class="ns-ctx-item" id="ctx-connect">⟷ Connect from here</div>
@@ -1385,13 +1393,7 @@ function render() {
 
     // Double-click → rename
     _network.on('doubleClick', params => {
-      if (params.nodes.length === 1) {
-        const nodeId = params.nodes[0];
-        const idx = projects.findIndex(p => (p.id||p.name) === nodeId);
-        if (idx < 0) return;
-        const newName = prompt('Rename:', projects[idx].name);
-        if (newName && newName.trim() !== projects[idx].name) commitRenameById(nodeId, newName.trim());
-      }
+      if (params.nodes.length === 1) showRenameInput(params.nodes[0]);
     });
 
     // Right-click → context menu
@@ -1490,10 +1492,7 @@ document.getElementById('ctx-connect').onclick = () => {
 document.getElementById('ctx-rename').onclick = () => {
   if (!_ctxNodeId) return;
   hideCtxMenu();
-  const p = projects.find(x => (x.id||x.name) === _ctxNodeId);
-  const cur = p?.name || _ctxNodeId;
-  const newName = prompt('Rename project:', cur);
-  if (newName && newName.trim() !== cur) commitRenameById(_ctxNodeId, newName.trim());
+  showRenameInput(_ctxNodeId);
 };
 
 document.getElementById('ctx-setpath').onclick = () => {
@@ -1501,24 +1500,39 @@ document.getElementById('ctx-setpath').onclick = () => {
   hideCtxMenu();
   const p = projects.find(x => (x.id||x.name) === _ctxNodeId);
   const cur = p?.repo_path || '';
-  const newPath = prompt('Set directory path for this project:', cur);
-  if (newPath !== null) {
-    fetch(`/api/northstar/${encodeURIComponent(_ctxNodeId)}/layout`, {
+  showInlineInput(`Dir path for ${p?.name||_ctxNodeId}:`, cur, async (val) => {
+    await fetch(`/api/northstar/${encodeURIComponent(_ctxNodeId)}/layout`, {
       method: 'PATCH', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({repo_path: newPath.trim()}),
+      body: JSON.stringify({repo_path: val.trim()}),
     });
-    if (p) p.repo_path = newPath.trim();
-  }
+    if (p) p.repo_path = val.trim();
+  });
 };
 
 document.getElementById('ctx-delete').onclick = async () => {
   if (!_ctxNodeId) return;
   const p = projects.find(x => (x.id||x.name) === _ctxNodeId);
-  const name = p?.name || _ctxNodeId;
-  if (!confirm(`Remove "${name}" from the graph?\n(This deletes ~/.claude/hub/projects/${_ctxNodeId}/north-star.md)`)) return;
+  const nodeId = _ctxNodeId;
   hideCtxMenu();
-  await fetch(`/api/northstar/${encodeURIComponent(_ctxNodeId)}`, { method: 'DELETE' });
-  await loadData();
+  // Show confirmation via the rename input (repurposed as confirm)
+  const wrap = document.getElementById('ns-rename-wrap');
+  const input = document.getElementById('ns-rename-input');
+  input.value = '';
+  input.placeholder = `Type "${p?.name||nodeId}" to confirm delete`;
+  wrap.style.left = '50%'; wrap.style.top = '45%'; wrap.style.transform = 'translate(-50%,-50%)';
+  wrap.style.display = 'block';
+  input.focus();
+  const onKey = async (e) => {
+    if (e.key === 'Escape') { wrap.style.display='none'; wrap.style.transform=''; input.removeEventListener('keydown',onKey); }
+    if (e.key === 'Enter') {
+      wrap.style.display='none'; wrap.style.transform=''; input.removeEventListener('keydown',onKey);
+      if (input.value.trim() === (p?.name||nodeId)) {
+        await fetch(`/api/northstar/${encodeURIComponent(nodeId)}`, { method: 'DELETE' });
+        await loadData();
+      }
+    }
+  };
+  input.addEventListener('keydown', onKey);
 };
 
 // ── Add project modal ─────────────────────────────────────────────────────────
@@ -1543,6 +1557,66 @@ async function submitAddProject() {
 }
 
 function toggleConnectMode() {} // kept for compat — use right-click instead
+
+// ── Inline input (replaces prompt() which is blocked in iframe) ───────────────
+function showRenameInput(nodeId) {
+  const p = projects.find(x => (x.id||x.name) === nodeId);
+  if (!p || !_network) return;
+  // Position input over the node
+  const pos = _network.getPositions([nodeId])[nodeId];
+  if (!pos) return;
+  const dom = _network.canvasToDOM(pos);
+  const wrap = document.getElementById('ns-rename-wrap');
+  const input = document.getElementById('ns-rename-input');
+  input.value = p.name;
+  wrap.style.left = `${dom.x - 80}px`;
+  wrap.style.top  = `${dom.y - 16}px`;
+  wrap.style.display = 'block';
+  input.focus();
+  input.select();
+
+  const finish = async () => {
+    wrap.style.display = 'none';
+    input.removeEventListener('keydown', onKey);
+    input.removeEventListener('blur', finish);
+    const newName = input.value.trim();
+    if (newName && newName !== p.name) await commitRenameById(nodeId, newName);
+  };
+  const onKey = (e) => {
+    if (e.key === 'Enter') finish();
+    if (e.key === 'Escape') { wrap.style.display = 'none'; input.removeEventListener('keydown', onKey); input.removeEventListener('blur', finish); }
+  };
+  input.addEventListener('keydown', onKey);
+  input.addEventListener('blur', finish);
+}
+
+function showInlineInput(label, initial, onConfirm) {
+  const val = window._inlinePrompt ? window._inlinePrompt(label, initial) : initial;
+  // Fallback: simple in-canvas prompt using the rename overlay repurposed
+  const wrap = document.getElementById('ns-rename-wrap');
+  const input = document.getElementById('ns-rename-input');
+  input.value = initial;
+  input.placeholder = label;
+  wrap.style.left = '50%';
+  wrap.style.top = '50%';
+  wrap.style.transform = 'translate(-50%,-50%)';
+  wrap.style.display = 'block';
+  input.focus();
+  input.select();
+  const finish = async () => {
+    wrap.style.display = 'none';
+    wrap.style.transform = '';
+    input.removeEventListener('keydown', onKey);
+    input.removeEventListener('blur', finish);
+    await onConfirm(input.value);
+  };
+  const onKey = (e) => {
+    if (e.key === 'Enter') finish();
+    if (e.key === 'Escape') { wrap.style.display = 'none'; wrap.style.transform = ''; input.removeEventListener('keydown', onKey); input.removeEventListener('blur', finish); }
+  };
+  input.addEventListener('keydown', onKey);
+  input.addEventListener('blur', finish);
+}
 
 function fitGraph() { _network?.fit({ animation: { duration: 400, easingFunction: 'easeInOutQuad' } }); }
 
