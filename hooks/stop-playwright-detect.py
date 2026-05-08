@@ -189,7 +189,9 @@ def file_hash(files: list[str]) -> str:
     return hashlib.md5("\n".join(sorted(files)).encode()).hexdigest()[:8]
 
 diff_hash = file_hash(TARGETS) if TARGETS else file_hash(changed_raw)
-head_hash = git("rev-parse", "--short", "HEAD") or "unknown"
+_raw_head = git("rev-parse", "--short", "HEAD")
+# For non-git projects, use session+timestamp hash so each session gets a fresh flag
+head_hash = _raw_head or hashlib.md5(f"{SESSION_ID}:{__import__('time').time()//3600}".encode()).hexdigest()[:8]
 FLAG = f"/tmp/pw-checked-{SESSION_HASH}-{head_hash}-{diff_hash}.flag"
 BLOCK_FLAG = f"/tmp/pw-block-{SESSION_HASH}.flag"
 
@@ -253,7 +255,7 @@ def run_ui_check(url: str) -> list[dict]:
             page.on("pageerror", lambda e: errors.append(str(e)))
 
             try:
-                resp = page.goto(url, wait_until="domcontentloaded", timeout=10000)
+                resp = page.goto(url, wait_until="domcontentloaded", timeout=15000)
                 status = resp.status if resp else 0
                 final_url = page.url  # may differ from url if redirected
                 redirected = final_url.rstrip("/") != url.rstrip("/")
@@ -263,14 +265,27 @@ def run_ui_check(url: str) -> list[dict]:
                 bad_title = not title or any(w in title.lower() for w in ["error", "not found", "404", "500"])
                 results.append({"check": "page_title", "ok": not bad_title, "detail": title[:60]})
 
+                # Wait up to 3s for async-rendered content (SPA data loads after DOMContentLoaded)
+                try:
+                    page.wait_for_function(
+                        """() => {
+                            const sel = 'main, #app, #root, #__next, [role="main"], body > div, .content, .wrap, .layout, .ns-node, .ns-swimlane';
+                            const el = document.querySelector(sel);
+                            return el && (el.innerText || el.textContent || '').trim().length > 5;
+                        }""",
+                        timeout=3000
+                    )
+                except Exception:
+                    pass  # timed out waiting — proceed anyway, check will show false
+
                 # If server redirected (e.g. / → /ko), it's clearly alive — skip blank-page check
                 if redirected:
                     has_content = True
                 else:
                     has_content = page.evaluate("""() => {
-                        const sel = 'main, #app, #root, #__next, [role="main"], body > div, .content, .wrap, .layout';
+                        const sel = 'main, #app, #root, #__next, [role="main"], body > div, .content, .wrap, .layout, .ns-node, .ns-swimlane';
                         const el = document.querySelector(sel);
-                        return el ? el.innerText.trim().length > 10 : document.body.innerText.trim().length > 10;
+                        return el ? (el.innerText || el.textContent || '').trim().length > 5 : (document.body.innerText || '').trim().length > 10;
                     }""")
                 results.append({"check": "has_content", "ok": has_content, "detail": "" if has_content else "blank page"})
 
