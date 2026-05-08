@@ -1296,10 +1296,12 @@ function buildVisData() {
     const sessDot = _sessionStatus[p.id||p.name] === 'active' ? '● ' : '';
     const label = `${sessDot}${p.name}\n${gapText}${dateStr ? '  '+dateStr : ''}`;
 
+    const layer = Math.min(2, Math.max(0, parseInt(p.layer) || 0));
+
     const node = {
       id: p.id || p.name,
       label,
-      level: Math.min(2, Math.max(0, parseInt(p.layer) || 0)),  // tree level from layer field
+      level: layer,
       color: { background: col.bg, border: col.border,
                highlight: { background: col.bg, border: '#cc785c' },
                hover: { background: col.bg, border: '#cc785c' } },
@@ -1362,14 +1364,15 @@ function render() {
     _visEdges = new vis.DataSet(visEdges);
     const container = document.getElementById('ns-graph-canvas');
     const dark = document.documentElement.getAttribute('data-theme') === 'dark';
-    // Always use hierarchical tree layout — level driven by project.layer (0/1/2)
+    // Use hierarchical for initial layout, then convert to free dragging
+    // This avoids vis-network snapping nodes back after drag
     _network = new vis.Network(container, { nodes: _visNodes, edges: _visEdges }, {
       layout: {
         hierarchical: {
           enabled: true,
           direction: 'UD',
           sortMethod: 'directed',
-          levelSeparation: 130,
+          levelSeparation: 200,  // y spacing = 200 matches _bandCenters delta
           nodeSpacing: 170,
           treeSpacing: 220,
           blockShifting: true,
@@ -1398,7 +1401,7 @@ function render() {
       drawLayerBands(ctx);
     });
 
-    // Tree layout auto-positions — fit to view after initial layout completes
+    // Fit after initial layout
     _network.once('afterDrawing', () => {
       setTimeout(() => _network.fit({ animation: { duration: 300 } }), 80);
     });
@@ -1441,12 +1444,21 @@ function render() {
     });
     container.addEventListener('contextmenu', e => e.preventDefault());
 
-    // Drag end — detect if node crossed into a different layer band
+    // Track drag y-position during drag (before vis snaps back in hierarchical mode)
+    let _dragY = null;
+    _network.on('dragging', params => {
+      if (params.nodes.length) {
+        _dragY = _network.getPositions([params.nodes[0]])[params.nodes[0]]?.y ?? null;
+      }
+    });
+
+    // Drag end — use captured _dragY to detect target band
     _network.on('dragEnd', async params => {
-      if (!params.nodes.length) return;
+      if (!params.nodes.length || _dragY == null) { _dragY = null; return; }
       const nodeId = params.nodes[0];
-      const nodeY = _network.getPositions([nodeId])[nodeId]?.y;
-      if (nodeY == null || Object.keys(_bandCenters).length < 2) return;
+      const nodeY = _dragY;
+      _dragY = null;
+      if (Object.keys(_bandCenters).length < 1) return;
 
       // Find nearest band by y-distance
       let nearest = 0, minDist = Infinity;
@@ -1458,7 +1470,7 @@ function render() {
       const p = projects.find(x => (x.id||x.name) === nodeId);
       if (!p) return;
       const oldLayer = parseInt(p.layer) || 0;
-      if (nearest === oldLayer) return;  // same band — no change
+      if (nearest === oldLayer) return;
 
       // Layer changed — save and rebuild
       await fetch(`/api/northstar/${encodeURIComponent(nodeId)}/layout`, {
@@ -1661,15 +1673,17 @@ function toggleConnectMode() {} // kept for compat — use right-click instead
 function showRenameInput(nodeId) {
   const p = projects.find(x => (x.id||x.name) === nodeId);
   if (!p || !_network) return;
-  // Position input over the node
   const pos = _network.getPositions([nodeId])[nodeId];
   if (!pos) return;
   const dom = _network.canvasToDOM(pos);
+  // canvasToDOM returns coords relative to canvas container, not viewport
+  // For position:fixed we need viewport coords = containerRect + dom offset
+  const containerRect = document.getElementById('ns-graph-canvas').getBoundingClientRect();
   const wrap = document.getElementById('ns-rename-wrap');
   const input = document.getElementById('ns-rename-input');
   input.value = p.name;
-  wrap.style.left = `${dom.x - 80}px`;
-  wrap.style.top  = `${dom.y - 16}px`;
+  wrap.style.left = `${containerRect.left + dom.x - 80}px`;
+  wrap.style.top  = `${containerRect.top + dom.y - 16}px`;
   wrap.style.display = 'block';
   input.focus();
   input.select();
@@ -1789,21 +1803,10 @@ function drawLayerBands(ctx) {
     const midY = ys.reduce((a, b) => a + b, 0) / ys.length;
     _bandCenters[lvl] = midY;  // store for drag-drop detection
 
-    // Band in canvas-space (very wide)
+    // Band background only (no text labels — user removed them)
     ctx.save();
     ctx.fillStyle = colors[lvl];
     ctx.fillRect(-10000, midY - BAND_HALF, 20000, BAND_HALF * 2);
-    ctx.restore();
-
-    // Label in screen-space (reset transform) so it always appears at left edge
-    const domMid = _network.canvasToDOM({ x: 0, y: midY });
-    ctx.save();
-    ctx.setTransform(1, 0, 0, 1, 0, 0); // screen space
-    ctx.font = 'bold 9px "JetBrains Mono", monospace';
-    ctx.fillStyle = textColor;
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(LAYER_LABELS[lvl].toUpperCase(), 8, domMid.y);
     ctx.restore();
   });
 }
