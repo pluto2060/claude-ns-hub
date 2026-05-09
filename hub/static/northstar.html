@@ -399,7 +399,7 @@ header {
 .gauge-wrap { display: flex; align-items: flex-end; gap: 14px; margin-bottom: 14px; }
 .gauge-svg-wrap { flex-shrink: 0; }
 .gauge-svg { display: block; }
-.gauge-track { fill: none; stroke: var(--bg-deep); stroke-width: 11; stroke-linecap: butt; }
+.gauge-track { fill: none; stroke: var(--bg-deep); stroke-width: 11; stroke-linecap: round; }
 .gauge-fill  { fill: none; stroke-width: 11; stroke-linecap: round; transition: stroke-dasharray .6s ease; }
 .gauge-center-text { font-family: var(--serif); }
 .gauge-value { font-size: 13px; font-weight: 500; fill: var(--text); }
@@ -1433,7 +1433,7 @@ function renderMilestoneCreator(projId, milestones) {
     .nt-del { opacity:0; transition:opacity .1s; background:none; border:none; cursor:pointer;
       color:var(--text-dim); font-size:11px; padding:0 2px; }
     .nt-del:hover { color:var(--red); }
-    .nt-sub-wrap { margin-left:30px; border-left:2px solid var(--panel-border); padding-left:8px; padding-bottom:2px; }
+    .nt-sub-wrap { margin-left:24px; border-left:2px solid var(--panel-border); padding-left:10px; padding-bottom:4px; margin-top:2px; }
     .nt-sub-row { display:flex; align-items:flex-start; gap:5px; padding:5px 4px; border-radius:3px; transition:background .08s; margin-bottom:1px; }
     .nt-sub-row:hover { background:var(--panel-soft); }
     .nt-sub-row:hover .nt-del { opacity:1; }
@@ -1442,8 +1442,14 @@ function renderMilestoneCreator(projId, milestones) {
     .nt-add { font-family:var(--mono); font-size:10px; color:var(--text-dim); background:none; border:none;
       cursor:pointer; padding:3px 6px; border-radius:3px; transition:background .08s; }
     .nt-add:hover { background:var(--panel-soft); color:var(--accent); }
+    /* Layer labels for milestone tree */
+    .nt-layer-label { font-family:var(--mono); font-size:9px; color:var(--text-dim); letter-spacing:.06em;
+      text-transform:uppercase; padding:8px 0 3px; margin-left:2px; opacity:.7; display:block; }
+    .nt-layer-label:first-child { padding-top:2px; }
+    .nt-new-badge { font-size:9px; color:var(--accent); margin-left:3px; cursor:default; }
   </style>
   <div>
+    ${l0.length > 0 ? `<span class="nt-layer-label">L0 · Strategic</span>` : ''}
     ${l0.map((m, idx) => {
       const children = l1.filter(c => c.parent_id === m.id);
       // 3-state: pending / queued / done
@@ -1506,7 +1512,7 @@ function renderMilestoneCreator(projId, milestones) {
       }).join('');
 
       const subHtml = isOpen && children.length
-        ? `<div class="nt-sub-wrap" onclick="event.stopPropagation()">${childrenHtml}<button class="nt-add" onclick="event.stopPropagation();addMilestone('${esc(projId)}',1,'${esc(m.id)}')">+ sub</button></div>`
+        ? `<div class="nt-sub-wrap" onclick="event.stopPropagation()"><span class="nt-layer-label" style="padding-top:2px">L1 · Tactical</span>${childrenHtml}<button class="nt-add" onclick="event.stopPropagation();addMilestone('${esc(projId)}',1,'${esc(m.id)}')">+ sub</button></div>`
         : '';
 
       // State button: user cannot change state — Claude manages all transitions automatically
@@ -2561,6 +2567,27 @@ function openTerminal(projId) {
       document.addEventListener('mousemove', onMove);
       document.addEventListener('mouseup', onUp);
     });
+    // Touch support for mobile resize
+    _resizeHandle.addEventListener('touchstart', te => {
+      te.preventDefault();
+      const t0 = te.touches[0];
+      const startX = t0.clientX, startY = t0.clientY;
+      const startW = _floatEl.offsetWidth, startH = _floatEl.offsetHeight;
+      const onTMove = tme => {
+        const t = tme.touches[0];
+        const nw = Math.max(280, Math.min(window.innerWidth * 0.95, startW + t.clientX - startX));
+        const nh = Math.max(160, Math.min(window.innerHeight * 0.88, startH + t.clientY - startY));
+        _floatEl.style.width = nw + 'px'; _floatEl.style.height = nh + 'px';
+        if (_termFitAddon) _termFitAddon.fit();
+      };
+      const onTEnd = () => {
+        document.removeEventListener('touchmove', onTMove);
+        document.removeEventListener('touchend', onTEnd);
+        localStorage.setItem('ns-term-size', JSON.stringify({w: _floatEl.style.width, h: _floatEl.style.height}));
+      };
+      document.addEventListener('touchmove', onTMove, {passive: false});
+      document.addEventListener('touchend', onTEnd);
+    }, {passive: false});
   }
 
   // Right-click paste + auto-copy on select
@@ -2860,17 +2887,8 @@ function renderRight(p, topics, docData) {
     </div>`
   ).join('') || `<div style="font-size:11px;color:var(--text-dim);font-family:var(--mono)">CTX offline or no activity</div>`;
 
-  // Right panel: CTX activity + quick actions only (milestones moved to left panel)
+  // Right panel: quick actions + note (CTX live work removed — visible in CTX tab)
   document.getElementById('dm-right').innerHTML = `
-
-    <!-- Current work from CTX -->
-    <div class="dm-section">
-      <div class="dm-section-label">
-        <span class="live-dot"></span>
-        Live work (CTX)
-      </div>
-      <div class="ctx-strip">${topicsHtml}</div>
-    </div>
 
     <!-- Quick actions -->
     <div class="dm-section">
