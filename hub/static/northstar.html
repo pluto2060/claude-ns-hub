@@ -3074,13 +3074,19 @@ function renderHierarchy(p) {
         <div class="dm-layer-icon ms" title="Milestones">◎</div>
         <span class="dm-layer-title">Milestones</span>
         <span class="dm-layer-count" id="dm-ms-ack-badge"></span>
-        <!-- sync removed: Claude manages milestones automatically -->
       </div>
       <div id="dm-ms-save-status" style="font-size:10px;color:var(--text-dim);font-family:var(--mono)"></div>
       <div id="dm-ms-creator" style="font-size:12px;font-family:var(--mono);color:var(--text-dim)">Loading…</div>
       <div style="margin-top:8px">
         <button class="dm-btn" style="font-size:11px" onclick="addMilestone('${esc(p.id)}', 0, null)">+ milestone</button>
       </div>
+    </div>
+
+    <!-- Bottom row: Spec doc link + Note -->
+    <div id="dm-bottom-row" style="display:flex;align-items:flex-start;gap:12px;margin-top:4px;padding-top:8px;border-top:1px solid var(--panel-border)">
+      <!-- Spec doc button injected by renderRight -->
+      <div id="dm-spec-slot" style="flex-shrink:0"></div>
+      ${p.note ? `<div style="flex:1;font-size:11px;color:var(--text-dim);line-height:1.5;font-style:italic">${esc(p.note)}</div>` : ''}
     </div>
   `;
 }
@@ -3177,33 +3183,27 @@ function renderRight(p, topics, docData) {
     </div>`
   ).join('') || `<div style="font-size:11px;color:var(--text-dim);font-family:var(--mono)">CTX offline or no activity</div>`;
 
-  // Right panel: quick actions + note (CTX live work removed — visible in CTX tab)
+  // Inject spec doc button into left panel bottom slot
+  const specSlot = document.getElementById('dm-spec-slot');
+  if (specSlot) {
+    specSlot.innerHTML = docData?.ok
+      ? `<button class="dm-btn" onclick="openDoc('${esc(p.id)}', '${esc(docData.path)}')">◈ Spec doc</button>`
+      : `<button class="dm-btn" style="opacity:.35;pointer-events:none;font-size:10px">no spec</button>`;
+  }
+
+  // Right panel: minimal — only init + align result
   document.getElementById('dm-right').innerHTML = `
-
-    <!-- Quick actions -->
     <div class="dm-section">
-      <div class="dm-section-label">Actions</div>
-      <!-- Open Claude session removed — use ›_ claude button on NS card instead -->
-      <div class="dm-action-row">
-        ${docData?.ok
-          ? `<button class="dm-btn" onclick="openDoc('${esc(p.id)}', '${esc(docData.path)}')">◈ Spec doc</button>`
-          : `<button class="dm-btn" style="opacity:.4;pointer-events:none">◈ No spec</button>`}
-        ${(!p.milestones || p.milestones.length === 0)
-          ? `<button class="dm-btn dm-btn-refresh" onclick="initMilestones('${esc(p.id)}')" title="No milestones — sync from project environment">⊕ Init</button>`
-          : ''}
-      </div>
-      <div id="dm-align-result" style="margin-top:8px"></div>
-      <div id="eval-result"></div>
       ${(!p.milestones || p.milestones.length === 0) ? `
-      <div style="margin-top:10px;padding:8px 10px;border-radius:5px;background:rgba(184,134,11,.08);border:1px solid rgba(184,134,11,.25);font-size:11px;color:var(--text-dim)">
-        No milestones or goals defined. Click <strong>⊕ Init</strong> to detect from project, or add milestones above.
-      </div>` : ''}
+        <div class="dm-action-row" style="margin-bottom:8px">
+          <button class="dm-btn dm-btn-refresh" onclick="initMilestones('${esc(p.id)}')" title="No milestones — sync from project environment">⊕ Init</button>
+        </div>
+        <div style="padding:8px 10px;border-radius:5px;background:rgba(184,134,11,.08);border:1px solid rgba(184,134,11,.25);font-size:11px;color:var(--text-dim)">
+          No milestones yet. Click <strong>⊕ Init</strong> or add above.
+        </div>` : ''}
+      <div id="dm-align-result"></div>
+      <div id="eval-result"></div>
     </div>
-
-    ${p.note ? `<div class="dm-section">
-      <div class="dm-section-label">Note</div>
-      <div class="dm-note">${esc(p.note)}</div>
-    </div>` : ''}
   `;
 }
 
