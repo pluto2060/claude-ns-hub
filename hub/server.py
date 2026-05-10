@@ -1036,6 +1036,27 @@ async def terminal_session(websocket: WebSocket, proj_id: str):
     await asyncio.gather(pty_to_ws(), ws_to_pty())
 
 
+@app.post("/api/terminal/{proj_id}/inject")
+async def terminal_inject(proj_id: str, request: Request):
+    """Inject a prompt into the running Claude terminal session for a project."""
+    data = await request.json()
+    prompt = data.get("prompt", "").strip()
+    if not prompt:
+        return JSONResponse({"ok": False, "error": "prompt required"}, status_code=400)
+
+    proc = _sessions.get(proj_id)
+    if not proc or not proc.isalive():
+        return JSONResponse({"ok": False, "error": "No active terminal session for this project",
+                             "hint": "Open the terminal first by clicking ›_ claude on the card"}, status_code=404)
+
+    # Send prompt to PTY (append newline to submit)
+    try:
+        proc.write((prompt + "\n").encode())
+        return JSONResponse({"ok": True, "message": f"Prompt injected into {proj_id} terminal"})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
 @app.get("/api/northstar/{proj_id}/north-stars")
 async def get_north_stars(proj_id: str):
     """Return all North Stars for a project (multi-NS structure)."""
@@ -1154,7 +1175,7 @@ async def update_milestone(proj_id: str, mid: str, request: Request):
     for m in milestones:
         if isinstance(m, dict) and m.get("id") == mid:
             # User-settable fields: text, layer, parent_id, claude_ack, status=queued/pending only
-            for k in ("text", "layer", "parent_id", "claude_ack", "cron_job_id"):
+            for k in ("text", "layer", "parent_id", "claude_ack", "cron_job_id", "claude_comment"):
                 if k in data:
                     m[k] = data[k] if data[k] else None
             # Status: user can set pending/queued; done is Claude-only (set via done=True or status=done)
@@ -1277,45 +1298,77 @@ async def execute_project(proj_id: str):
             _host = '127.0.0.1'
     hub_api = f"http://{_tailscale_interface_ip()}:{PORT}"
 
-    if not active_ms:
-        # INIT MODE: no milestones → create roadmap
-        entry = {
-            "ts": _dt_.now().isoformat(timespec="seconds"),
-            "type": "execute_init",
-            "proj_id": proj_id,
-            "proj_name": proj.get("name", proj_id),
-            "hub_api": hub_api,
-            "message": f"No milestones found for {proj_id}. Run /ns-stone to initialize milestone roadmap.",
-        }
-        mode = "init"
-    else:
-        # EXECUTE MODE: list ALL stones needing attention → per-stone CronCreate
-        actionable = [m for m in active_ms if m.get("status") in ("queued", "pending", "needs_clarification")]
-        stones_for_cron = [
-            {
-                "id": m.get("id"),
-                "text": m.get("text", "")[:80],
-                "status": m.get("status", "pending"),
-                "claude_ack": bool(m.get("claude_ack")),
-            }
-            for m in actionable[:5]  # cap at 5 to avoid overwhelming
-        ]
-        entry = {
-            "ts": _dt_.now().isoformat(timespec="seconds"),
-            "type": "execute_all",
-            "proj_id": proj_id,
-            "proj_name": proj.get("name", proj_id),
-            "hub_api": hub_api,
-            "total_active": len(active_ms),
-            "stones": stones_for_cron,
-            "message": f"Execute {proj_id}: create per-stone CronCreate for {len(stones_for_cron)} actionable stones.",
-        }
-        mode = "work"
+    task_queue = HERE / "task-queue"
+    task_queue.mkdir(parents=True, exist_ok=True)
+    ts = _dt_.now().strftime("%Y%m%d-%H%M%S")
 
-    inbox = Path(__file__).parent / "session-inbox.jsonl"
-    with open(inbox, "a") as f:
-        f.write(__import__("json").dumps(entry, ensure_ascii=False) + "\n")
-    return JSONResponse({"ok": True, "mode": mode, "message": entry["message"]})
+    if not active_ms:
+        # INIT MODE: dispatch a single task to initialize the milestone roadmap
+        task_file = task_queue / f"task-{proj_id}-init-{ts}.md"
+        task_file.write_text(
+            f"# Execute Init: {proj_id}\n\n"
+            f"Project '{proj.get('name', proj_id)}' has no milestones.\n"
+            f"Use /ns-stone or analyze the project context and create an initial milestone roadmap.\n"
+            f"After creating milestones, PATCH them via {hub_api}/api/northstar/{proj_id}/milestones\n"
+        )
+        mode = "init"
+        return JSONResponse({"ok": True, "mode": mode, "tasks_created": 1,
+                             "message": f"Init task queued for {proj_id}"})
+    else:
+        # Check if terminal session is open — prefer terminal injection (full context)
+        term_proc = _sessions.get(proj_id)
+        if term_proc and term_proc.isalive():
+            # TERMINAL MODE: inject execute prompt directly into running Claude session
+            actionable = [m for m in active_ms if m.get("status") in ("queued", "pending", "needs_clarification")][:5]
+            stone_lines = "\n".join(
+                f"  - {m.get('id')} [{m.get('status')}]: \"{m.get('text','')[:60]}\""
+                for m in actionable
+            )
+            inject_prompt = (
+                f"[EXECUTE] Analyze and process these {proj_id} milestones:\n"
+                f"{stone_lines}\n"
+                f"For each: ack unreviewed ones, implement clear tasks, ask clarification for vague ones. "
+                f"Hub: {hub_api}"
+            )
+            try:
+                term_proc.write((inject_prompt + "\n").encode())
+                return JSONResponse({
+                    "ok": True, "mode": "terminal",
+                    "message": f"Injected into {proj_id} terminal — {len(actionable)} stones"
+                })
+            except Exception:
+                pass  # fall through to task-worker
+
+        # FALLBACK: create one task file per actionable stone (task-worker handles each)
+        actionable = [m for m in active_ms if m.get("status") in ("queued", "pending", "needs_clarification")][:5]
+        tasks_created = 0
+        for m in actionable:
+            mid = m.get("id", "")
+            text = m.get("text", "")
+            status = m.get("status", "pending")
+            task_file = task_queue / f"task-{proj_id}-{mid}-{ts}.md"
+            # Skip if task already queued or result exists
+            result_file = HERE / "task-results" / f"task-{proj_id}-{mid}-{ts}.json"
+            lock_file = HERE / "task-locks" / f"task-{proj_id}-{mid}-{ts}.lock"
+            if task_file.exists() or result_file.exists() or lock_file.exists():
+                continue
+            task_file.write_text(
+                f"# Task: {proj_id}/{mid}\n\n"
+                f"Stone: [{status}] \"{text}\"\n\n"
+                f"Instructions:\n"
+                f"1. PATCH claude_ack=now: {hub_api}/api/northstar/{proj_id}/milestones/{mid}\n"
+                f"2. If status=needs_clarification: PATCH status=needs_clarification + clarification_question\n"
+                f"3. If clear actionable task: implement it directly\n"
+                f"4. On completion: append to ~/.claude/hub/projects/{proj_id}/completion-log.jsonl:\n"
+                f'   {{"session_id":"worker","milestone_id":"{mid}","evidence":"<what was done>","timestamp":"<ISO>"}}\n'
+                f"5. PATCH {hub_api}/api/northstar/{proj_id}/milestones/{mid} with status=pending_confirmation\n\n"
+                f"Hub API: {hub_api}\n"
+            )
+            tasks_created += 1
+
+        mode = "work"
+        return JSONResponse({"ok": True, "mode": mode, "tasks_created": tasks_created,
+                             "message": f"Dispatched {tasks_created} stone tasks to worker (no user message needed)"})
 
 
 @app.post("/api/northstar/create")

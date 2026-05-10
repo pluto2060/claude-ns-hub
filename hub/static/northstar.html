@@ -616,7 +616,7 @@ header {
 
 .detail-modal {
   background: var(--panel); border: 1px solid var(--panel-border);
-  border-radius: 10px; width: 100%; max-width: 880px; max-height: 90vh;
+  border-radius: 10px; width: 100%; max-width: 580px; max-height: 90vh;
   display: flex; flex-direction: column; overflow: hidden;
   box-shadow: 0 20px 60px rgba(31,28,26,.18);
   position: relative;
@@ -1543,6 +1543,7 @@ function renderMilestoneCreator(projId, milestones) {
               <button onclick="event.stopPropagation();confirmDeleteMs('${esc(projId)}','${esc(m.id)}','${esc(m.text)}')" class="nt-del" style="opacity:1">✕</button>
             </div>
             ${m.clarification_question ? `<div style="font-size:11px;color:#7b9fd4;font-family:var(--mono);padding:4px 6px;background:rgba(90,120,200,.08);border-radius:3px;margin-left:24px">Claude asks: ${esc(m.clarification_question)}</div>` : ''}
+            ${m.claude_comment ? `<div style="font-size:10px;color:var(--text-dim);font-family:var(--mono);padding:3px 6px;background:var(--panel-soft);border-radius:3px;margin-left:24px;border-left:2px solid var(--panel-border)">note: ${esc(m.claude_comment)}</div>` : ''}
             <div style="display:flex;gap:6px;margin-left:24px">
               <input id="clarify-${esc(m.id)}" type="text" value="${esc(m.clarification_answer||'')}"
                 placeholder="Type your answer and press Enter…"
@@ -1559,16 +1560,19 @@ function renderMilestoneCreator(projId, milestones) {
       // pending_confirmation: show confirm/reopen buttons inline
       if (mStatus === 'pending_confirmation') {
         const confirmHtml = `
-          <div class="nt-row" style="background:rgba(204,120,92,.08);border:1px solid var(--accent-soft);border-radius:5px;padding:6px 8px;margin-bottom:2px">
-            <span class="nt-num">${idx+1}.</span>
-            <span style="font-size:10px;color:var(--accent-deep);font-family:var(--mono);padding-top:2px">⏳</span>
-            <div style="flex:1;font-size:12px;color:var(--text)">${esc(m.text)}</div>
-            <div style="display:flex;gap:4px;flex-shrink:0">
-              <button onclick="event.stopPropagation();confirmMsDone('${esc(projId)}','${esc(m.id)}')"
-                style="font-size:9px;padding:2px 6px;border-radius:3px;border:1px solid var(--green);background:var(--green-soft);color:var(--green);cursor:pointer;font-family:var(--mono)">✓ Confirm</button>
-              <button onclick="event.stopPropagation();reopenMs('${esc(projId)}','${esc(m.id)}')"
-                style="font-size:9px;padding:2px 6px;border-radius:3px;border:1px solid var(--panel-border);background:none;color:var(--text-dim);cursor:pointer;font-family:var(--mono)">↩ Reopen</button>
+          <div style="background:rgba(204,120,92,.08);border:1px solid var(--accent-soft);border-radius:5px;padding:6px 8px;margin-bottom:2px">
+            <div class="nt-row" style="margin-bottom:0">
+              <span class="nt-num">${idx+1}.</span>
+              <span style="font-size:10px;color:var(--accent-deep);font-family:var(--mono);padding-top:2px">⏳</span>
+              <div style="flex:1;font-size:12px;color:var(--text)">${esc(m.text)}</div>
+              <div style="display:flex;gap:4px;flex-shrink:0">
+                <button onclick="event.stopPropagation();confirmMsDone('${esc(projId)}','${esc(m.id)}')"
+                  style="font-size:9px;padding:2px 6px;border-radius:3px;border:1px solid var(--green);background:var(--green-soft);color:var(--green);cursor:pointer;font-family:var(--mono)">✓ Confirm</button>
+                <button onclick="event.stopPropagation();reopenMs('${esc(projId)}','${esc(m.id)}')"
+                  style="font-size:9px;padding:2px 6px;border-radius:3px;border:1px solid var(--panel-border);background:none;color:var(--text-dim);cursor:pointer;font-family:var(--mono)">↩ Reopen</button>
+              </div>
             </div>
+            ${m.claude_comment ? `<div style="font-size:10px;color:var(--text-dim);font-family:var(--mono);padding:3px 6px;margin-top:4px;background:var(--panel-soft);border-radius:3px;margin-left:24px;border-left:2px solid var(--accent)">Claude: ${esc(m.claude_comment)}</div>` : ''}
           </div>`;
         return confirmHtml;
       }
@@ -1629,6 +1633,9 @@ function renderMilestoneCreator(projId, milestones) {
         ? `<span style="font-size:9px;color:var(--accent);margin-left:3px" title="Added by user — Claude hasn't seen this yet">★</span>`
         : '';
 
+      const mCommentHtml = m.claude_comment
+        ? `<div style="font-size:10px;color:var(--text-dim);font-family:var(--mono);padding:2px 6px 3px;margin:2px 0 2px 54px;background:var(--panel-soft);border-radius:3px;border-left:2px solid ${mStatus==='queued'?'var(--accent)':'var(--panel-border)'}">Claude: ${esc(m.claude_comment)}</div>`
+        : '';
       return `
         <div onclick="toggleMsExpand('${esc(projId)}','${esc(m.id)}')">
           <div class="nt-row ${mStatus==='done'?'nt-done':''}">
@@ -1655,6 +1662,7 @@ function renderMilestoneCreator(projId, milestones) {
               <button class="nt-del" title="Delete this stone" onclick="event.stopPropagation();confirmDeleteMs('${esc(projId)}','${esc(m.id)}','${esc(m.text)}')">✕</button>
             </div>
           </div>
+          ${mCommentHtml}
           ${subHtml}
         </div>`;
     }).join('')}
@@ -1772,11 +1780,24 @@ async function executeProject(projId, btn) {
     const r = await fetch(`/api/northstar/${encodeURIComponent(projId)}/execute`, {method:'POST'});
     const d = await r.json();
     if (d.ok) {
-      btn.textContent = d.mode === 'init' ? '⊕' : '✓';
+      const icon = d.mode === 'init' ? '⊕' : d.mode === 'terminal' ? '▶▶' : '✓';
+      btn.textContent = icon;
       btn.title = d.message;
-      setTimeout(() => { btn.textContent = orig; btn.title = 'Execute: init milestones or process queued work'; btn.classList.remove('running'); }, 4000);
+      // terminal mode: open terminal to see execution
+      if (d.mode === 'terminal') {
+        btn.style.background = 'var(--accent-soft)';
+        btn.style.borderColor = 'var(--accent)';
+        btn.style.color = 'var(--accent-deep)';
+      }
+      setTimeout(() => {
+        btn.textContent = orig; btn.title = 'Execute: init milestones or process queued work';
+        btn.style.background = ''; btn.style.borderColor = ''; btn.style.color = '';
+        btn.classList.remove('running');
+      }, 5000);
     } else {
-      btn.textContent = '!'; setTimeout(() => { btn.textContent = orig; btn.classList.remove('running'); }, 2000);
+      btn.textContent = d.error?.includes('No active terminal') ? '⚠' : '!';
+      btn.title = d.error || 'Error';
+      setTimeout(() => { btn.textContent = orig; btn.title = 'Execute'; btn.classList.remove('running'); }, 3000);
     }
   } catch(_) { btn.textContent = orig; btn.classList.remove('running'); }
 }
@@ -2559,6 +2580,7 @@ function nodeHtml(p, idx) {
   const sessClass = sKey === 'active' ? 'live' : '';
   const sessDot = sKey === 'active' ? '●' : sKey?.startsWith('idle') ? '○' : '·';
   const active = idx === activeIdx ? 'active' : '';
+  const hasClarify = (p.milestones||[]).some(m => (m.status||'') === 'needs_clarification');
   return `<div class="ns-node ${active}" data-proj-idx="${idx}" data-proj-id="${esc(p.id||p.name)}" data-layer="${p.layer||0}" draggable="true">
     <div class="ns-node-top">
       <span class="ns-node-sdot" style="background:${dotColor}"></span>
@@ -2567,6 +2589,7 @@ function nodeHtml(p, idx) {
         onblur="commitRename(this,'${esc(p.id||p.name)}')"
         onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur()}"
         >${esc(p.name)}</span>
+      ${hasClarify ? `<span title="Claude needs clarification on a milestone" style="font-size:9px;color:#7b9fd4;cursor:default">❓</span>` : ''}
       <span class="ns-node-sess-dot ${sessClass}" title="Click for terminal"
         onclick="event.stopPropagation();_openWithTerminal(${idx},'${esc(p.id||p.name)}')">${sessDot}</span>
     </div>
