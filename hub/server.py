@@ -1239,7 +1239,7 @@ async def run_milestone(proj_id: str, mid: str):
             _host = _m.group(1) if _m else '127.0.0.1'
         except Exception:
             _host = '127.0.0.1'
-    hub_api = f"http://{_host}:9000"
+    hub_api = f"http://{_tailscale_interface_ip()}:{PORT}"
     inbox = Path.home() / ".claude/hub/session-inbox.jsonl"
     entry = {
         "ts": _dt_.now().isoformat(timespec="seconds"),
@@ -1275,7 +1275,7 @@ async def execute_project(proj_id: str):
             _host = _m.group(1) if _m else '127.0.0.1'
         except Exception:
             _host = '127.0.0.1'
-    hub_api = f"http://{_host}:9000"
+    hub_api = f"http://{_tailscale_interface_ip()}:{PORT}"
 
     if not active_ms:
         # INIT MODE: no milestones → create roadmap
