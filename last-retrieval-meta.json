@@ -1,1 +1,1 @@
-{"ts": 1778482903.8321185, "blocks": {}, "vec_daemon_up": true, "bge_daemon_up": true, "query_char_count": 2, "session_id": "9109142f-e627-4111-8213-70b99b0c1a9b"}
+{"ts": 1778483725.877506, "blocks": {"g1_decisions": {"candidates": 385, "returned": 7, "retrieval_method": "HYBRID", "duration_ms": 463, "query_type": "KEYWORD"}}, "vec_daemon_up": true, "bge_daemon_up": true, "query_char_count": 13, "session_id": "66ce7909-9006-4eb5-a7ba-293e7cae9d17"}
