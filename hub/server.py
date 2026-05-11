@@ -1412,6 +1412,16 @@ async def execute_project(proj_id: str):
         }
         proj_dir = proj_dirs.get(proj_id, str(Path.home() / "Project" / proj_id))
 
+        # M24 fix: if tmux session already running, return status instead of spawning duplicate
+        existing = subprocess.run(["tmux", "has-session", "-t", session_name], capture_output=True)
+        if existing.returncode == 0:
+            # Session already active — return status, don't duplicate
+            return JSONResponse({
+                "ok": True, "mode": "tmux_active",
+                "session": session_name,
+                "message": f"Claude is already working on {proj_id} stones (session '{session_name}' active). Check live session for progress.",
+            })
+
         if actionable:
             stone_lines = "\n".join(
                 f"  {m.get('id')} [{m.get('status')}]: \"{m.get('text','')[:60]}\""

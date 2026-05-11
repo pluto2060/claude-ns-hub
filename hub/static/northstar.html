@@ -1807,9 +1807,10 @@ async function executeProject(projId, btn) {
     const r = await fetch(`/api/northstar/${encodeURIComponent(projId)}/execute`, {method:'POST'});
     const d = await r.json();
     if (d.ok) {
-      btn.textContent = d.mode === 'init' ? '⊕' : d.mode === 'tmux' ? '▶▶' : '⟳';
-      btn.title = d.message + (d.session ? ` (tmux: ${d.session})` : '');
+      btn.textContent = d.mode === 'init' ? '⊕' : d.mode === 'tmux' ? '▶▶' : d.mode === 'tmux_active' ? '◉' : '✓';
+      btn.title = d.message;
       if (d.mode === 'tmux') startTmuxWatch(projId);
+      if (d.mode === 'tmux_active') startTmuxWatch(projId); // already running, just show session
       // Show results panel and start polling
       const resPanel = document.getElementById('dm-task-results');
       const resBody = document.getElementById('dm-task-results-body');
