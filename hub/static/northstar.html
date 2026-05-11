@@ -1683,9 +1683,6 @@ function renderMilestoneCreator(projId, milestones) {
               ${children.length ? `<span style="font-family:var(--mono);font-size:9px;color:var(--text-dim)">${childDone}/${children.length}</span>` : ''}
               ${m.cron_job_id ? `<span style="font-family:var(--mono);font-size:8px;color:var(--text-dim)" title="Active cron monitor: ${esc(m.cron_job_id)}">cron</span>` : ''}
               ${mStatus!=='done' ? `<span class="${m.claude_ack?'nt-ack-g':'nt-ack-o'}" title="${mAckTitle}" style="font-size:8px;padding:1px 4px;border-radius:3px;border:1px solid currentColor;letter-spacing:.02em">${m.claude_ack?'acked':'review'}</span>` : ''}
-              ${mStatus!=='done' ? `<button onclick="event.stopPropagation();runMilestone('${esc(projId)}','${esc(m.id)}',this)"
-                title="Dispatch to Claude Code worker"
-                style="font-size:8px;padding:1px 5px;border-radius:3px;border:1px solid var(--green);background:var(--green-soft);color:var(--green);cursor:pointer;font-family:var(--mono)">▶ run</button>` : ''}
               <button class="nt-del" title="Delete this stone" onclick="event.stopPropagation();confirmDeleteMs('${esc(projId)}','${esc(m.id)}','${esc(m.text)}')">✕</button>
             </div>
           </div>
@@ -3314,7 +3311,9 @@ async function loadTaskBoard(projId) {
     const allJobs = d.jobs || [];
     // Only show active jobs (queued/running) + last 3 completed
     const activeJobs = allJobs.filter(j => j.status === 'queued' || j.status === 'running');
-    const recentDone = allJobs.filter(j => j.status !== 'queued' && j.status !== 'running').slice(0, 3);
+    const recentDone = allJobs.filter(j => j.status !== 'queued' && j.status !== 'running')
+      .sort((a, b) => (b.completed_at || b.task_id) > (a.completed_at || a.task_id) ? 1 : -1)
+      .slice(0, 3);
     const jobs = [...activeJobs, ...recentDone];
     if (!jobs.length) { board.innerHTML = ''; return; }
     const statusIcon = {queued:'○',running:'⟳',done:'✓',failed:'✕',timeout:'⏱'}
