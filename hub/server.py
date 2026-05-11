@@ -1466,26 +1466,23 @@ async def execute_project(proj_id: str):
             )
             # Spawn tmux session — use TaskCreate/TaskUpdate (Claude Code built-in) for task tracking
             cron_prompt = (
-                f"[EXECUTE SYNC] Project {proj_id} — user clicked Execute.\n\n"
-                f"Step 1 — MILESTONE SYNC: GET {hub_api}/api/northstar/{proj_id}/milestones. "
-                f"For each unreviewed (claude_ack=null): PATCH claude_ack=now. "
-                f"Clear text (>15 chars) → PATCH status=queued. "
-                f"Vague → PATCH status=needs_clarification + clarification_question.\n\n"
-                f"Step 2 — CREATE TASKS: For each queued milestone, call TaskCreate with:\n"
-                f'  - subject: milestone ID (e.g. "M42")\n'
-                f'  - description: milestone text\n'
-                f"  This creates Claude Code built-in tasks (TaskCreate tool — NOT TodoWrite).\n\n"
-                f"Step 3 — IMPLEMENT SEQUENTIALLY: For each task:\n"
-                f"  a. TaskUpdate(id, status='in_progress')\n"
-                f"  b. Implement the milestone (read/write/edit files)\n"
-                f"  c. Write completion log:\n"
-                f'     echo \'{{\"session_id\":\"exec\",\"milestone_id\":\"MID\",\"evidence\":\"...\",\"timestamp\":\"DATE\"}}\' >> ~/.claude/hub/projects/{proj_id}/completion-log.jsonl\n'
-                f"  d. PATCH {hub_api}/api/northstar/{proj_id}/milestones/MID "
-                f'{{\"status\":\"pending_confirmation\"}}\n'
-                f"  e. TaskUpdate(id, status='completed')\n"
-                f"  Repeat for all tasks.\n\n"
-                f"Step 4 — SPEC DOC: Update spec via {hub_api}/api/northstar/{proj_id}/doc.\n\n"
-                f"All active milestones:\n{all_ms_lines}"
+                f"[EXECUTE SYNC] Project {proj_id} — Execute clicked. PRIMARY GOAL: build a task list from queued milestones.\n\n"
+                f"PRIMARY ACTION — TaskCreate per queued milestone:\n"
+                f"  For each milestone with status=queued in the list below:\n"
+                f'    TaskCreate(subject="<milestone_id>", description="<milestone text>")\n'
+                f"  (Use Claude Code built-in TaskCreate tool. NOT TodoWrite.)\n\n"
+                f"PRE-STEP — Sync unreviewed (only if claude_ack=null exists):\n"
+                f"  PATCH {hub_api}/api/northstar/{proj_id}/milestones/<id>:\n"
+                f"    claude_ack=now. Clear text (>15 chars) → status=queued. Vague → status=needs_clarification + clarification_question.\n\n"
+                f"IMPLEMENT each task sequentially:\n"
+                f"  1. TaskUpdate(<id>, status='in_progress')\n"
+                f"  2. Edit/write files to implement the milestone.\n"
+                f"  3. Append completion-log:\n"
+                f'     echo \'{{\"session_id\":\"exec\",\"milestone_id\":\"<MID>\",\"evidence\":\"<one-line summary>\",\"timestamp\":\"\'$(date -Iseconds)\'\"}}\' >> ~/.claude/hub/projects/{proj_id}/completion-log.jsonl\n'
+                f"  4. PATCH {hub_api}/api/northstar/{proj_id}/milestones/<MID> body {{\"status\":\"pending_confirmation\"}}\n"
+                f"  5. TaskUpdate(<id>, status='completed')\n\n"
+                f"OPTIONAL — After all tasks done, update spec via {hub_api}/api/northstar/{proj_id}/doc.\n\n"
+                f"Active milestones (snapshot — TaskCreate only for status=queued):\n{all_ms_lines}"
             )
             # Write prompt to file — avoids tmux paste-mode for multi-line text
             prompt_file = PROJECTS_DIR / proj_id / "pending-execute-prompt.txt"
