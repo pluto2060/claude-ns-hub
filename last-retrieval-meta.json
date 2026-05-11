@@ -1,1 +1,1 @@
-{"ts": 1778487077.632512, "blocks": {"g2_docs": {"candidates": null, "returned": 5, "retrieval_method": "HYBRID", "duration_ms": 158, "query_type": "SEMANTIC"}}, "vec_daemon_up": true, "bge_daemon_up": true, "query_char_count": 95, "session_id": "9109142f-e627-4111-8213-70b99b0c1a9b"}
+{"ts": 1778490580.3601744, "blocks": {"g2_docs": {"candidates": null, "returned": 5, "retrieval_method": "HYBRID", "duration_ms": 202, "query_type": "KEYWORD"}}, "vec_daemon_up": true, "bge_daemon_up": true, "query_char_count": 8, "session_id": "9109142f-e627-4111-8213-70b99b0c1a9b"}
