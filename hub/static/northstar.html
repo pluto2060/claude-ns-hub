@@ -1488,7 +1488,7 @@ function renderMilestoneCreator(projId, milestones) {
   let expanded = {};
   try { expanded = JSON.parse(localStorage.getItem(expandKey) || '{}'); } catch(_) {}
 
-  const l0 = milestones.filter(m => (m.layer || 0) === 0);
+  const l0 = milestones.filter(m => (m.layer || 0) === 0).reverse(); // newest first
   const l1 = milestones.filter(m => (m.layer || 0) === 1);
   const doneTotal = milestones.filter(m => (m.status||'') === 'done' || m.done).length;
   const queuedTotal = milestones.filter(m => (m.status||'') === 'queued').length;
@@ -1550,6 +1550,8 @@ function renderMilestoneCreator(projId, milestones) {
     .nt-new-badge { font-size:9px; color:var(--accent); margin-left:3px; cursor:default; }
   </style>
   <div>
+    <button class="nt-add" style="margin-bottom:6px;font-size:11px;padding:3px 10px;border:1px dashed var(--panel-border);border-radius:5px;width:100%;text-align:left;color:var(--text-dim)"
+      onclick="addMilestone('${esc(projId)}',0,null)">+ milestone</button>
     ${l0.length > 0 ? `<span class="nt-layer-label">L0 · Strategic</span>` : ''}
     ${l0.map((m, idx) => {
       const children = l1.filter(c => c.parent_id === m.id);
