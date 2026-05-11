@@ -95,7 +95,7 @@ header {
   position: relative;
   min-width: max-content; /* never shrink below content — forces horizontal scroll */
 }
-.ns-lane { display: flex; align-items: flex-start; margin-bottom: 10px; }
+.ns-lane { display: flex; align-items: flex-start; margin-bottom: 32px; }
 .ns-lane-nodes { flex-wrap: nowrap !important; } /* single row per lane on all screen sizes */
 .ns-lane-label {
   width: 72px; flex-shrink: 0; font-family: var(--mono); font-size: 9px;
@@ -1062,7 +1062,7 @@ header {
     background:#252220;border-bottom:1px solid #333">
     <span style="font-family:var(--mono);font-size:11px;color:#cc785c">LIVE SESSION</span>
     <div style="display:flex;gap:6px">
-      <button onclick="stopTmuxWatch()" style="background:none;border:1px solid #555;border-radius:4px;color:#e05252;font-family:var(--mono);font-size:10px;padding:2px 7px;cursor:pointer">■ stop</button>
+      <button onclick="killExecSession()" style="background:none;border:1px solid #555;border-radius:4px;color:#e05252;font-family:var(--mono);font-size:10px;padding:2px 7px;cursor:pointer">■ stop</button>
       <button onclick="toggleTmuxOverlay()" style="background:none;border:1px solid #555;border-radius:4px;color:#888;font-family:var(--mono);font-size:10px;padding:2px 7px;cursor:pointer">✕</button>
     </div>
   </div>
@@ -1560,29 +1560,21 @@ function renderMilestoneCreator(projId, milestones) {
       // 3-state: pending / queued / done
       // state derives from m.status field (new) or m.done (old compat)
       const mStatus = m.status || (m.done ? 'done' : 'pending');
-      // needs_clarification: show question + inline answer input
+      // needs_clarification: compact row with ? badge in meta; click ? → popup with explanation + answer input
       if (mStatus === 'needs_clarification') {
         const hasAnswer = !!(m.clarification_answer || '').trim();
+        const clarQ = esc(m.clarification_question || 'Why is this milestone unclear? Please describe the task in more detail.');
+        const clarA = esc(m.clarification_answer || '');
         return `
-          <div class="nt-row" style="background:rgba(90,120,200,.06);border:1px solid rgba(90,120,200,.25);border-radius:5px;padding:6px 8px;margin-bottom:2px;flex-direction:column;gap:4px">
-            <div style="display:flex;align-items:center;gap:6px">
-              <span class="nt-num">${idx+1}.</span>
-              <span style="font-size:11px;color:#7b9fd4;font-family:var(--mono);cursor:pointer" title="Click to see why Claude flagged this" onclick="event.stopPropagation();showClarifyPopup(event,[{id:'${esc(m.id)}',text:'${esc(m.text)}',q:'${esc(m.clarification_question||'Why is this milestone unclear? Please describe the task in more detail.')}'}])">❓</span>
-              <div style="flex:1;font-size:12px;color:var(--text)">${esc(m.text)}</div>
-              <button onclick="event.stopPropagation();confirmDeleteMs('${esc(projId)}','${esc(m.id)}','${esc(m.text)}')" class="nt-del" style="opacity:1">✕</button>
-            </div>
-            ${m.clarification_question ? `<div style="font-size:11px;color:#7b9fd4;font-family:var(--mono);padding:4px 6px;background:rgba(90,120,200,.08);border-radius:3px;margin-left:24px">Claude asks: ${esc(m.clarification_question)}</div>` : ''}
-            ${m.claude_comment ? `<div style="font-size:10px;color:var(--text-dim);font-family:var(--mono);padding:3px 6px;background:var(--panel-soft);border-radius:3px;margin-left:24px;border-left:2px solid var(--panel-border)">note: ${esc(m.claude_comment)}</div>` : ''}
-            <div style="display:flex;gap:6px;margin-left:24px">
-              <input id="clarify-${esc(m.id)}" type="text" value="${esc(m.clarification_answer||'')}"
-                placeholder="Type your answer and press Enter…"
-                onclick="event.stopPropagation()"
-                style="flex:1;font-size:11px;font-family:var(--mono);padding:4px 8px;border-radius:4px;
-                  border:1px solid ${hasAnswer?'var(--green)':'rgba(90,120,200,.4)'};background:var(--panel);color:var(--text);outline:none"
-                onkeydown="if(event.key==='Enter'){event.stopPropagation();submitClarification('${esc(projId)}','${esc(m.id)}',this.value)}">
-              <button onclick="event.stopPropagation();submitClarification('${esc(projId)}','${esc(m.id)}',document.getElementById('clarify-${esc(m.id)}').value)"
-                style="font-size:10px;padding:3px 8px;border-radius:4px;border:1px solid ${hasAnswer?'var(--green)':'rgba(90,120,200,.4)'};background:${hasAnswer?'var(--green-soft)':'rgba(90,120,200,.1)'};color:${hasAnswer?'var(--green)':'#7b9fd4'};cursor:pointer;font-family:var(--mono);white-space:nowrap"
-              >${hasAnswer ? '✓ Answered' : 'Submit'}</button>
+          <div class="nt-row" style="opacity:.85">
+            <span class="nt-num">${idx+1}.</span>
+            <span class="nt-arrow"> </span>
+            <button class="nt-check" disabled style="border:1px solid #7b9fd4;background:rgba(90,120,200,.1);color:#7b9fd4;cursor:default;border-radius:4px;width:auto;padding:0 5px;font-size:8px;letter-spacing:.03em;min-width:30px">?</button>
+            <div class="nt-text" style="color:var(--text-soft)">${esc(m.text)}</div>
+            <div class="nt-meta">
+              <span style="font-size:11px;color:#7b9fd4;cursor:pointer" title="Click to see why Claude flagged this"
+                onclick="event.stopPropagation();showClarifyPopup(event,'${esc(projId)}','${esc(m.id)}','${clarQ}','${clarA}',${hasAnswer})">❓</span>
+              <button class="nt-del" title="Delete" onclick="event.stopPropagation();confirmDeleteMs('${esc(projId)}','${esc(m.id)}','${esc(m.text)}')">✕</button>
             </div>
           </div>`;
       }
@@ -3260,29 +3252,36 @@ function renderMultiNSLeftPanel(p, nsList, okrData) {
 }
 
 let _tmuxWatchInterval = null;
-function showClarifyPopup(event, items) {
-  // Remove existing popup
+function showClarifyPopup(event, projId, mid, clarQ, clarA, hasAnswer) {
   document.getElementById('clarify-popup')?.remove();
   const popup = document.createElement('div');
   popup.id = 'clarify-popup';
   popup.style.cssText = `position:fixed;z-index:9999;background:var(--panel);border:1px solid rgba(90,120,200,.4);
-    border-radius:8px;padding:10px 12px;max-width:280px;box-shadow:0 6px 20px rgba(0,0,0,.2);
+    border-radius:8px;padding:12px 14px;max-width:300px;box-shadow:0 6px 24px rgba(0,0,0,.25);
     font-family:var(--mono);font-size:11px;line-height:1.6`;
-  // Position near click
-  const x = Math.min(event.clientX, window.innerWidth - 300);
-  const y = Math.min(event.clientY + 8, window.innerHeight - 150);
+  const x = Math.min(event.clientX, window.innerWidth - 320);
+  const y = Math.min(event.clientY + 8, window.innerHeight - 180);
   popup.style.left = x + 'px';
   popup.style.top = y + 'px';
-  popup.innerHTML = `<div style="font-size:9px;color:var(--text-dim);margin-bottom:6px;letter-spacing:.05em">CLAUDE FLAGGED FOR CLARIFICATION</div>` +
-    items.map(it => `<div style="margin-bottom:8px">
-      <div style="color:var(--text-dim);font-size:10px">${esc(it.id)}: ${esc(it.text.slice(0,40))}…</div>
-      <div style="color:#7b9fd4;margin-top:2px">❓ ${esc(it.q || '내용이 불명확합니다. 구체적으로 어떤 작업인가요?')}</div>
-    </div>`).join('') +
-    `<div style="font-size:9px;color:var(--accent);cursor:pointer;margin-top:4px" onclick="document.getElementById('clarify-popup').remove()">닫기 ✕</div>`;
+  popup.innerHTML = `
+    <div style="font-size:9px;color:var(--text-dim);margin-bottom:8px;letter-spacing:.05em">WHY CLAUDE FLAGGED THIS</div>
+    <div style="color:#7b9fd4;margin-bottom:10px;line-height:1.5">❓ ${clarQ}</div>
+    <div style="display:flex;gap:6px">
+      <input id="clarify-popup-input" type="text" value="${clarA}"
+        placeholder="Your answer…"
+        style="flex:1;font-size:11px;font-family:var(--mono);padding:4px 8px;border-radius:4px;
+          border:1px solid ${hasAnswer?'var(--green)':'rgba(90,120,200,.4)'};background:var(--bg-deep);color:var(--text);outline:none"
+        onkeydown="if(event.key==='Enter'){event.stopPropagation();submitClarification('${projId}','${mid}',this.value);document.getElementById('clarify-popup')?.remove()}">
+      <button onclick="submitClarification('${projId}','${mid}',document.getElementById('clarify-popup-input').value);document.getElementById('clarify-popup')?.remove()"
+        style="font-size:10px;padding:3px 8px;border-radius:4px;border:1px solid ${hasAnswer?'var(--green)':'rgba(90,120,200,.4)'};
+          background:${hasAnswer?'var(--green-soft)':'rgba(90,120,200,.1)'};color:${hasAnswer?'var(--green)':'#7b9fd4'};cursor:pointer;white-space:nowrap">
+        ${hasAnswer ? '✓ Update' : 'Answer'}
+      </button>
+    </div>`;
   document.body.appendChild(popup);
-  // Auto-close on outside click
-  setTimeout(() => document.addEventListener('click', function h() {
-    popup.remove(); document.removeEventListener('click', h);
+  setTimeout(() => popup.querySelector('input')?.focus(), 50);
+  setTimeout(() => document.addEventListener('click', function h(e) {
+    if (!popup.contains(e.target)) { popup.remove(); document.removeEventListener('click', h); }
   }), 100);
 }
 
@@ -3290,7 +3289,25 @@ function toggleTmuxOverlay() {
   const overlay = document.getElementById('tmux-live-overlay');
   if (overlay) overlay.style.display = overlay.style.display === 'none' ? 'block' : 'none';
 }
+let _tmuxWatchProjId = null;
+
+async function killExecSession() {
+  stopTmuxWatch();
+  if (!_tmuxWatchProjId) return;
+  const output = document.getElementById('dm-tmux-output');
+  if (output) output.textContent = '(stopping — saving task position…)';
+  // 2-second grace: signal Claude to save current task state before kill
+  await fetch(`/api/northstar/${encodeURIComponent(_tmuxWatchProjId)}/exec-inject`, {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({prompt: '[STOP SIGNAL] Mark your current in-progress task position and exit cleanly.'})
+  }).catch(()=>{});
+  await new Promise(r => setTimeout(r, 2000));
+  await fetch(`/api/northstar/${encodeURIComponent(_tmuxWatchProjId)}/exec-session`, {method:'DELETE'}).catch(()=>{});
+  if (output) output.textContent = '(session stopped)';
+}
+
 function startTmuxWatch(projId) {
+  _tmuxWatchProjId = projId;
   const output = document.getElementById('dm-tmux-output');
   const trigger = document.getElementById('dm-tmux-trigger');
   const overlay = document.getElementById('tmux-live-overlay');
