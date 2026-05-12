@@ -2450,15 +2450,27 @@ function render() {
       return sd !== 0 ? sd : (a.p.position_x||0) - (b.p.position_x||0);
     });
 
-    el.innerHTML = lanes[l].map(({p, i}) =>
-      `<div class="ns-group-orphan">${nodeCard(p, i)}</div>`
-    ).join('');
+    // Build HTML with spacers for position_x gaps so dropped cards stay in their column
+    let laneHtml = '';
+    let prevPos = -1;
+    let visualCols = 0;
+    for (const {p, i} of lanes[l]) {
+      const pos = p.position_x || 0;
+      for (let g = prevPos + 1; g < pos; g++) {
+        laneHtml += `<div style="width:154px;min-width:154px;flex-shrink:0;pointer-events:none"></div>`;
+        visualCols++;
+      }
+      laneHtml += `<div class="ns-group-orphan">${nodeCard(p, i)}</div>`;
+      prevPos = pos;
+      visualCols++;
+    }
+    el.innerHTML = laneHtml;
     // M76: ghost column slots (max 5 visible cols per lane)
-    const ghosts = Math.max(0, 5 - lanes[l].length);
+    const ghosts = Math.max(0, 5 - visualCols);
     for (let g = 0; g < ghosts; g++) {
       const slot = document.createElement('div');
       slot.className = 'ns-col-ghost';
-      slot.dataset.lane = l; slot.dataset.col = lanes[l].length + g;
+      slot.dataset.lane = l; slot.dataset.col = visualCols + g;
       slot.addEventListener('dragover', e => { e.preventDefault(); slot.classList.add('drag-hover'); });
       slot.addEventListener('dragleave', () => slot.classList.remove('drag-hover'));
       slot.addEventListener('drop', e => _dropOnGhost(e, slot));
@@ -2605,20 +2617,14 @@ function render() {
       const relX = Math.max(0, e.clientX - laneRect.left + (laneEl.scrollLeft || 0));
       const CARD_CELL = 166; // 154px card + 12px gap
       const targetCol = Math.floor(relX / CARD_CELL);
-      // Reorder lane cards with dropped card at grid column
-      const laneCards = projects
-        .filter(x => x !== p && (parseInt(x.layer)||0) === l)
-        .sort((a, b) => (a.position_x||0) - (b.position_x||0));
-      laneCards.splice(Math.min(targetCol, laneCards.length), 0, p);
       p.layer = l;
+      p.position_x = targetCol;
       _dragSrc = null; _dragIdx = null;
-      const saves = laneCards.map((card, pos) => {
-        card.position_x = pos;
-        return fetch(`/api/northstar/${encodeURIComponent(card.id||card.name)}/layout`, {
-          method:'PATCH', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({layer: parseInt(card.layer)||0, position_x: pos}),
-        });
-      });
+      // Only save the moved card — preserve other cards' position_x as-is
+      const saves = [fetch(`/api/northstar/${encodeURIComponent(p.id||p.name)}/layout`, {
+        method:'PATCH', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({layer: l, position_x: targetCol}),
+      })];
       render();
       requestAnimationFrame(() => drawParentLines());
       Promise.all(saves);
