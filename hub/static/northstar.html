@@ -113,9 +113,7 @@ header {
   min-height: 100px; height: 100px; padding: 0;
   border-left: 2px solid var(--panel-border);
   border-radius: 0 8px 8px 0; transition: border-color .1s, background .1s;
-  overflow-x: auto; overflow-y: visible;
-  /* allow absolute children to overflow downward */
-  contain: none;
+  overflow: visible; /* no per-lane scroll — .grid-wrap handles shared horizontal scroll */
 }
 .ns-lane-nodes.drag-over { border-left-color: var(--accent); background: var(--accent-soft); }
 .ns-node.drop-before { border-left: 2px solid var(--accent); }
@@ -2526,6 +2524,7 @@ function render() {
     const CARD_W = 160;
     let autoX = 8;
     el.innerHTML = '';
+    let maxRight = 0;
     for (const {p, i} of lanes[l]) {
       const rawX = p.position_x ?? 0;
       let x = rawX >= 100 ? rawX : autoX;
@@ -2534,7 +2533,10 @@ function render() {
       wrapper.innerHTML = nodeCard(p, i);
       el.appendChild(wrapper);
       autoX = Math.max(autoX, x) + CARD_W + 8;
+      maxRight = Math.max(maxRight, x + CARD_W);
     }
+    // Stretch lane so .ns-swimlane min-width:max-content drives shared scroll
+    el.style.minWidth = (maxRight + 16) + 'px';
   });
 
   // Click → open detail (or finish connect if in connect mode)
