@@ -1726,9 +1726,25 @@ function renderMilestoneCreator(projId, milestones) {
       text-transform:uppercase; padding:8px 0 3px; margin-left:2px; opacity:.7; display:block; }
     .nt-layer-label:first-child { padding-top:2px; }
     .nt-new-badge { font-size:9px; color:var(--accent); margin-left:3px; cursor:default; }
-    .nt-table { border:1px solid var(--panel-border); border-radius:6px; overflow:hidden; margin-bottom:8px; }
+    /* M101: table layout for stone pane */
+    .nt-table { width:100%; border-collapse:collapse; border:1px solid var(--panel-border); border-radius:6px; overflow:hidden; margin-bottom:8px; display:table; }
+    .nt-table tr.nt-draggable-row { border-bottom:1px solid var(--panel-border); cursor:pointer; transition:background .08s; }
+    .nt-table tr.nt-draggable-row:last-child { border-bottom:none; }
+    .nt-table tr.nt-draggable-row:hover td { background:var(--panel-soft); }
+    .nt-table tr.nt-draggable-row:hover .nt-del { opacity:1; }
+    .nt-table tr.nt-draggable-row:hover .nt-drag-handle { opacity:.85; }
+    .nt-table tr.nt-draggable-row.drag-over td { border-top:2px solid var(--accent); }
+    .nt-table td { padding:4px 3px; vertical-align:top; }
+    .nt-table .ms-td-drag { width:18px; padding:5px 2px 4px 4px; }
+    .nt-table .ms-td-id { width:58px; white-space:nowrap; padding-top:5px; }
+    .nt-table .ms-td-state { width:50px; padding-top:4px; }
+    .nt-table .ms-td-text { padding-top:4px; }
+    .nt-table .ms-td-meta { white-space:nowrap; padding-top:3px; }
+    .nt-table tr.ms-sub-tr td { border-top:none; background:var(--bg-deep); }
+    .nt-table tr.ms-sub-tr:hover td { background:var(--panel-soft); }
     /* M81: queued stones show execution-priority indicator */
-    .nt-draggable-row[data-status="queued"] .nt-row { border-left:2px solid var(--accent); padding-left:4px; }
+    .nt-table tr.nt-draggable-row[data-status="queued"] td { border-left:2px solid var(--accent); }
+    .nt-table tr.nt-draggable-row[data-status="queued"] td:first-child { border-left:2px solid var(--accent); }
     .nt-priority-tag { font-family:var(--mono); font-size:8px; color:var(--accent); letter-spacing:.04em;
       opacity:.75; flex-shrink:0; padding-top:3px; }
     .nt-table .nt-draggable-row { display:block; }
@@ -1737,7 +1753,7 @@ function renderMilestoneCreator(projId, milestones) {
     <button class="nt-add" style="margin-bottom:8px;display:block;width:100%;text-align:center"
       onclick="addMilestone('${esc(projId)}',0,null)">+ milestone</button>
     ${l0.length > 0 ? `<span class="nt-layer-label">L0 · Strategic</span>` : ''}
-    <div class="nt-table">
+    <table class="nt-table"><tbody>
     ${l0.map((m, idx) => {
       const escJs = s => esc(s).replace(/'/g, '&#39;');  // escape for single-quoted JS attrs
       const children = l1.filter(c => c.parent_id === m.id);
@@ -1753,50 +1769,42 @@ function renderMilestoneCreator(projId, milestones) {
           + `data-clara="${esc(m.clarification_answer || '')}" data-has-answer="${hasAnswer}"`;
         const clarOnClick = `event.stopPropagation();const d=this.dataset;showClarifyPopup(event,d.projid,d.mid,d.clarq,d.clara,d.hasAnswer==='true')`;
         return `
-          <div class="nt-draggable-row" data-mid="${esc(m.id)}" draggable="true"
+          <tr class="nt-draggable-row" data-mid="${esc(m.id)}" draggable="true"
             ondragstart="_msDragStart(event,'${esc(m.id)}')" ondragend="_msDragEnd(event)" ondragover="_msDragOver(event)"
-            ondragleave="_msDragLeave(event)" ondrop="_msDrop(event,'${esc(projId)}')">
-          <div class="nt-row" style="opacity:.85">
-            <span class="nt-drag-handle" title="Drag to reorder">⋮⋮</span>
-            
-            <span class="nt-mid" title="Milestone ID">${esc(m.id)}</span>
-            <span class="nt-arrow"> </span>
-            <button class="nt-check" style="border:1px solid #7b9fd4;background:rgba(90,120,200,.1);color:#7b9fd4;cursor:pointer;border-radius:4px;width:auto;padding:0 5px;font-size:8px;letter-spacing:.03em;min-width:30px"
-              title="Click to see why Claude flagged this"
-              ${clarDataAttrs} onclick="${clarOnClick}">?</button>
-            <div class="nt-text" style="color:var(--text-soft)">${esc(m.text)}</div>
-            <div class="nt-meta">
-              <span style="font-size:11px;color:#7b9fd4;cursor:pointer" title="Click to see why Claude flagged this"
-                ${clarDataAttrs} onclick="${clarOnClick}">❓</span>
+            ondragleave="_msDragLeave(event)" ondrop="_msDrop(event,'${esc(projId)}')" style="opacity:.85">
+            <td class="ms-td-drag"><span class="nt-drag-handle" title="Drag to reorder">⋮⋮</span></td>
+            <td class="ms-td-id"><span class="nt-mid" title="Milestone ID">${esc(m.id)}</span></td>
+            <td class="ms-td-state"><button class="nt-check" style="border:1px solid #7b9fd4;background:rgba(90,120,200,.1);color:#7b9fd4;cursor:pointer;border-radius:4px;width:auto;padding:0 5px;font-size:8px;letter-spacing:.03em;min-width:30px" title="Needs clarification" ${clarDataAttrs} onclick="${clarOnClick}">?</button></td>
+            <td class="ms-td-text" style="color:var(--text-soft)">${esc(m.text)}</td>
+            <td class="ms-td-meta">
+              <span style="font-size:11px;color:#7b9fd4;cursor:pointer" title="Clarify" ${clarDataAttrs} onclick="${clarOnClick}">❓</span>
               <button class="nt-del" title="Delete" onclick="event.stopPropagation();confirmDeleteMs('${esc(projId)}','${esc(m.id)}','${escJs(m.text.slice(0,60))}')">✕</button>
-            </div>
-          </div>
-          </div>`;
+            </td>
+          </tr>`;
       }
       // pending_confirmation: show confirm/reopen buttons inline
       if (mStatus === 'pending_confirmation') {
+        const msgCnt = (_msConversations[m.id]||[]).length;
         const confirmHtml = `
-          <div class="nt-draggable-row" data-mid="${esc(m.id)}" draggable="true"
+          <tr class="nt-draggable-row" data-mid="${esc(m.id)}" draggable="true"
             ondragstart="_msDragStart(event,'${esc(m.id)}')" ondragend="_msDragEnd(event)" ondragover="_msDragOver(event)"
             ondragleave="_msDragLeave(event)" ondrop="_msDrop(event,'${esc(projId)}')">
-          <div style="background:rgba(204,120,92,.08);border:1px solid var(--accent-soft);border-radius:5px;padding:4px 6px;margin-bottom:2px">
-            <div class="nt-row" style="margin-bottom:0;align-items:flex-start">
-              <span class="nt-drag-handle" style="padding-top:2px" title="Drag to reorder">⋮⋮</span>
-              <span class="nt-mid" title="Milestone ID">${esc(m.id)}</span>
-              <div style="display:flex;flex-direction:column;gap:2px;flex-shrink:0;align-self:flex-start">
+            <td class="ms-td-drag"><span class="nt-drag-handle" title="Drag to reorder">⋮⋮</span></td>
+            <td class="ms-td-id"><span class="nt-mid" title="Milestone ID">${esc(m.id)}</span></td>
+            <td class="ms-td-state" style="vertical-align:top">
+              <div style="display:flex;flex-direction:column;gap:2px">
                 <button onclick="event.stopPropagation();confirmMsDone('${esc(projId)}','${esc(m.id)}')"
-                  style="font-size:9px;padding:1px 5px;border-radius:3px;border:1px solid var(--green);background:var(--green-soft);color:var(--green);cursor:pointer;font-family:var(--mono);line-height:1.4">Confirm</button>
+                  style="font-size:8px;padding:1px 4px;border-radius:3px;border:1px solid var(--green);background:var(--green-soft);color:var(--green);cursor:pointer;font-family:var(--mono);line-height:1.4;white-space:nowrap">Confirm</button>
                 <button onclick="event.stopPropagation();reopenMs('${esc(projId)}','${esc(m.id)}')"
-                  style="font-size:9px;padding:1px 5px;border-radius:3px;border:1px solid var(--panel-border);background:none;color:var(--text-dim);cursor:pointer;font-family:var(--mono);line-height:1.4">Reopen</button>
+                  style="font-size:8px;padding:1px 4px;border-radius:3px;border:1px solid var(--panel-border);background:none;color:var(--text-dim);cursor:pointer;font-family:var(--mono);line-height:1.4">Reopen</button>
               </div>
-              <div style="flex:1;font-size:12px;color:var(--text);min-width:0;overflow-wrap:anywhere;padding-top:1px">
-                ${m.claude_comment ? (() => { const cnt = (_msConversations[m.id]||[]).length; return `<span style="font-size:9px;color:var(--accent);cursor:pointer;padding:1px 4px;border-radius:3px;border:1px solid var(--accent-soft);background:var(--accent-soft);float:right;margin:0 0 2px 4px" title="Claude comment" onclick="event.stopPropagation();showCommentPopup(event,'${escJs(m.claude_comment)}','${esc(projId)}','${esc(m.id)}')">${cnt > 0 ? cnt+' ' : ''}msg</span>`; })() : ''}
-                ${esc(m.text)}
-              </div>
-              <button class="nt-del" style="opacity:1;padding-top:2px" title="Delete this stone" onclick="event.stopPropagation();confirmDeleteMs('${esc(projId)}','${esc(m.id)}','${escJs(m.text.slice(0,60))}')">✕</button>
-            </div>
-          </div>
-          </div>`;
+            </td>
+            <td class="ms-td-text" style="background:rgba(204,120,92,.06);font-size:12px;color:var(--text);overflow-wrap:anywhere">
+              ${m.claude_comment ? `<span style="font-size:9px;color:var(--accent);cursor:pointer;padding:1px 4px;border-radius:3px;border:1px solid var(--accent-soft);background:var(--accent-soft);float:right;margin:0 0 2px 4px" title="Claude comment" onclick="event.stopPropagation();showCommentPopup(event,'${escJs(m.claude_comment)}','${esc(projId)}','${esc(m.id)}')">${msgCnt > 0 ? msgCnt+' ' : ''}msg</span>` : ''}
+              ${esc(m.text)}
+            </td>
+            <td class="ms-td-meta"><button class="nt-del" style="opacity:1" title="Delete" onclick="event.stopPropagation();confirmDeleteMs('${esc(projId)}','${esc(m.id)}','${escJs(m.text.slice(0,60))}')">✕</button></td>
+          </tr>`;
         return confirmHtml;
       }
       // User can only set pending↔queued; done is Claude-only
@@ -1822,26 +1830,32 @@ function renderMilestoneCreator(projId, milestones) {
 
         const cAckTitle = c.claude_ack ? `AI acknowledged (${c.claude_ack})` : 'Not yet reviewed by AI';
         return `
-          <div class="nt-sub-row ${cs==='done'?'nt-done':''}">
-            
-            <span class="nt-mid" title="Milestone ID">${esc(c.id)}</span>
-            <button class="nt-check" ${cBtnAttrs}
-              style="border:1px solid ${csc};background:${csbg};color:${csfg};cursor:default;opacity:${cs==='pending'?'.4':'1'};border-radius:4px;width:auto;padding:0 4px;font-size:7px;letter-spacing:.03em;min-width:26px${!canToggle?';cursor:not-allowed':''}"
-            >${csIcon}</button>
-            <div class="nt-text" style="font-size:11.5px;${c.done?'color:var(--text-dim);text-decoration:line-through;':''}"
-              contenteditable="true"
-              data-ms-id="${esc(c.id)}"
-              onblur="saveMs('${esc(projId)}','${esc(c.id)}',this.textContent)"
-              onkeydown="handleMsTab(event,'${esc(projId)}','${esc(c.id)}')"
-              onclick="event.stopPropagation()"
-            >${esc(c.text)}</div>
-            ${cs!=='done' ? `<span class="${c.claude_ack?'nt-ack-g':'nt-ack-o'}" title="${cAckTitle}" >${c.claude_ack?'acked':'review'}</span>` : ''}
-            <button class="nt-del" title="Delete this stone" onclick="event.stopPropagation();confirmDeleteMs('${esc(projId)}','${esc(c.id)}','${escJs(c.text.slice(0,60))}')">✕</button>
-          </div>`;
+          <tr class="ms-sub-tr ${cs==='done'?'nt-done':''}">
+            <td class="ms-td-drag"></td>
+            <td class="ms-td-id"><span class="nt-mid" title="Child milestone">${esc(c.id)}</span></td>
+            <td class="ms-td-state">
+              ${cs!=='done' ? `<span class="${c.claude_ack?'nt-ack-g':'nt-ack-o'}" style="font-size:8px" title="${cAckTitle}">${c.claude_ack?'ack':'rev'}</span>` : ''}
+              <button class="nt-check" ${cBtnAttrs}
+                style="border:1px solid ${csc};background:${csbg};color:${csfg};cursor:default;opacity:${cs==='pending'?'.4':'1'};border-radius:4px;width:auto;padding:0 4px;font-size:7px;letter-spacing:.03em;min-width:26px;display:block;margin-top:2px"
+              >${csIcon}</button>
+            </td>
+            <td class="ms-td-text" style="padding-left:12px">
+              <div class="nt-text" style="font-size:11.5px;${c.done?'color:var(--text-dim);text-decoration:line-through;':''}"
+                contenteditable="true" data-ms-id="${esc(c.id)}"
+                onblur="saveMs('${esc(projId)}','${esc(c.id)}',this.textContent)"
+                onkeydown="handleMsTab(event,'${esc(projId)}','${esc(c.id)}')"
+                onclick="event.stopPropagation()"
+              >${esc(c.text)}</div>
+            </td>
+            <td class="ms-td-meta">
+              <button class="nt-del" title="Delete" onclick="event.stopPropagation();confirmDeleteMs('${esc(projId)}','${esc(c.id)}','${escJs(c.text.slice(0,60))}')">✕</button>
+            </td>
+          </tr>`;
       }).join('');
 
+      // M101: sub-rows are now separate <tr> elements rendered after parent row
       const subHtml = isOpen && children.length
-        ? `<div class="nt-sub-wrap" onclick="event.stopPropagation()"><span class="nt-layer-label" style="padding-top:2px">L1 · Tactical</span>${childrenHtml}<button class="nt-add" onclick="event.stopPropagation();addMilestone('${esc(projId)}',1,'${esc(m.id)}')">+ sub</button></div>`
+        ? childrenHtml + `<tr class="ms-sub-tr"><td colspan="5" style="padding:2px 4px 4px 60px"><button class="nt-add" style="font-size:10px;padding:2px 8px;border-radius:4px" onclick="event.stopPropagation();addMilestone('${esc(projId)}',1,'${esc(m.id)}')">+ sub</button></td></tr>`
         : '';
 
       // State button: user cannot change state — Claude manages all transitions automatically
@@ -1859,47 +1873,45 @@ function renderMilestoneCreator(projId, milestones) {
 
       const mCommentHtml = '';  // replaced by comment badge in meta row
       return `
-        <div class="nt-draggable-row" data-mid="${esc(m.id)}" data-status="${esc(mStatus)}" draggable="true"
+        <tr class="nt-draggable-row ${mStatus==='done'?'nt-done':''}" data-mid="${esc(m.id)}" data-status="${esc(mStatus)}" draggable="true"
           ondragstart="_msDragStart(event,'${esc(m.id)}')"
           ondragover="_msDragOver(event)"
           ondragleave="_msDragLeave(event)"
           ondrop="_msDrop(event,'${esc(projId)}')"
           onclick="toggleMsExpand('${esc(projId)}','${esc(m.id)}')">
-          <div class="nt-row ${mStatus==='done'?'nt-done':''}">
-            <span class="nt-drag-handle" title="Drag to reorder">⋮⋮</span>
-            ${mStatus === 'queued' ? `<span class="nt-priority-tag" title="Queued — Claude will execute this next">▶</span>` : ''}
+          <td class="ms-td-drag"><span class="nt-drag-handle" title="Drag to reorder">⋮⋮</span></td>
+          <td class="ms-td-id">
+            ${mStatus === 'queued' ? `<span class="nt-priority-tag" title="Queued">▶</span>` : ''}
             <span class="nt-mid" title="Milestone ID">${esc(m.id)}</span>
-            <span class="nt-arrow">${children.length ? (isOpen?'▾':'▸') : ' '}</span>
-            <div style="display:flex;flex-direction:column;gap:2px;flex-shrink:0;align-self:flex-start;align-items:flex-start">
-              ${mStatus!=='done' ? `<span class="${m.claude_ack?'nt-ack-g':'nt-ack-o'}" title="${mAckTitle}">${m.claude_ack?'acked':'review'}</span>` : ''}
-              <button class="nt-check"
-                ${mBtnAttrs}
-                style="border:1px solid ${sc};background:${sbg};color:${sfg};cursor:default;opacity:${mStatus==='pending'?'.4':'1'};border-radius:4px;width:auto;padding:1px 5px;font-size:8px;letter-spacing:.03em;line-height:1.3"
-              >${stateLabel}</button>
-            </div>
-            <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:1px">
-              <div class="nt-text" style="font-weight:${mStatus==='queued'?'500':'400'};${m.done?'color:var(--text-dim);text-decoration:line-through;':''}"
-                contenteditable="true"
-                data-ms-id="${esc(m.id)}"
-                onclick="event.stopPropagation()"
-                onkeydown="handleMsTab(event,'${esc(projId)}','${esc(m.id)}')"
-                onblur="saveMs('${esc(projId)}','${esc(m.id)}',this.textContent)"
-              >${esc(m.text)}</div>
-            </div>
-            <div class="nt-meta">
-              ${children.length ? `<span style="font-family:var(--mono);font-size:9px;color:var(--text-dim)">${childDone}/${children.length}</span>` : ''}
-              ${(!m.claude_ack && m.user_added_at) ? `<span style="font-size:9px;color:var(--accent);flex-shrink:0" title="Added by user — Claude hasn't seen this yet">★</span>` : ''}
-              ${m.user_added_at ? `<span style="font-family:var(--mono);font-size:8px;color:var(--text-dim);opacity:.6;border:1px solid var(--panel-border);border-radius:3px;padding:0 4px" title="Stone added ${esc(m.user_added_at)}">+${esc((m.user_added_at||'').slice(5,16).replace('T',' '))}</span>` : ''}
-              ${mStatus !== 'done' ? `<button class="nt-why" title="${m.star_relation ? 'Why this stone matters (click to view)' : 'Generate: why does this stone matter?'}" style="opacity:${m.star_relation?'1':'.45'}" onclick="event.stopPropagation();${m.star_relation ? `showStarRelModal('${escJs(m.star_relation)}','${escJs(m.text.slice(0,60))}')` : `generateStarRelation('${esc(projId)}','${esc(m.id)}',this)`}">★</button>` : ''}
-              <button class="nt-why" title="Chat about this milestone (M59)" style="font-size:9px;opacity:${(_msConversations[m.id]||[]).length>0?'1':'.45'}" onclick="event.stopPropagation();showCommentPopup(event,'${escJs(m.claude_comment||'')}','${esc(projId)}','${esc(m.id)}')">${(_msConversations[m.id]||[]).length>0 ? (_msConversations[m.id].length+' msg') : 'msg'}</button>
-              <button class="nt-del" title="Delete this stone" onclick="event.stopPropagation();confirmDeleteMs('${esc(projId)}','${esc(m.id)}','${escJs(m.text.slice(0,60))}')">✕</button>
-            </div>
-          </div>
-          ${mCommentHtml}
-          ${subHtml}
-        </div>`;
+            <span class="nt-arrow" style="font-size:10px;color:var(--text-soft)">${children.length ? (isOpen?'▾':'▸') : ''}</span>
+          </td>
+          <td class="ms-td-state">
+            ${mStatus!=='done' ? `<span class="${m.claude_ack?'nt-ack-g':'nt-ack-o'}" title="${mAckTitle}" style="display:block;margin-bottom:2px">${m.claude_ack?'acked':'review'}</span>` : ''}
+            <button class="nt-check"
+              ${mBtnAttrs}
+              style="border:1px solid ${sc};background:${sbg};color:${sfg};cursor:default;opacity:${mStatus==='pending'?'.4':'1'};border-radius:4px;width:auto;padding:1px 5px;font-size:8px;letter-spacing:.03em;line-height:1.3"
+            >${stateLabel}</button>
+          </td>
+          <td class="ms-td-text">
+            <div class="nt-text" style="font-weight:${mStatus==='queued'?'500':'400'};${m.done?'color:var(--text-dim);text-decoration:line-through;':''}"
+              contenteditable="true" data-ms-id="${esc(m.id)}"
+              onclick="event.stopPropagation()"
+              onkeydown="handleMsTab(event,'${esc(projId)}','${esc(m.id)}')"
+              onblur="saveMs('${esc(projId)}','${esc(m.id)}',this.textContent)"
+            >${esc(m.text)}</div>
+          </td>
+          <td class="ms-td-meta">
+            ${children.length ? `<span style="font-family:var(--mono);font-size:9px;color:var(--text-dim)">${childDone}/${children.length}</span>` : ''}
+            ${(!m.claude_ack && m.user_added_at) ? `<span style="font-size:9px;color:var(--accent)" title="New — Claude hasn't seen this">★</span>` : ''}
+            ${m.user_added_at ? `<span style="font-family:var(--mono);font-size:8px;color:var(--text-dim);opacity:.6;border:1px solid var(--panel-border);border-radius:3px;padding:0 3px" title="Added ${esc(m.user_added_at)}">+${esc((m.user_added_at||'').slice(5,10))}</span>` : ''}
+            ${mStatus !== 'done' ? `<button class="nt-why" title="${m.star_relation ? 'Why this matters' : 'Generate: why this matters'}" style="opacity:${m.star_relation?'1':'.45'}" onclick="event.stopPropagation();${m.star_relation ? `showStarRelModal('${escJs(m.star_relation)}','${escJs(m.text.slice(0,60))}')` : `generateStarRelation('${esc(projId)}','${esc(m.id)}',this)`}">★</button>` : ''}
+            <button class="nt-why" title="Chat" style="font-size:9px;opacity:${(_msConversations[m.id]||[]).length>0?'1':'.45'}" onclick="event.stopPropagation();showCommentPopup(event,'${escJs(m.claude_comment||'')}','${esc(projId)}','${esc(m.id)}')">${(_msConversations[m.id]||[]).length>0 ? (_msConversations[m.id].length+' msg') : 'msg'}</button>
+            <button class="nt-del" title="Delete" onclick="event.stopPropagation();confirmDeleteMs('${esc(projId)}','${esc(m.id)}','${escJs(m.text.slice(0,60))}')">✕</button>
+          </td>
+        </tr>
+        ${subHtml}`;
     }).join('')}
-    </div>
+    </tbody></table>
   </div>`;
 
   // Collapsed "Completed" section for done stones
