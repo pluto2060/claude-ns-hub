@@ -3524,11 +3524,9 @@ async function killSession() {
   if (projId && projId !== '—') {
     _sessionStatus[projId] = 'none';
     render(); // redraw cards with updated pill
-    // M89: immediately clear exec session list so UI reflects kill without waiting for 5s poll
+    // M89: show stopping indicator immediately — do NOT flip button (poll drives that)
     const execList = document.getElementById('dm-exec-sessions');
-    if (execList) execList.innerHTML = '';
-    const execBtn = document.getElementById('dm-exec-btn');
-    if (execBtn) { execBtn.textContent = '▶ Execute'; execBtn.title = 'Execute: init milestones or process queued work'; }
+    if (execList) execList.innerHTML = `<div style="font-family:var(--mono);font-size:10px;color:var(--text-dim);padding:4px 2px;opacity:.7">stopping…</div>`;
     clearInterval(window._execPollTimer); // stop poll; restart after kill completes
     // Persist to server
     fetch(`/api/northstar/${encodeURIComponent(projId)}/session-status`, {
@@ -3935,6 +3933,9 @@ async function killExecSession() {
   const projId = _tmuxWatchProjId;
   stopTmuxWatch();
   if (!projId) return;
+  // M89: show stopping indicator in session list immediately (before 2s grace)
+  const execInfo = document.getElementById('dm-exec-sessions');
+  if (execInfo) execInfo.innerHTML = `<div style="font-family:var(--mono);font-size:10px;color:var(--text-dim);padding:4px 2px;opacity:.7">stopping…</div>`;
   const output = document.getElementById('dm-tmux-output');
   if (output) output.textContent = '(stopping — saving task position…)';
   // 2-second grace: signal Claude to save current task state before kill
@@ -3945,13 +3946,8 @@ async function killExecSession() {
   await new Promise(r => setTimeout(r, 2000));
   await fetch(`/api/northstar/${encodeURIComponent(projId)}/exec-session`, {method:'DELETE'}).catch(()=>{});
   if (output) output.textContent = '(session killed)';
-  // Reset execute button + immediately clear session list (M89: no lag after kill)
+  // M89: do NOT flip button directly — let _refreshExecState drive that after poll confirms gone
   window._execLaunchBtn = null;
-  const execBtn = document.getElementById('dm-exec-btn');
-  if (execBtn) { execBtn.textContent = '▶ Execute'; execBtn.classList.remove('running', 'exec-loading'); }
-  const execInfo = document.getElementById('dm-exec-sessions');
-  if (execInfo) execInfo.innerHTML = '';
-  // Re-poll after kill to confirm disappearance
   clearInterval(window._execPollTimer);
   if (window._refreshExecState) {
     setTimeout(window._refreshExecState, 500);
@@ -4006,6 +4002,7 @@ function stopTmuxWatch() {
 async function loadTaskBoard(projId) {
   const board = document.getElementById('dm-task-board');
   if (!board) return;
+  board.innerHTML = ''; // clear previous project's tasks immediately
   try {
     const r = await fetch(`/api/northstar/${encodeURIComponent(projId)}/task-board`);
     const d = await r.json();
