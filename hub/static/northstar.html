@@ -2222,11 +2222,15 @@ async function saveMs(projId, mid, text) {
 }
 
 async function confirmMsDone(projId, mid) {
+  // M106: optimistic update — flip badge immediately before server round-trip
+  const row = document.querySelector(`[data-mid="${mid}"]`);
+  if (row) row.style.opacity = '0.5';
   await fetch(`/api/northstar/${encodeURIComponent(projId)}/milestones/${encodeURIComponent(mid)}`, {
     method: 'PATCH', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({status: 'done', done: true}),
   });
   await loadMilestones(projId);
+  render(); // M106: refresh swimlane cards so progress bars update
 }
 
 async function reopenMs(projId, mid) {
@@ -2235,6 +2239,7 @@ async function reopenMs(projId, mid) {
     body: JSON.stringify({status: 'pending', done: false}),
   });
   await loadMilestones(projId);
+  render(); // M106: refresh swimlane cards
 }
 
 async function executeProject(projId, btn) {
