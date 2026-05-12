@@ -2242,6 +2242,8 @@ async function executeProject(projId, btn) {
         // Keep loading state — startTmuxWatch will clear it once session is confirmed running
         window._execLaunchBtn = btn;
         startTmuxWatch(projId);
+        // Refresh stone badges — server just acked/queued new pending stones
+        loadMilestones(projId);
       } else {
         btn.classList.remove('exec-loading');
         btn.textContent = d.mode === 'init' ? '⊕' : '✓';
@@ -2745,25 +2747,22 @@ async function saveDeadline(projId, dateStr) {
   if (!p) return;
   p.deadline = dateStr;
   render();
-  // Patch the open detail modal deadline button in-place (render() only updates swimlane cards)
+  // Update deadline button in the open detail modal (render() only redraws swimlane cards)
+  // dm-deadline-row is the <button> itself in renderHierarchy, not a container
   const dlRow = document.getElementById('dm-deadline-row');
   if (dlRow) {
     const dl = deadlineBadge(dateStr);
-    const btn = dlRow.querySelector('button');
+    // dlRow may be the button itself OR a container with a child button
+    const btn = dlRow.tagName === 'BUTTON' ? dlRow : dlRow.querySelector('button');
     if (btn) {
       btn.style.color = dl.color;
       Array.from(btn.childNodes).forEach(n => {
         if (n.nodeType === Node.TEXT_NODE && n.textContent.trim()) n.textContent = dl.text;
       });
     }
-    const progBar = dlRow.nextElementSibling;
-    if (progBar && progBar.firstElementChild) {
-      const rem = Math.max(0, (new Date(dateStr) - new Date()) / 86400000);
-      const pct = Math.max(0, Math.min(100, 100 - Math.round(rem / 365 * 100)));
-      progBar.firstElementChild.style.width = pct + '%';
-      progBar.firstElementChild.style.background = dl.color;
-    }
   }
+  // Reload milestone creator so progress bars reflect new deadline
+  if (typeof loadMilestones === 'function' && projId) loadMilestones(projId);
 }
 
 async function saveNodeName(el, projId) {
