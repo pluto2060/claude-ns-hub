@@ -52,62 +52,8 @@ def get_project_id(cwd: str) -> str | None:
 
 
 def _ensure_watcher():
-    """Start milestone-watcher.py daemon if not already running."""
-    pid_file = Path("/tmp/hub-milestone-watcher.pid")
-    watcher = Path.home() / ".claude/hub/milestone-watcher.py"
-    if not watcher.exists():
-        return
-    # Check if existing process is alive
-    if pid_file.exists():
-        try:
-            pid = int(pid_file.read_text().strip())
-            os.kill(pid, 0)  # signal 0 = check existence
-            return  # already running
-        except (OSError, ValueError):
-            pid_file.unlink(missing_ok=True)
-    # Start daemon
-    import subprocess
-    subprocess.Popen(
-        [sys.executable, str(watcher)],
-        stdout=open("/tmp/hub-watcher.log", "a"),
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
-    # Ensure hardened task watcher is running (crash-recovery + API error retry)
-    hardened_pid = Path("/tmp/hub-task-watcher.pid")
-    hardened_script = Path.home() / ".claude/hub/task-watcher-hardened.py"
-    if hardened_script.exists():
-        if hardened_pid.exists():
-            try:
-                os.kill(int(hardened_pid.read_text().strip()), 0)
-            except (OSError, ValueError):
-                hardened_pid.unlink(missing_ok=True)
-        if not hardened_pid.exists():
-            subprocess.Popen(
-                [sys.executable, str(hardened_script)],
-                stdout=open("/tmp/hub-task-watcher.log", "a"),
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-    # Also ensure task-worker.sh is running
-    worker_pid = Path("/tmp/hub-task-worker.pid")
-    worker_sh = Path.home() / ".claude/hub/task-worker.sh"
-    if worker_sh.exists():
-        if worker_pid.exists():
-            try:
-                os.kill(int(worker_pid.read_text().strip()), 0)
-            except (OSError, ValueError):
-                worker_pid.unlink(missing_ok=True)
-        if not worker_pid.exists():
-            worker_py = Path.home() / ".claude/hub/task-worker.py"
-            target = str(worker_py) if worker_py.exists() else str(worker_sh)
-            cmd = [sys.executable, target] if target.endswith(".py") else ["bash", target]
-            subprocess.Popen(
-                cmd,
-                stdout=open("/tmp/hub-task-worker.log", "a"),
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
+    """No-op: daemon watchers removed. server.py asyncio task handles milestone sync."""
+    pass
 
 
 def main():
@@ -215,7 +161,7 @@ def main():
     lines.append( "     Step 1 — NEW unacked: status=pending AND claude_ack=null.")
     lines.append( "       For each: PATCH claude_ack=now. If clear (>15 chars) → keep status=pending. If vague → needs_clarification + question.")
     lines.append( "       (Promotion to queued is user-only via Execute button — do NOT auto-promote here.)")
-    lines.append( "     Step 2 — WORK: first milestone with status=queued → implement it now. On done: write completion-log, PATCH pending_confirmation.")
+    lines.append( "     Step 2 — WORK: (skip — Execute button + exec session handle implementation. Do NOT auto-implement here.)")
     lines.append( "     Step 3 — ANSWERED: needs_clarification AND clarification_answer set → PATCH status=pending.")
     lines.append( "     If nothing, output nothing.'")
     lines.append( "  REPL idle → cron fires → works on first queued → done → idle → next task. Self-scheduling chain.")
