@@ -782,6 +782,7 @@ header {
 }
 .dm-btn:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
 .dm-btn.loading { opacity: .5; pointer-events: none; }
+.dm-btn.exec-loading { pointer-events: none; animation: sess-pulse 1s ease-in-out infinite; }
 .dm-btn-refresh { border-color: var(--green); color: var(--green); background: var(--green-soft); }
 .dm-btn-refresh:hover { opacity: .85; }
 
@@ -1065,12 +1066,32 @@ header {
     background:#252220;border-bottom:1px solid #333">
     <span style="font-family:var(--mono);font-size:11px;color:#cc785c">LIVE SESSION</span>
     <div style="display:flex;gap:6px">
-      <button onclick="killExecSession()" style="background:none;border:1px solid #555;border-radius:4px;color:#e05252;font-family:var(--mono);font-size:10px;padding:2px 7px;cursor:pointer">■ stop</button>
+      <button onclick="document.getElementById('kill-confirm-overlay').style.display='flex'" style="background:none;border:1px solid #c0392b;border-radius:4px;color:#e05252;font-family:var(--mono);font-size:10px;padding:2px 7px;cursor:pointer">■ kill</button>
       <button onclick="toggleTmuxOverlay()" style="background:none;border:1px solid #555;border-radius:4px;color:#888;font-family:var(--mono);font-size:10px;padding:2px 7px;cursor:pointer">✕</button>
     </div>
   </div>
   <div id="dm-tmux-output" style="font-size:10px;font-family:var(--mono);color:#d4cfc8;padding:10px;
     max-height:240px;overflow-y:auto;white-space:pre-wrap;line-height:1.5"></div>
+</div>
+
+<!-- Kill session confirm dialog (fixed viewport overlay) -->
+<div id="kill-confirm-overlay" style="display:none;position:fixed;inset:0;z-index:10000;
+  background:rgba(0,0,0,.6);align-items:center;justify-content:center">
+  <div style="background:#1e1c1a;border:1px solid #555;border-radius:10px;
+    padding:20px 24px;max-width:280px;width:90%;box-shadow:0 8px 40px rgba(0,0,0,.6)">
+    <div style="font-size:13px;color:#e05252;margin-bottom:8px;font-weight:500">Kill session?</div>
+    <div style="font-size:11px;color:#888;font-family:var(--mono);margin-bottom:16px;line-height:1.5">
+      The live session will be terminated. In-progress tasks may be lost.
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button onclick="document.getElementById('kill-confirm-overlay').style.display='none'"
+        style="font-size:11px;font-family:var(--mono);padding:5px 14px;border-radius:5px;
+        border:1px solid #444;background:none;color:#888;cursor:pointer">Cancel</button>
+      <button onclick="document.getElementById('kill-confirm-overlay').style.display='none';killExecSession()"
+        style="font-size:11px;font-family:var(--mono);padding:5px 14px;border-radius:5px;
+        border:1px solid #c0392b;background:rgba(192,57,43,.15);color:#e05252;cursor:pointer">Kill</button>
+    </div>
+  </div>
 </div>
 
 <!-- Delete confirm dialog (inside hub modal, not browser confirm) -->
@@ -1994,18 +2015,23 @@ async function reopenMs(projId, mid) {
 
 async function executeProject(projId, btn) {
   if (btn.classList.contains('running')) return;
-  btn.classList.add('running');
+  btn.classList.add('running', 'exec-loading');
   const orig = btn.textContent;
-  btn.textContent = '⟳';
+  btn.textContent = '◌ Launching…';
   try {
     const r = await fetch(`/api/northstar/${encodeURIComponent(projId)}/execute`, {method:'POST'});
     const d = await r.json();
     if (d.ok) {
-      btn.textContent = d.mode === 'init' ? '⊕' : d.mode === 'tmux' ? '▶▶' : d.mode === 'tmux_active' ? '◉' : '✓';
       btn.title = d.message;
-      if (d.mode === 'tmux') startTmuxWatch(projId);
-      if (d.mode === 'tmux_active') startTmuxWatch(projId); // already running, just show session
-      // Show results panel and start polling
+      if (d.mode === 'tmux' || d.mode === 'tmux_active') {
+        // Keep loading state — startTmuxWatch will clear it once session is confirmed running
+        window._execLaunchBtn = btn;
+        startTmuxWatch(projId);
+      } else {
+        btn.classList.remove('exec-loading');
+        btn.textContent = d.mode === 'init' ? '⊕' : '✓';
+      }
+      // Show results panel
       const resPanel = document.getElementById('dm-task-results');
       const resBody = document.getElementById('dm-task-results-body');
       if (resPanel && resBody) {
@@ -2025,18 +2051,17 @@ async function executeProject(projId, btn) {
               }).join('');
             }
           } catch(_) {}
-          loadTaskBoard(projId);  // refresh job board
-          if (polls >= 12) { clearInterval(poll); btn.textContent = orig; btn.classList.remove('running'); }
+          loadTaskBoard(projId);
+          if (polls >= 12) clearInterval(poll);
         }, 5000);
-      } else {
-        setTimeout(() => { btn.textContent = orig; btn.classList.remove('running'); }, 4000);
       }
     } else {
       btn.textContent = d.error?.includes('No active terminal') ? '⚠' : '!';
+      btn.classList.remove('exec-loading');
       btn.title = d.error || 'Error';
       setTimeout(() => { btn.textContent = orig; btn.title = 'Execute'; btn.classList.remove('running'); }, 3000);
     }
-  } catch(_) { btn.textContent = orig; btn.classList.remove('running'); }
+  } catch(_) { btn.textContent = orig; btn.classList.remove('running', 'exec-loading'); }
 }
 
 async function runMilestone(projId, mid, btn) {
@@ -3584,18 +3609,23 @@ function toggleTmuxOverlay() {
 let _tmuxWatchProjId = null;
 
 async function killExecSession() {
+  const projId = _tmuxWatchProjId;
   stopTmuxWatch();
-  if (!_tmuxWatchProjId) return;
+  if (!projId) return;
   const output = document.getElementById('dm-tmux-output');
   if (output) output.textContent = '(stopping — saving task position…)';
   // 2-second grace: signal Claude to save current task state before kill
-  await fetch(`/api/northstar/${encodeURIComponent(_tmuxWatchProjId)}/exec-inject`, {
+  await fetch(`/api/northstar/${encodeURIComponent(projId)}/exec-inject`, {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({prompt: '[STOP SIGNAL] Mark your current in-progress task position and exit cleanly.'})
   }).catch(()=>{});
   await new Promise(r => setTimeout(r, 2000));
-  await fetch(`/api/northstar/${encodeURIComponent(_tmuxWatchProjId)}/exec-session`, {method:'DELETE'}).catch(()=>{});
-  if (output) output.textContent = '(session stopped)';
+  await fetch(`/api/northstar/${encodeURIComponent(projId)}/exec-session`, {method:'DELETE'}).catch(()=>{});
+  if (output) output.textContent = '(session killed)';
+  // Reset execute button to idle
+  window._execLaunchBtn = null;
+  const execBtn = document.getElementById('dm-exec-btn');
+  if (execBtn) { execBtn.textContent = '▶ Execute'; execBtn.classList.remove('running', 'exec-loading'); }
 }
 
 function startTmuxWatch(projId) {
@@ -3612,10 +3642,23 @@ function startTmuxWatch(projId) {
     try {
       const r = await fetch(`/api/northstar/${encodeURIComponent(projId)}/tmux-output?lines=25`);
       const d = await r.json();
-      if (!d.running) { output.textContent = '(session ended)'; stopTmuxWatch(); return; }
+      if (!d.running) {
+        output.textContent = '(session ended)';
+        stopTmuxWatch();
+        // Reset execute button to idle
+        const execBtn = document.getElementById('dm-exec-btn');
+        if (execBtn) { execBtn.textContent = '▶ Execute'; execBtn.classList.remove('running','exec-loading'); }
+        return;
+      }
+      // First confirmed-running poll: clear loading state on execute button
+      if (window._execLaunchBtn) {
+        window._execLaunchBtn.textContent = '▶▶';
+        window._execLaunchBtn.classList.remove('exec-loading');
+        window._execLaunchBtn = null;
+      }
       const atBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 40;
       output.textContent = d.output || '(waiting for output…)';
-      if (atBottom) output.scrollTop = output.scrollHeight;  // only auto-scroll if already at bottom
+      if (atBottom) output.scrollTop = output.scrollHeight;
     } catch(_) {}
   };
   poll();
@@ -3636,19 +3679,15 @@ async function loadTaskBoard(projId) {
     const r = await fetch(`/api/northstar/${encodeURIComponent(projId)}/task-board`);
     const d = await r.json();
     const allJobs = d.jobs || [];
-    // Only show active jobs (queued/running) + last 3 completed
-    const activeJobs = allJobs.filter(j => j.status === 'queued' || j.status === 'running')
-      .sort((a, b) => b.task_id > a.task_id ? 1 : -1);  // newest first
-    const recentDone = allJobs.filter(j => j.status !== 'queued' && j.status !== 'running')
-      .sort((a, b) => (b.completed_at || b.task_id) > (a.completed_at || a.task_id) ? 1 : -1)
-      .slice(0, 3);
-    const jobs = [...activeJobs, ...recentDone];
+    // Only show active tasks (queued/running) — completed tasks are removed
+    const jobs = allJobs.filter(j => j.status === 'queued' || j.status === 'running')
+      .sort((a, b) => b.task_id > a.task_id ? 1 : -1);
     if (!jobs.length) { board.innerHTML = ''; return; }
     const statusIcon = {queued:'○',running:'⟳',done:'✓',failed:'✕',timeout:'⏱'}
     const statusColor = {queued:'var(--text-dim)',running:'var(--accent)',done:'var(--green)',failed:'var(--red)',timeout:'var(--red)'}
     board.innerHTML = `
       <div style="font-size:9px;font-family:var(--mono);color:var(--text-dim);margin-bottom:4px;letter-spacing:.05em;margin-top:8px">
-        JOBS${activeJobs.length ? ` (${activeJobs.length} active)` : ''} <span style="cursor:pointer;color:var(--accent)" onclick="loadTaskBoard('${esc(projId)}')">↻</span>
+        TASKS${jobs.length ? ` (${jobs.length} active)` : ''} <span style="cursor:pointer;color:var(--accent)" onclick="loadTaskBoard('${esc(projId)}')">↻</span>
       </div>
       <div style="font-size:10px;font-family:var(--mono);line-height:1.7">
         ${jobs.map(j => {
