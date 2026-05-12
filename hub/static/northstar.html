@@ -3476,6 +3476,9 @@ async function openDetail(idx) {
   document.getElementById('dm-right').innerHTML =
     '<div style="padding:20px;color:var(--text-dim);font-family:var(--mono);font-size:12px">Loading…</div>';
 
+  // Load milestones immediately — don't wait for OKR/CTX/doc
+  loadMilestones(p.id);
+
   // Fetch OKRs + CTX + doc in parallel
   const [okrData, ctxData, docData] = await Promise.all([
     fetch(`/api/northstar/${esc(p.id)}/okrs`).then(r=>r.json()).catch(()=>({ok:false,okrs:[]})),
@@ -3511,7 +3514,6 @@ async function openDetail(idx) {
         </div>`;
       }).join('') : '';
     }
-    loadMilestones(p.id);
   }
 }
 
