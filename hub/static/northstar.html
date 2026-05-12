@@ -1067,6 +1067,8 @@ header {
   </div>
 </div>
 
+<!-- M122: backdrop behind floating terminal — click to close -->
+<div id="ns-term-backdrop" style="display:none;position:fixed;inset:0;z-index:299;background:transparent" onclick="closeTerminal()"></div>
 <!-- Floating draggable terminal — full-screen on mobile, floating on desktop -->
 <div id="ns-terminal-float" style="display:none;position:fixed;
   top:60px;left:50%;transform:translateX(-50%) translateZ(0);
@@ -1557,6 +1559,9 @@ async function toggleNSMilestone(projId, nsId, mid, newDone, rowEl) {
 function renderMilestoneCreator(projId, milestones) {
   const el = document.getElementById('dm-ms-creator');
   if (!el) return;
+
+  // M121: cache milestones for immediate re-render on setting changes (e.g. deadline)
+  _msCacheByProject[projId] = milestones;
 
   // Claude manages all state transitions; users can only add/delete
   const canToggle = false;
@@ -2081,6 +2086,7 @@ let _touchDragMid = null, _touchDragEl = null, _touchDragProjId = null;
 let _touchDragGhost = null, _touchDragOffsetX = 0, _touchDragOffsetY = 0;
 let _nodeTouchSrc = null, _nodeTouchIdx = null, _nodeTouchGhost = null, _nodeTouchOX = 0, _nodeTouchOY = 0;
 let _msConversations = {}; // mid → [{role,text,ts}] conversation thread cache
+let _msCacheByProject = {}; // M121: projId → milestones[] for immediate re-render on setting change
 
 function _nodeTouchDrag() {
   const DRAG_THRESHOLD = 8; // px movement before drag activates
@@ -2214,8 +2220,9 @@ function _msTouchSetup(projId) {
         const toIdx   = domOrder.indexOf(targetMid);
         if (fromIdx >= 0 && toIdx >= 0) {
           domOrder.splice(fromIdx, 1);
-          domOrder.splice(toIdx, 0, _touchDragMid);
-          const serverOrder = [...domOrder].reverse();
+          const insertAt = fromIdx < toIdx ? toIdx - 1 : toIdx;
+          domOrder.splice(insertAt, 0, _touchDragMid);
+          const serverOrder = domOrder; // display order = server order, no reversal
           await fetch(`/api/northstar/${encodeURIComponent(_touchDragProjId)}/milestones/reorder`, {
             method: 'POST', headers: {'Content-Type':'application/json'},
             body: JSON.stringify({order: serverOrder})
@@ -2820,7 +2827,8 @@ async function saveDeadline(projId, dateStr) {
       if (n.nodeType === Node.TEXT_NODE && n.textContent.trim()) n.textContent = dl.text;
     });
   }
-  // Reload milestone creator so progress bars reflect new deadline
+  // M121: immediately re-render progress bars from cache, then background-sync from server
+  if (_msCacheByProject[projId]) renderMilestoneCreator(projId, _msCacheByProject[projId]);
   if (typeof loadMilestones === 'function' && projId) loadMilestones(projId);
 }
 
@@ -3346,6 +3354,8 @@ function openTerminal(projId) {
   // Show floating terminal (no longer embedded in modal)
   const float = document.getElementById('ns-terminal-float');
   float.style.display = 'flex';
+  const bd = document.getElementById('ns-term-backdrop');
+  if (bd) bd.style.display = 'block';
   document.getElementById('ns-term-proj').textContent = projId;
   _termMinimized = false;
   float.classList.remove('ns-term-minimized'); // reset if reopened while minimized
@@ -3520,6 +3530,8 @@ function closeTerminal() {
   if (_termRo) { _termRo.disconnect(); _termRo = null; }
   if (_termWs) { _termWs.close(); _termWs = null; }
   document.getElementById('ns-terminal-float').style.display = 'none';
+  const bd = document.getElementById('ns-term-backdrop');
+  if (bd) bd.style.display = 'none';
   // Mark as detached — PTY still alive, pill shows "detached" until next refresh
   if (projId && projId !== '—') {
     _sessionStatus[projId] = 'detached';
@@ -3592,7 +3604,7 @@ async function killSession() {
     render(); // redraw cards with updated pill
     // M89: show stopping indicator immediately — do NOT flip button (poll drives that)
     const execList = document.getElementById('dm-exec-sessions');
-    if (execList) execList.innerHTML = `<div style="font-family:var(--mono);font-size:12px;font-weight:600;color:#e05252;padding:6px 4px;letter-spacing:.08em;animation:stop-pulse 0.8s ease-in-out infinite alternate">⬛ STOPPING…</div>`;
+    if (execList) execList.innerHTML = `<div style="font-family:var(--mono);font-size:13px;font-weight:700;color:#e05252;padding:10px 4px;letter-spacing:.12em;text-align:center;animation:stop-pulse 0.8s ease-in-out infinite alternate">STOPPING</div>`;
     clearInterval(window._execPollTimer); // stop poll; restart after kill completes
     // Persist to server
     fetch(`/api/northstar/${encodeURIComponent(projId)}/session-status`, {
@@ -4014,9 +4026,9 @@ async function killExecSession() {
   if (!projId) return;
   // M89: show stopping indicator in session list immediately (before 2s grace)
   const execInfo = document.getElementById('dm-exec-sessions');
-  if (execInfo) execInfo.innerHTML = `<div style="font-family:var(--mono);font-size:12px;font-weight:600;color:#e05252;padding:6px 4px;letter-spacing:.08em;animation:stop-pulse 0.8s ease-in-out infinite alternate">⬛ STOPPING…</div>`;
+  if (execInfo) execInfo.innerHTML = `<div style="font-family:var(--mono);font-size:13px;font-weight:700;color:#e05252;padding:10px 4px;letter-spacing:.12em;text-align:center;animation:stop-pulse 0.8s ease-in-out infinite alternate">STOPPING</div>`;
   const output = document.getElementById('dm-tmux-output');
-  if (output) { output.style.color = '#e05252'; output.style.fontWeight = '600'; output.textContent = '⬛ STOPPING — saving task position…'; }
+  if (output) { output.style.color = '#e05252'; output.style.fontWeight = '700'; output.style.textAlign = 'center'; output.style.fontSize = '13px'; output.style.letterSpacing = '.12em'; output.textContent = 'STOPPING'; }
   // 2-second grace: signal Claude to save current task state before kill
   await fetch(`/api/northstar/${encodeURIComponent(projId)}/exec-inject`, {
     method: 'POST', headers: {'Content-Type':'application/json'},
@@ -4024,7 +4036,7 @@ async function killExecSession() {
   }).catch(()=>{});
   await new Promise(r => setTimeout(r, 2000));
   await fetch(`/api/northstar/${encodeURIComponent(projId)}/exec-session`, {method:'DELETE'}).catch(()=>{});
-  if (output) { output.style.color = ''; output.style.fontWeight = ''; output.textContent = '(session killed)'; }
+  if (output) { output.style.color = 'var(--green,#4caf50)'; output.style.fontWeight = '700'; output.style.textAlign = 'center'; output.style.fontSize = '13px'; output.style.letterSpacing = '.12em'; output.textContent = 'SAVED'; setTimeout(() => { if (output) { output.style.color = ''; output.style.fontWeight = ''; output.style.textAlign = ''; output.style.fontSize = ''; output.style.letterSpacing = ''; output.textContent = '(session ended)'; } }, 2000); }
   // M89: do NOT flip button directly — let _refreshExecState drive that after poll confirms gone
   // Burst-poll after kill: 500ms, 1.5s, 3s, then settle to normal 5s interval
   window._execLaunchBtn = null;

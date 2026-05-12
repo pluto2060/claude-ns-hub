@@ -13,20 +13,21 @@ current_path=$(echo "$input" | jq -r '.cwd // empty' 2>/dev/null)
 dir_name=$(basename "$current_path")
 current_time=$(date +"%H:%M")
 
-# Project index: pos-map (config order) → fallback internal number → fallback tmux
+# Project index: pos-map by dir_name (most reliable) → zellij session → tmux window index
+# M110: dir_name lookup takes priority to fix inherited TMUX env showing wrong window index
 POS_MAP="${HOME}/.config/celi-pos-map.conf"
 proj_num=""
-if [ -n "$ZELLIJ_SESSION_NAME" ]; then
+# 1. First priority: exact pos-map match by directory name (works for exec sessions too)
+dir_pos=$(grep -i "${dir_name}" "$POS_MAP" 2>/dev/null | grep -v '^#' | head -1 | cut -d= -f2)
+if [ -n "$dir_pos" ]; then
+    proj_num=$(printf '%02d' "$((10#${dir_pos}))")
+elif [ -n "$ZELLIJ_SESSION_NAME" ]; then
+    # 2. Fallback: exact zellij session name match in pos-map
     pos_num=$(grep "^${ZELLIJ_SESSION_NAME}=" "$POS_MAP" 2>/dev/null | cut -d= -f2)
     [ -n "$pos_num" ] && proj_num=$(printf '%02d' "$((10#${pos_num}))")
 elif [ -n "$TMUX" ]; then
+    # 3. Last resort: tmux window index (unreliable in exec sessions — inherited env)
     proj_num=$(tmux display-message -p '#I' 2>/dev/null | awk '{printf "%02d", $1}')
-fi
-# M110: dir_name fallback — if session lookup gave a number from a different project,
-# try to find a pos-map entry that contains dir_name (case-insensitive)
-if [ -z "$proj_num" ] || ! echo "$ZELLIJ_SESSION_NAME" | grep -qi "$dir_name"; then
-    dir_pos=$(grep -i "${dir_name}" "$POS_MAP" 2>/dev/null | grep -v '^#' | head -1 | cut -d= -f2)
-    [ -n "$dir_pos" ] && proj_num=$(printf '%02d' "$((10#${dir_pos}))")
 fi
 if [ -n "$transcript_path" ]; then
     proj_key=$(basename "$(dirname "$transcript_path")")
