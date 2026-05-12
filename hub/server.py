@@ -1412,11 +1412,18 @@ async def execute_project(proj_id: str):
         # TMUX SESSION MODE: spawn one persistent claude session, inject cron-creation prompt
         # CronCreate in this session = auto-retry on API errors (built-in resilience)
 
-        # Auto-promote acked pending → queued immediately on Execute click
-        # (background poller does this every 5 min, but Execute should trigger it now)
+        # On Execute: ack any unreviewed milestones first, then promote all acked pending → queued
+        _now_iso = datetime.now().strftime("%Y-%m-%dT%H:%M")
         _promoted = False
         for _m in milestones:
-            if isinstance(_m, dict) and (_m.get("status") in ("pending", None) or not _m.get("status")) and _m.get("claude_ack") and not _m.get("done"):
+            if not isinstance(_m, dict) or _m.get("done"): continue
+            _st = _m.get("status") or ""
+            if _st in ("done", "pending_confirmation", "queued", "needs_clarification"): continue
+            # Ack if unreviewed
+            if not _m.get("claude_ack"):
+                _m["claude_ack"] = _now_iso
+            # Promote acked pending → queued
+            if _m.get("claude_ack") and _st in ("pending", None, ""):
                 _m["status"] = "queued"
                 _promoted = True
         if _promoted:
