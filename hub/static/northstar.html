@@ -3945,9 +3945,18 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
     ${buildReplyInput()}`;
   document.body.appendChild(popup);
   setTimeout(() => popup.querySelector('#comment-reply-input')?.focus(), 50);
-  setTimeout(() => document.addEventListener('click', function h(e) {
-    if (!popup.contains(e.target)) { popup.remove(); document.removeEventListener('click', h); }
-  }), 100);
+  // M130: close on click OR touchstart outside (mobile tap doesn't always fire click)
+  setTimeout(() => {
+    function _hComment(e) {
+      if (!popup.contains(e.target)) {
+        popup.remove();
+        document.removeEventListener('click', _hComment);
+        document.removeEventListener('touchstart', _hComment);
+      }
+    }
+    document.addEventListener('click', _hComment);
+    document.addEventListener('touchstart', _hComment, {passive: true});
+  }, 100);
 }
 
 async function _doCommentReply(projId, mid, inputEl, currentStatus) {
@@ -4015,9 +4024,17 @@ function showClarifyPopup(event, projId, mid, clarQ, clarA, hasAnswer) {
     </div>`;
   document.body.appendChild(popup);
   setTimeout(() => popup.querySelector('input')?.focus(), 50);
-  setTimeout(() => document.addEventListener('click', function h(e) {
-    if (!popup.contains(e.target)) { popup.remove(); document.removeEventListener('click', h); }
-  }), 100);
+  setTimeout(() => {
+    function _hClarify(e) {
+      if (!popup.contains(e.target)) {
+        popup.remove();
+        document.removeEventListener('click', _hClarify);
+        document.removeEventListener('touchstart', _hClarify);
+      }
+    }
+    document.addEventListener('click', _hClarify);
+    document.addEventListener('touchstart', _hClarify, {passive: true});
+  }, 100);
 }
 
 function toggleTmuxOverlay() {
@@ -4178,27 +4195,40 @@ function renderRight(p, topics, docData) {
         }
         if (info) {
           if (running.length > 0) {
-            // Only re-render if session count changed (avoid blink on every 5s poll)
-            const newKey = running.map(s=>s.session||s.proj_id).join(',');
-            if (info.dataset.sessionKey === newKey) return; // no change — skip DOM update
+            // M132: include idle state in key so re-render fires when idle changes
+            const newKey = running.map(s=>`${s.session||s.proj_id}:${s.idle?'i':'r'}`).join(',');
+            if (info.dataset.sessionKey === newKey) return;
             info.dataset.sessionKey = newKey;
+            // M131: update swimlane card badge immediately when idle state changes
+            for (const s of running) {
+              _sessionStatus[s.proj_id] = s.idle ? 'exec-idle' : 'exec-running';
+            }
+            render();
             // M95/M98: toggle live overlay — open if closed, close if open
             window._toggleTmux = (pid) => {
               const overlay = document.getElementById('tmux-live-overlay');
               if (overlay && overlay.style.display !== 'none') stopTmuxWatch();
               else startTmuxWatch(pid);
             };
-            info.innerHTML = `<div style="margin-top:6px;border-radius:7px;overflow:hidden;border:1px solid rgba(61,139,94,.22)">` + running.map((s,i) => `
-              <div style="display:flex;align-items:center;gap:8px;padding:6px 10px;background:rgba(61,139,94,.06);${i<running.length-1?'border-bottom:1px solid rgba(61,139,94,.12)':''};cursor:pointer"
+            info.innerHTML = `<div style="margin-top:6px;border-radius:7px;overflow:hidden;border:1px solid rgba(61,139,94,.22)">` + running.map((s,i) => {
+              const sIdle = s.idle;
+              const dotColor = sIdle ? 'var(--text-dim)' : 'var(--green)';
+              const rowBg = sIdle ? 'rgba(0,0,0,.03)' : 'rgba(61,139,94,.06)';
+              const borderColor = sIdle ? 'rgba(0,0,0,.06)' : 'rgba(61,139,94,.22)';
+              const labelColor = sIdle ? 'var(--text-dim)' : 'var(--green)';
+              const labelBg = sIdle ? 'rgba(0,0,0,.04)' : 'rgba(61,139,94,.12)';
+              const labelText = sIdle ? 'idle' : 'live ▸';
+              return `<div style="display:flex;align-items:center;gap:8px;padding:6px 10px;background:${rowBg};${i<running.length-1?`border-bottom:1px solid ${borderColor}`:''};cursor:pointer"
                 title="Click to open/close terminal"
                 onclick="_toggleTmux('${esc(p.id)}')">
-                <span style="width:8px;height:8px;border-radius:50%;background:var(--green);flex-shrink:0;box-shadow:0 0 6px rgba(61,139,94,.5);animation:sess-pulse 1.5s ease-in-out infinite"></span>
+                <span style="width:8px;height:8px;border-radius:50%;background:${dotColor};flex-shrink:0;${sIdle?'':'box-shadow:0 0 6px rgba(61,139,94,.5);animation:sess-pulse 1.5s ease-in-out infinite'}"></span>
                 <div style="flex:1;min-width:0">
-                  <div style="font-family:var(--mono);font-size:10px;color:var(--green);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.session||s.proj_id)}</div>
+                  <div style="font-family:var(--mono);font-size:10px;color:${labelColor};overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.session||s.proj_id)}</div>
                   <div style="font-family:var(--mono);font-size:8px;color:var(--text-dim);margin-top:1px;letter-spacing:.03em">started ${(s.created||'').slice(11,16)}</div>
                 </div>
-                <span style="font-family:var(--mono);font-size:8px;color:var(--green);background:rgba(61,139,94,.12);border-radius:4px;padding:1px 5px;letter-spacing:.04em;text-transform:uppercase">live ▸</span>
-              </div>`).join('') + `</div>`;
+                <span style="font-family:var(--mono);font-size:8px;color:${labelColor};background:${labelBg};border-radius:4px;padding:1px 5px;letter-spacing:.04em;text-transform:uppercase">${labelText}</span>
+              </div>`;
+            }).join('') + `</div>`;
           } else {
             info.innerHTML = '';
           }
@@ -4593,11 +4623,9 @@ async function _refreshDetailCard(projId) {
 
 setInterval(async () => {
   if (_isUserTyping()) return;
-  // Skip auto-refresh while live tmux session is active — avoids blink during exec
+  // Skip auto-refresh while live tmux overlay is actively streaming (terminal open)
   if (_tmuxWatchInterval) return;
-  // M103: also skip when exec session running but terminal closed (session list visible)
-  const execSessions = document.getElementById('dm-exec-sessions');
-  if (execSessions && execSessions.children.length > 0) return;
+  // M129: removed exec-session block — user needs milestone reload during live sessions
   const overlay = document.getElementById('detail-overlay');
   if (overlay && overlay.classList.contains('show')) {
     // Detail card open — refresh milestones (works for both multi-NS and single-NS)
