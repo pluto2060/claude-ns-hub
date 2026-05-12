@@ -3680,8 +3680,9 @@ function renderHierarchy(p) {
           ${p.deadline ? esc(deadlineBadge(p.deadline).text) : '+ deadline'}
         </button>
         <input type="date" id="dm-deadline-input" value="${esc(p.deadline||'')}"
-          style="position:absolute;opacity:0;pointer-events:none;width:0;height:0"
-          onchange="saveDeadline('${esc(p.id||p.name)}',this.value)">
+          style="position:absolute;opacity:0;width:0;height:0"
+          onchange="saveDeadline('${esc(p.id||p.name)}',this.value)"
+          oninput="saveDeadline('${esc(p.id||p.name)}',this.value)">
         <span style="opacity:.3">·</span>
         <span id="dm-ns-ms-count" style="color:var(--text-dim)">${doneCount}/${p.milestones.length}</span>
         <span id="dm-ms-save-status" style="margin-left:auto;font-size:9px;color:var(--green,#4caf50)"></span>
