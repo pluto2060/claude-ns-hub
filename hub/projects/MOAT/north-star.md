@@ -135,11 +135,12 @@ log:
     to 729/wk; M18/M19 cross-promotion milestones queued'
 metric: Hub dashboard completeness score (%)
 milestones:
-- claude_ack: null
+- claude_ack: 2026-05-14T22:18
   done: false
   id: M150
   layer: 0
   parent_id: null
+  status: queued
   text: if user asked clauude not the command for execution anything the claude should
     add a comment in the stone pane (msg badge, sometimes claude skip the comment
     on user's qeustion -> make stable for it)
@@ -2010,6 +2011,7 @@ milestones:
   status: done
   text: blank stone should be on the toppest.
   user_added_at: 2026-05-12T17:57
+model: MiniMax-M2.5
 name: MOAT
 note: ''
 parent: null

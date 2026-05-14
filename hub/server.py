@@ -14,7 +14,7 @@ from pathlib import Path
 import yaml as _yaml
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import httpx
 import ptyprocess
@@ -69,6 +69,26 @@ SERVICES = {
 }
 
 app = FastAPI(title="Hub", version="1.0.0")
+
+# M210 follow-up: when this app is served over plain HTTP, redirect every request to the
+# HTTPS endpoint so the browser unlocks the Notification API. Same uvicorn process can
+# run two instances (HTTP:9000 → redirect, HTTPS:9443 → serve normally); the request.url.scheme
+# is "http" only on the HTTP listener, so this middleware no-ops on the HTTPS listener.
+from fastapi import Request
+from fastapi.responses import RedirectResponse
+
+_HTTPS_HOST = "desk-1-1.tailb5ab18.ts.net"
+_HTTPS_PORT = 9443
+
+@app.middleware("http")
+async def _force_https_redirect(request: Request, call_next):
+    if request.url.scheme == "http":
+        target = f"https://{_HTTPS_HOST}:{_HTTPS_PORT}{request.url.path}"
+        if request.url.query:
+            target += f"?{request.url.query}"
+        return RedirectResponse(url=target, status_code=302)
+    return await call_next(request)
+
 app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
 
 
@@ -175,6 +195,9 @@ def _load_projects() -> list:
                                 "claude_comment": m.get("claude_comment") or None,
                                 "conversation": m.get("conversation") or None,
                                 "star_relation": m.get("star_relation") or None,
+                                "star_target_at_completion": m.get("star_target_at_completion") or None,  # M266: stale-flag basis
+                                "held": bool(m.get("held")),  # M216: user-paused flag, surfaced to UI
+                                "user_added_at": m.get("user_added_at") or None,  # M223: creation timestamp shown in stone pane
                             }
                             norm_ms.append(entry)
                         elif isinstance(m, str):
@@ -233,6 +256,32 @@ def _load_projects() -> list:
                     data["stale"] = (time.time() - mtime) > (14 * 86400)
                     projects.append(data)
     return projects
+
+
+def _ensure_repo_path_exists(repo_path: str) -> tuple[bool, str]:
+    """M258: when a node points to a server path that doesn't exist, mkdir -p it.
+
+    Returns (created, resolved_path). created=True if the directory was newly
+    created on this call; False if it already existed or input was invalid.
+    Path is expanded (~) and resolved to absolute; refuses empty input.
+    Errors (PermissionError, OSError) are swallowed and reported via created=False
+    so that project creation never hard-fails on a transient mkdir issue.
+    """
+    if not repo_path or not isinstance(repo_path, str):
+        return False, ""
+    try:
+        p = Path(repo_path).expanduser()
+        # Make absolute relative to user's home if a bare relative path was given.
+        if not p.is_absolute():
+            p = (Path.home() / p).resolve()
+        else:
+            p = p.resolve()
+        if p.exists() and p.is_dir():
+            return False, str(p)
+        p.mkdir(parents=True, exist_ok=True)
+        return True, str(p)
+    except (PermissionError, OSError):
+        return False, repo_path
 
 
 def _save_project(proj_id: str, data: dict):
@@ -707,6 +756,13 @@ CHANNELS = [
         "type": "manual",
     },
     {
+        "id": "pinterest",
+        "name": "Pinterest",
+        "url": "https://www.pinterest.com/",
+        "api": None,
+        "type": "manual",
+    },
+    {
         "id": "naver_mail",
         "name": "Naver Mail",
         "url": "https://mail.naver.com/",
@@ -895,6 +951,14 @@ _buffers: dict[str, list] = {}
 _BUFFER_MAX = 65536
 # Idle tracking: proj_id → timestamp of last WS detach
 _session_idle_since: dict[str, float] = {}
+# M181: PTY busy tracking — last time we saw "esc to interrupt" in the byte stream.
+# Updated by the background drain task. PTY is "active" if this timestamp is fresh (<3s).
+_pty_last_busy_ts: dict[str, float] = {}
+# M182: Background drain task per project — single reader on the PTY fd.
+# Runs continuously while the PTY is in _sessions, regardless of WS attachment.
+# WS clients subscribe via _pty_subscribers to get a copy of each chunk.
+_pty_drain_tasks: dict[str, "asyncio.Task"] = {}
+_pty_subscribers: dict[str, set] = {}  # proj_id → set of asyncio.Queue
 _SESSION_TTL = 30 * 60  # kill after 30 min idle
 
 
@@ -903,6 +967,13 @@ def _kill_session(proj_id: str) -> None:
     proc = _sessions.pop(proj_id, None)
     _buffers.pop(proj_id, None)
     _session_idle_since.pop(proj_id, None)
+    _pty_last_busy_ts.pop(proj_id, None)  # M181: clear busy stamp
+    # M182: cancel background drain (will exit cleanly when proc is gone)
+    task = _pty_drain_tasks.pop(proj_id, None)
+    if task and not task.done():
+        try: task.cancel()
+        except Exception: pass
+    _pty_subscribers.pop(proj_id, None)
     if proc:
         try:
             proc.terminate(force=True)
@@ -991,6 +1062,48 @@ async def _start_milestone_watcher():
                     if changed:
                         proj["milestones"] = raw_ms
                         _save_project(proj_id, proj)
+
+                    # M150: detect stones with a user message awaiting Claude reply
+                    # (last conv entry is user, no claude reply after it). If the exec
+                    # session is alive AND idle, re-fire the trigger so Claude is forced
+                    # to read the REPLY PROTOCOL again. Prevents silently skipped replies.
+                    pending_reply_ids = []
+                    for m in raw_ms:
+                        if not isinstance(m, dict): continue
+                        # M225: held stones are completely excluded from claude token consumption
+                        if m.get("held"): continue
+                        conv = m.get("conversation") or []
+                        if conv and isinstance(conv, list) and conv[-1].get("role") == "user":
+                            pending_reply_ids.append(m.get("id"))
+                    if pending_reply_ids:
+                        session_name = f"claude-exec-{proj_id}"
+                        check = subprocess.run(["tmux", "has-session", "-t", session_name], capture_output=True)
+                        if check.returncode == 0:
+                            # M149: append-only queue (one entry per write)
+                            # M172: enforce comment-reply protocol (3-line max, details to doc)
+                            _qf = PROJECTS_DIR / proj_id / "pending-execute-queue.jsonl"
+                            _qf.parent.mkdir(parents=True, exist_ok=True)
+                            from datetime import datetime as _dt_rep
+                            _entry = json.dumps({
+                                "ts": _dt_rep.now().isoformat(),
+                                "body": (
+                                    f"[REPLY SYNC] {len(pending_reply_ids)} stone(s) await your reply: "
+                                    f"{', '.join(pending_reply_ids[:5])}.\n\n"
+                                    f"PROTOCOL (docs/ns-comment-reply-protocol.md):\n"
+                                    f"  1. Reply ONLY to stones whose last conversation entry has role=user\n"
+                                    f"  2. Reply length ≤ 3 lines. No code blocks, no preamble\n"
+                                    f"  3. If details > 3 lines needed: write docs/ns-replies/<DATE>-<MID>.md\n"
+                                    f"     and reference the path in the reply\n"
+                                    f"  4. Do NOT add arbitrary claude_comment / append_message to other stones\n"
+                                    f"  5. Replying does NOT change the stone's status\n\n"
+                                    f"ACTION: GET http://100.119.82.4:9000/api/northstar/{proj_id}/milestones,\n"
+                                    f"  for each stone above, read its last user message, then\n"
+                                    f"  PATCH milestones/<MID> with append_message {{role:'claude', text:'<≤3 lines>'}}.\n"
+                                    f"Mandatory — do it now before any other work."
+                                ),
+                            }, ensure_ascii=False)
+                            with _qf.open("a", encoding="utf-8") as _qh:
+                                _qh.write(_entry + "\n")
             except Exception:
                 pass
     asyncio.create_task(_watch())
@@ -1016,14 +1129,237 @@ async def _start_session_gc():
     asyncio.create_task(_gc())
 
 
+def _encode_cwd_for_claude(cwd: str) -> str:
+    """Replicate Claude Code's transcript-dir encoding: every non-alphanumeric
+    character is replaced with `-`. Source: research/20260513-tmux-claude-session-resume-design.md FACT-3.
+    """
+    import re
+    return re.sub(r"[^a-zA-Z0-9]", "-", cwd)
+
+
+def _get_resume_args(proj_id: str, proj_dir: str) -> list:
+    """Return Claude resume flags for tmux/PTY spawn continuity.
+
+    Spec: docs/research/20260513-tmux-claude-session-resume-design.md MVF #2.
+    Looks up the last session id for the project's CURRENT model first
+    (.session-history.json keyed by model — switching back to a previous
+    model resumes its own thread). Falls back to .last-session-id for
+    backward compat. Verifies the transcript exists+non-empty at the
+    canonical encoded-cwd path before returning --resume.
+    """
+    pdir = PROJECTS_DIR / proj_id
+    encoded = _encode_cwd_for_claude(str(proj_dir))
+    transcripts_dir = Path.home() / ".claude" / "projects" / encoded
+
+    def _try_id(sid: str) -> list:
+        if not sid:
+            return []
+        t = transcripts_dir / f"{sid}.jsonl"
+        try:
+            if t.exists() and t.stat().st_size > 0:
+                return ["--resume", sid]
+        except Exception:
+            pass
+        return []
+
+    # 1) Per-model lookup — picks up the right thread when user switches models.
+    try:
+        cur_model = ""
+        try:
+            cur_model = _get_project_model_value(proj_id)
+        except NameError:
+            pass
+        hist_file = pdir / ".session-history.json"
+        if hist_file.exists():
+            hist = json.loads(hist_file.read_text())
+            sid = (hist.get(cur_model or "_default") or "").strip()
+            args = _try_id(sid)
+            if args:
+                return args
+    except Exception:
+        pass
+
+    # 2) Legacy single-file fallback.
+    last_id_file = pdir / ".last-session-id"
+    if last_id_file.exists():
+        try:
+            sid = last_id_file.read_text().strip()
+            args = _try_id(sid)
+            if args:
+                return args
+            # Stale id → clean up so spawns don't keep failing with "No conversation found"
+            try: last_id_file.unlink()
+            except Exception: pass
+        except Exception:
+            pass
+
+    return ["--continue"]
+
+
+_ALLOWED_MODELS = {
+    # Claude CLI accepts aliases and full IDs. Restrict to the ones we want users
+    # to pick from in the UI; "" / unset → CLI default model.
+    "haiku", "sonnet", "opus",
+    "claude-haiku-4-5-20251001",
+    "claude-sonnet-4-6",
+    "claude-opus-4-7",
+    # OSK/LiteLLM proxy on 127.0.0.1:4100 exposes OpenAI as the Anthropic API
+    # (config: ~/.osk-litellm.yaml). Selecting this routes the spawned Claude
+    # session to GPT — env splice happens in _get_project_spawn_env.
+    "gpt-5.4-2026-03-05",
+    # MiniMax via direct API (not LiteLLM) — uses shared.env MINIMAX_API_KEY
+    "MiniMax-M2.5",
+    "MiniMax-M2.7",
+}
+
+_OSK_MODELS = {"gpt-5.4-2026-03-05"}
+_MINIMAX_MODELS = {"MiniMax-M2.5", "MiniMax-M2.7"}
+_OSK_PROXY_URL = "http://127.0.0.1:4100"
+_OSK_PROXY_KEY = "sk-osk-local"
+
+
+def _get_project_model_value(proj_id: str) -> str:
+    """Read the (validated) model field from project frontmatter. '' if unset."""
+    try:
+        md = PROJECTS_DIR / proj_id / "north-star.md"
+        if not md.exists():
+            return ""
+        proj = _parse_md_frontmatter(md)
+        model = (proj.get("model") or "").strip()
+        return model if model in _ALLOWED_MODELS else ""
+    except Exception:
+        return ""
+
+
+def _get_project_model(proj_id: str) -> list:
+    """Return ['--model', value] if frontmatter has a valid model, else [].
+    Spliced into PTY + tmux spawn argv."""
+    model = _get_project_model_value(proj_id)
+    return ["--model", model] if model else []
+
+
+def _get_project_spawn_env(proj_id: str) -> dict:
+    """Return extra env vars to splice into the Claude spawn for this project.
+    For OSK/GPT: routes to LiteLLM proxy. For MiniMax: routes to direct API.
+    Otherwise {}."""
+    model = _get_project_model_value(proj_id)
+    if model in _OSK_MODELS:
+        # Route to LiteLLM proxy on 127.0.0.1:4100 (GPT)
+        return {
+            "CLAUDE_CODE_OAUTH_TOKEN": "",
+            "CLAUDE_CODE_OAUTH_REFRESH_TOKEN": "",
+            "ANTHROPIC_API_KEY": _OSK_PROXY_KEY,
+            "ANTHROPIC_BASE_URL": _OSK_PROXY_URL,
+            "ANTHROPIC_MODEL": model,
+            "ANTHROPIC_SMALL_FAST_MODEL": model,
+        }
+    if model in _MINIMAX_MODELS:
+        # Route directly to MiniMax API (not LiteLLM)
+        return {
+            "CLAUDE_CODE_OAUTH_TOKEN": "",
+            "CLAUDE_CODE_OAUTH_REFRESH_TOKEN": "",
+            "ANTHROPIC_API_KEY": os.environ.get("MINIMAX_API_KEY", ""),
+            "ANTHROPIC_BASE_URL": "https://api.minimax.io/v1",
+            "ANTHROPIC_MODEL": model,
+            "ANTHROPIC_SMALL_FAST_MODEL": model,
+        }
+    return {}
+
+
+def _record_spawn_info(proj_id: str, resume_args: list) -> None:
+    """Snapshot what resume flag we used when spawning Claude for this project.
+
+    Surfaces to the UI via /api/exec-sessions so users can see whether the
+    currently running tmux session is actually continuing prior stone work
+    (--resume <id>) or starting fresh (--continue / nothing).
+    """
+    from datetime import datetime as _dt
+    if "--resume" in resume_args:
+        try:
+            idx = resume_args.index("--resume")
+            from_id = resume_args[idx + 1] if idx + 1 < len(resume_args) else ""
+        except Exception:
+            from_id = ""
+        info = {"mode": "resume", "from_id": from_id, "at": _dt.now().isoformat(timespec="seconds")}
+    elif "--continue" in resume_args:
+        info = {"mode": "continue", "from_id": "", "at": _dt.now().isoformat(timespec="seconds")}
+    else:
+        info = {"mode": "fresh", "from_id": "", "at": _dt.now().isoformat(timespec="seconds")}
+    try:
+        pdir = PROJECTS_DIR / proj_id
+        pdir.mkdir(parents=True, exist_ok=True)
+        (pdir / ".last-spawn-info.json").write_text(json.dumps(info))
+    except Exception:
+        pass
+
+
 def _spawn_claude(proj_id: str) -> ptyprocess.PtyProcess:
+    # M173: PTY terminal spawns FRESH — no --continue/--resume. The PTY is for
+    # interactive debugging; users want a clean session each time. Tmux exec
+    # sessions still use _get_resume_args for autonomous-loop continuity.
     proj_dir = _get_project_dir(proj_id) or str(Path.home())
     return ptyprocess.PtyProcessUnicode.spawn(
-        ["claude", "--dangerously-skip-permissions", "--continue"],
+        ["claude", "--dangerously-skip-permissions", *_get_project_model(proj_id)],
         cwd=proj_dir,
         dimensions=(30, 120),
-        env={**os.environ, "TERM": "xterm-256color", "COLUMNS": "120", "LINES": "30"},
+        env={
+            **os.environ,
+            "TERM": "xterm-256color",
+            "COLUMNS": "120",
+            "LINES": "30",
+            "CLAUDE_CODE_TASK_LIST_ID": f"hub-exec-{proj_id}",
+            **_get_project_spawn_env(proj_id),
+        },
     )
+
+
+async def _pty_drain(proj_id: str, proc):
+    """M182: Single background reader for a PTY — runs as long as the PTY is in
+    _sessions. Owns the PTY fd; WS handlers subscribe via queues to get a copy
+    of each chunk. Keeps _buffers + _pty_last_busy_ts current even when no WS
+    is attached, so the PTY busy/idle badge reflects real Claude state."""
+    loop = asyncio.get_event_loop()
+    try:
+        while proj_id in _sessions and proc.isalive():
+            try:
+                data = await loop.run_in_executor(None, lambda: proc.read(4096))
+            except (EOFError, asyncio.CancelledError):
+                break
+            except Exception:
+                # Transient read error — back off briefly and retry
+                await asyncio.sleep(0.1)
+                continue
+            if not data:
+                continue
+            # Append to scrollback buffer (cap 64 KB)
+            buf = _buffers.setdefault(proj_id, [])
+            buf.append(data)
+            total = sum(len(c) for c in buf)
+            while total > _BUFFER_MAX and buf:
+                total -= len(buf.pop(0))
+            # M181/M182: busy timestamp. Claude PTY uses spinner glyphs during work
+            # (✢ ✶ ✻ ✽ from the "thinking" animation set) — NOT the "esc to interrupt"
+            # string used in tmux exec status bar. Detect either form.
+            if ("esc to interrupt" in data) or ("… (" in data) or \
+               ("✻" in data) or ("✶" in data) or ("✽" in data) or ("✢" in data):
+                _pty_last_busy_ts[proj_id] = time.time()
+            # Fan-out to subscribers (WS clients)
+            for q in list(_pty_subscribers.get(proj_id, set())):
+                try:
+                    q.put_nowait(data)
+                except Exception:
+                    pass
+    finally:
+        # PTY died — clean up. Don't pop from _sessions here; _kill_session does.
+        _pty_drain_tasks.pop(proj_id, None)
+
+
+def _ensure_pty_drain(proj_id: str, proc) -> None:
+    """Start the background drain task if not already running for this PTY."""
+    existing = _pty_drain_tasks.get(proj_id)
+    if existing and not existing.done():
+        return
+    _pty_drain_tasks[proj_id] = asyncio.create_task(_pty_drain(proj_id, proc))
 
 
 @app.websocket("/ws/session/{proj_id}")
@@ -1042,6 +1378,8 @@ async def terminal_session(websocket: WebSocket, proj_id: str):
             await websocket.send_text(f"\r\n[Failed to start claude: {e}]\r\n")
             await websocket.close()
             return
+        # M182: start background drain so PTY busy/idle is tracked continuously
+        _ensure_pty_drain(proj_id, proc)
     else:
         _session_idle_since.pop(proj_id, None)  # no longer idle
         # Replay scrollback buffer so user sees previous output
@@ -1054,44 +1392,32 @@ async def terminal_session(websocket: WebSocket, proj_id: str):
             proc.setwinsize(proc.getwinsize()[0], proc.getwinsize()[1])
         except Exception:
             pass
+        # M182: drain may have died if previous session ended cleanly — ensure it's running
+        _ensure_pty_drain(proj_id, proc)
 
-    loop = asyncio.get_event_loop()
+    # M182: subscribe to the broadcaster — drain task fan-outs each chunk to our queue
+    queue: asyncio.Queue = asyncio.Queue(maxsize=512)
+    _pty_subscribers.setdefault(proj_id, set()).add(queue)
 
     async def pty_to_ws():
-        while True:
-            if not proc.isalive():
-                # Process died naturally — clean up registry
-                _sessions.pop(proj_id, None)
+        try:
+            while True:
+                if not proc.isalive():
+                    try:
+                        await websocket.send_text("\r\n\x1b[33m[Session ended]\x1b[0m\r\n")
+                    except Exception:
+                        pass
+                    break
                 try:
-                    await websocket.send_text("\r\n\x1b[33m[Session ended]\x1b[0m\r\n")
-                except Exception:
-                    pass
-                break
-            try:
-                data = await loop.run_in_executor(None, lambda: proc.read(4096))
-            except EOFError:
-                # PTY closed — process exited
-                _sessions.pop(proj_id, None)
-                _buffers.pop(proj_id, None)
+                    data = await asyncio.wait_for(queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue  # loop back to check proc.isalive
                 try:
-                    await websocket.send_text("\r\n\x1b[33m[Session ended]\x1b[0m\r\n")
+                    await websocket.send_text(data)
                 except Exception:
-                    pass
-                break
-            except Exception:
-                # PTY read error — stop this reader but keep session alive
-                break
-            # Accumulate into scrollback buffer (cap at 64 KB)
-            buf = _buffers.setdefault(proj_id, [])
-            buf.append(data)
-            total = sum(len(c) for c in buf)
-            while total > _BUFFER_MAX and buf:
-                total -= len(buf.pop(0))
-            try:
-                await websocket.send_text(data)
-            except Exception:
-                # WS send failed (client disconnected) — stop forwarding, keep proc alive
-                break
+                    break  # WS send failed — drain continues without us
+        finally:
+            _pty_subscribers.get(proj_id, set()).discard(queue)
 
     async def ws_to_pty():
         while True:
@@ -1265,6 +1591,9 @@ async def create_milestone(proj_id: str, request: Request):
     milestones.insert(0, new_ms)  # M86: prepend so newest always appears first in UI
     proj["milestones"] = milestones
     _save_project(proj_id, proj)
+    # M267: user-originated event — new stone added via UI.
+    _ns_push("stone_created", proj_id=proj_id, mid=new_id,
+             text=(new_ms.get("text") or "")[:140])
     return JSONResponse({"ok": True, "milestone": new_ms})
 
 
@@ -1281,12 +1610,18 @@ async def update_milestone(proj_id: str, mid: str, request: Request):
     for m in milestones:
         if isinstance(m, dict) and m.get("id") == mid:
             # User-settable fields: text, layer, parent_id, claude_ack, status=queued/pending only
-            for k in ("text", "layer", "parent_id", "claude_ack", "cron_job_id", "claude_comment"):
+            # M216: `held` = user-paused stone, excluded from EXECUTE/REPLY SYNC queues until released.
+            for k in ("text", "layer", "parent_id", "claude_ack", "cron_job_id", "claude_comment", "star_relation", "held"):
                 if k in data:
                     m[k] = data[k] if data[k] else None
                     # M118: clear stale star_relation when milestone text changes
                     if k == "text" and data[k]:
                         m.pop("star_relation", None)
+                    # M266: when star_relation is (re)set, snapshot the current project
+                    # target so the UI can later flag the rationale as stale (⚠ overlay)
+                    # if the user moves the goalpost. Zero token cost — purely server-side.
+                    if k == "star_relation" and data[k]:
+                        m["star_target_at_completion"] = proj.get("target") or None
             # conversation: accumulated chat thread — allow empty list (don't coerce to None)
             if "conversation" in data:
                 m["conversation"] = data["conversation"]
@@ -1295,15 +1630,100 @@ async def update_milestone(proj_id: str, mid: str, request: Request):
                 msg = data["append_message"]
                 if isinstance(msg, dict) and msg.get("role") and msg.get("text"):
                     import datetime as _dt
+                    # M190: forbid claude→claude consecutive appends. Claude can only post when
+                    # (a) conversation is empty (initial comment), or (b) last entry is from user.
+                    # Prevents self-reply chains that violate ns-comment-reply-protocol.md Rule 1+2.
+                    if msg.get("role") == "claude":
+                        _conv_so_far = m.get("conversation") or []
+                        if _conv_so_far and _conv_so_far[-1].get("role") == "claude":
+                            return JSONResponse({
+                                "ok": False,
+                                "error": "claude_self_reply_blocked",
+                                "detail": "Last conversation entry is already claude. Wait for user reply or initial-comment-request trigger (M190, ns-comment-reply-protocol.md Rule 1)."
+                            }, status_code=409)
+                    # M185: enforce 3-line TL;DR cap on comments. Long replies are
+                    # truncated and a doc-reference suffix is appended per the
+                    # ns-comment-reply-protocol.md (details go in docs/ns-replies/).
+                    _text = str(msg.get("text", ""))
+                    _lines = _text.split("\n")
+                    if len(_lines) > 3:
+                        # Write the full text to docs/ns-replies for the user to find later
+                        try:
+                            _replies_dir = Path.home() / "Project" / "Moat" / "docs" / "ns-replies"
+                            _replies_dir.mkdir(parents=True, exist_ok=True)
+                            _date = _dt.datetime.now().strftime("%Y-%m-%d-%H%M%S")
+                            _full_file = _replies_dir / f"{_date}-{proj_id}-{mid}.md"
+                            _full_file.write_text(
+                                f"# Full reply (truncated in comment thread) — {proj_id} / {mid}\n\n"
+                                f"**Truncated to first 3 lines in the stone pane.**\n"
+                                f"Posted: {msg.get('ts','')}\n\n---\n\n{_text}\n",
+                                encoding="utf-8"
+                            )
+                            _ref = f"docs/ns-replies/{_full_file.name}"
+                        except Exception:
+                            _ref = "docs/ns-replies/<save-failed>"
+                        msg["text"] = "\n".join(_lines[:3]) + f"\n[details: {_ref}]"
+                        msg["truncated"] = True
                     msg.setdefault("ts", _dt.datetime.now().isoformat())
                     conv = m.get("conversation") or []
                     conv.append(msg)
                     m["conversation"] = conv
-                    # M119: user reply → auto-reopen stone for Claude's attention
-                    if msg.get("role") == "user" and not m.get("done"):
-                        if m.get("status") in ("pending_confirmation", "done", "pending", None):
-                            m["status"] = "queued"
-                            m.setdefault("queued_at", _dt.datetime.now().isoformat())
+                    # M222 (final stone-status protocol): any claude action on a stone
+                    # (reply / apply / change) auto-flips status to pending_confirmation
+                    # unless it's already done or needs_clarification (those are user-gated).
+                    if msg.get("role") == "claude":
+                        _cur_status = m.get("status") or ("done" if m.get("done") else "pending")
+                        if _cur_status not in ("done", "needs_clarification", "pending_confirmation"):
+                            m["status"] = "pending_confirmation"
+                            m["done"] = False
+                            m.setdefault("pending_confirm_at", now_iso)
+                            m.setdefault("claude_ack", now_iso)
+                    # M267: emit SSE event ONLY for user-originated comments — NOT claude.
+                    if msg.get("role") == "user":
+                        _ns_push("user_commented", proj_id=proj_id, mid=mid,
+                                 text=(msg.get("text") or "")[:140])
+                    # M184: when user adds a comment, dispatch REPLY SYNC immediately
+                    # (don't wait for the 5-min watcher). Also do NOT re-promote to queued
+                    # — the comment is a question/instruction, not a request to redo work.
+                    # If user wants to re-run the stone, they'd change status explicitly.
+                    # M225: skip REPLY SYNC dispatch if stone is held (zero claude token spend on held).
+                    if msg.get("role") == "user" and not m.get("done") and not m.get("held"):
+                        session_name = f"claude-exec-{proj_id}"
+                        check = subprocess.run(["tmux", "has-session", "-t", session_name], capture_output=True)
+                        if check.returncode == 0:
+                            _qf = PROJECTS_DIR / proj_id / "pending-execute-queue.jsonl"
+                            _qf.parent.mkdir(parents=True, exist_ok=True)
+                            _entry = json.dumps({
+                                "ts": _dt.datetime.now().isoformat(),
+                                "body": (
+                                    f"[REPLY SYNC] User commented on stone {mid}: \"{msg.get('text','')[:200]}\"\n\n"
+                                    f"PROTOCOL (docs/ns-comment-reply-protocol.md):\n"
+                                    f"  1. Read the comment above.\n"
+                                    f"  2. Answer/act on it in ≤3 lines via PATCH "
+                                    f"http://100.119.82.4:9000/api/northstar/{proj_id}/milestones/{mid} "
+                                    f"with body append_message {{role:'claude', text:'<≤3 lines>'}}.\n"
+                                    f"  3. If user gave an instruction to re-do the stone, you may also act on it directly.\n"
+                                    f"  4. Do NOT change status from this — replying does NOT advance the stone.\n"
+                                    f"  5. If reply requires more than 3 lines: write docs/ns-replies/<DATE>-{mid}.md and reference the path.\n"
+                                    f"Mandatory — do this before any other work."
+                                ),
+                            }, ensure_ascii=False)
+                            with _qf.open("a", encoding="utf-8") as _qh:
+                                _qh.write(_entry + "\n")
+                            # M184/M148: wake Claude if pane is idle. Without this, Stop hook
+                            # can't fire (no response event) and the queue sits unread.
+                            try:
+                                _pane = subprocess.run(
+                                    ["tmux", "capture-pane", "-p", "-t", session_name, "-S", "-8"],
+                                    capture_output=True, text=True, timeout=2,
+                                ).stdout
+                                if not (("esc to interrupt" in _pane) or ("… (" in _pane)):
+                                    subprocess.run(
+                                        ["tmux", "send-keys", "-t", session_name, "go", "Enter"],
+                                        capture_output=True, timeout=2,
+                                    )
+                            except Exception:
+                                pass
             # Status: user can set pending/queued; done is Claude-only (set via done=True or status=done)
             new_status = data.get("status")
             if new_status in ("pending", "queued"):
@@ -1390,6 +1810,48 @@ async def milestone_rationale(proj_id: str, mid: str):
     return JSONResponse({"ok": True, "rationale": rationale})
 
 
+@app.post("/api/northstar/{proj_id}/milestones/{mid}/request-comment")
+async def request_milestone_comment(proj_id: str, mid: str):
+    """M182: queue a request for Claude to post an initial 1-line comment on
+    a new stone. Triggered when user opens msg popup on a stone with no prior
+    claude_comment and empty conversation. Server appends a queue entry; Stop
+    hook delivers to Claude on next idle; Claude PATCHes append_message{role:'claude'}.
+    """
+    md = PROJECTS_DIR / proj_id / "north-star.md"
+    if not md.exists():
+        return JSONResponse({"ok": False, "error": "project not found"}, status_code=404)
+    proj = _parse_md_frontmatter(md)
+    ms = next((m for m in proj.get("milestones", []) if isinstance(m, dict) and m.get("id") == mid), None)
+    if not ms:
+        return JSONResponse({"ok": False, "error": "milestone not found"}, status_code=404)
+    # Skip if already has a comment or conversation
+    if (ms.get("claude_comment") or "").strip():
+        return JSONResponse({"ok": True, "skipped": "already_commented"})
+    conv = ms.get("conversation") or []
+    if conv:
+        return JSONResponse({"ok": True, "skipped": "conversation_not_empty"})
+
+    from datetime import datetime as _dt_rc
+    _qf = PROJECTS_DIR / proj_id / "pending-execute-queue.jsonl"
+    _qf.parent.mkdir(parents=True, exist_ok=True)
+    _entry = json.dumps({
+        "ts": _dt_rc.now().isoformat(),
+        "body": (
+            f"[INITIAL COMMENT REQUEST] User just opened msg popup on a new stone with no prior comment.\n"
+            f"Stone: {mid} — \"{(ms.get('text') or '')[:100]}\"\n\n"
+            f"Action: PATCH http://100.119.82.4:9000/api/northstar/{proj_id}/milestones/{mid}\n"
+            f"  body: {{\"append_message\":{{\"role\":\"claude\",\"text\":\"<≤3 line initial take on this stone>\"}}}}\n\n"
+            f"Rules (per docs/ns-comment-reply-protocol.md):\n"
+            f"  - ≤3 lines, no preamble, no code blocks\n"
+            f"  - Acknowledge the stone, state your initial read, optionally flag one risk/question\n"
+            f"  - If you need clarification, append a question instead of attempting it"
+        ),
+    }, ensure_ascii=False)
+    with _qf.open("a", encoding="utf-8") as _qh:
+        _qh.write(_entry + "\n")
+    return JSONResponse({"ok": True, "queued": True})
+
+
 @app.get("/api/northstar/{proj_id}/tmux-output")
 async def get_tmux_output(proj_id: str, lines: int = 20):
     """Return latest output from the tmux execute session."""
@@ -1429,25 +1891,85 @@ async def get_task_board(proj_id: str):
             except Exception:
                 pass
     # Show queued milestones in task board when exec session is active.
-    # First queued milestone → "running" (Claude processes sequentially, this one is up next/active).
-    # Remaining queued milestones → "queued" (waiting their turn).
-    # This keeps the task board "running" count distinct from the total queued-stone count.
+    # M168: identify the actually-running milestone by parsing the tmux pane's TaskList block.
+    # Claude Code prints status sigils ("✔ M164" done, "◼ M166" in-progress, "◻ M167" pending)
+    # plus a "Working on M<id>" spinner line. We grep the most recent pane snapshot.
+    # Fallback to the first-queued heuristic only when no live signal is parseable.
     session_name = f"claude-exec-{proj_id}"
     check = subprocess.run(["tmux", "has-session", "-t", session_name], capture_output=True)
     if check.returncode == 0:
         md = PROJECTS_DIR / proj_id / "north-star.md"
         if md.exists():
             proj = _parse_md_frontmatter(md)
-            queued_ms = [m for m in (proj.get("milestones") or []) if m.get("status") == "queued"]
+            # M160: paused stones (awaiting user reply on Claude comment) excluded from running list
+            # M216: held stones (user-paused via hold badge) also excluded
+            queued_ms = [m for m in (proj.get("milestones") or [])
+                         if m.get("status") == "queued" and not _awaits_user_reply(m) and not m.get("held")]
+
+            # M168: parse pane to find truly-running milestone id
+            live_running_id = None
+            try:
+                _pane = subprocess.run(
+                    ["tmux", "capture-pane", "-p", "-t", session_name, "-S", "-40"],
+                    capture_output=True, text=True, timeout=2,
+                ).stdout
+                # Priority 1: TaskList in-progress sigil ("◼ M123")
+                _m = re.search(r"◼\s+(M\d+)", _pane)
+                if _m:
+                    live_running_id = _m.group(1)
+                else:
+                    # Priority 2: spinner "Working on M123"
+                    _m = re.search(r"Working on (M\d+)", _pane)
+                    if _m:
+                        live_running_id = _m.group(1)
+            except Exception:
+                pass
+
+            queued_ids = {m["id"] for m in queued_ms}
             for i, m in enumerate(queued_ms):
-                job_status = "running" if i == 0 else "queued"
+                # M168: only flag "running" when the pane confirms it; otherwise
+                # all queued entries stay as "queued" (no false "running" on first).
+                if live_running_id and m["id"] == live_running_id:
+                    job_status = "running"
+                else:
+                    job_status = "queued"
                 jobs.insert(i, {
                     "task_id": f"{m['id']}-{job_status}",
                     "status": job_status,
                     "output": m.get("text", "")[:80],
                     "completed_at": "",
                 })
+
+            # M168: if the running id isn't currently in the queue (e.g. it was just
+            # promoted to pending_confirmation but pane still shows it), surface it
+            # as a synthetic "running" entry so the task board doesn't drop the signal.
+            if live_running_id and live_running_id not in queued_ids:
+                live_ms = next((m for m in (proj.get("milestones") or [])
+                                if m.get("id") == live_running_id), None)
+                if live_ms:
+                    jobs.insert(0, {
+                        "task_id": f"{live_running_id}-running",
+                        "status": "running",
+                        "output": live_ms.get("text", "")[:80],
+                        "completed_at": "",
+                    })
     return JSONResponse({"ok": True, "jobs": jobs[:10]})
+
+
+def _awaits_user_reply(m: dict) -> bool:
+    """M160: True when last conversation entry is from claude — user must reply before this stone may run.
+
+    Stones that have an open Claude comment awaiting user feedback are paused
+    regardless of status=queued — preventing Claude from autonomously executing
+    on top of an unanswered comment.
+    """
+    if not isinstance(m, dict):
+        return False
+    conv = m.get("conversation") or []
+    if not conv or not isinstance(conv, list):
+        return False
+    last = conv[-1]
+    return isinstance(last, dict) and last.get("role") == "claude"
 
 
 @app.post("/api/northstar/{proj_id}/execute")
@@ -1517,7 +2039,11 @@ async def execute_project(proj_id: str):
             milestones = proj.get("milestones", [])
             active_ms = [m for m in milestones if not m.get("done") and m.get("status") != "done"]
 
-        actionable = [m for m in active_ms if m.get("status") in ("queued", "pending", "needs_clarification")][:5]
+        # M160: skip stones with a pending Claude comment awaiting user reply
+        # M225: held stones are completely excluded from SessionStart actionable surfaces too.
+        actionable_all = [m for m in active_ms if m.get("status") in ("queued", "pending", "needs_clarification") and not m.get("held")]
+        paused_awaiting_user = [m for m in actionable_all if _awaits_user_reply(m)]
+        actionable = [m for m in actionable_all if not _awaits_user_reply(m)][:5]
         session_name = f"claude-exec-{proj_id}"
         proj_dirs = {
             "MOAT": "/home/desk-1/Project/Moat", "CTX": "/home/desk-1/Project/CTX",
@@ -1539,44 +2065,77 @@ async def execute_project(proj_id: str):
             _claude_alive = any(c not in _SHELLS for c in _cmds) if _cmds else False
             if _claude_alive:
                 # Session alive with Claude running — inject trigger if milestones need attention
-                new_pending = [m for m in active_ms if m.get("status") == "pending" and not m.get("claude_ack")]
-                new_queued = [m for m in active_ms if m.get("status") == "queued"]
+                # M160: skip stones whose last conversation entry is from claude (awaiting user reply)
+                # M216: held stones (user-paused) are excluded from EXECUTE SYNC entirely.
+                new_pending = [m for m in active_ms if m.get("status") == "pending" and not m.get("claude_ack") and not _awaits_user_reply(m) and not m.get("held")]
+                new_queued  = [m for m in active_ms if m.get("status") == "queued" and not _awaits_user_reply(m) and not m.get("held")]
                 needs_trigger = new_pending or new_queued
                 _trigger_sent = False
                 if needs_trigger:
-                    _pf = PROJECTS_DIR / proj_id / "pending-execute-prompt.txt"
-                    _pf.parent.mkdir(parents=True, exist_ok=True)
+                    # M149: append-only JSONL queue — never overwrite. Each Execute click
+                    # appends one entry. Hooks track byte offset to consume only new entries.
+                    _qf = PROJECTS_DIR / proj_id / "pending-execute-queue.jsonl"
+                    _qf.parent.mkdir(parents=True, exist_ok=True)
                     _ms_snap = "\n".join(
                         f"  {m.get('id')} [{m.get('status')}]: \"{m.get('text','')[:60]}\""
                         for m in (new_queued + new_pending)
                     )
-                    _pf.write_text(
-                        f"[EXECUTE SYNC] New milestones need processing — process ALL queued milestones now.\n\n"
-                        f"GET {hub_api}/api/northstar/{proj_id}/milestones for current state.\n"
-                        f"TaskCreate + implement each queued milestone sequentially.\n\n"
-                        f"Newly queued:\n{_ms_snap}",
-                        encoding="utf-8"
-                    )
-                    _pane_output = subprocess.run(
-                        ["tmux", "capture-pane", "-p", "-t", session_name, "-S", "-3"],
-                        capture_output=True, text=True
-                    ).stdout
-                    _processing_indicators = ("Transmut", "Pondering", "Cogitat", "Simmer", "Stew",
-                                              "Drizzl", "Whirl", "Wibbl", "Finagl", "Churn",
-                                              "Kneading", "Newspapering", "thinking")
-                    _is_processing = any(ind in _pane_output for ind in _processing_indicators)
-                    if not _is_processing:
-                        subprocess.run(["tmux", "send-keys", "-t", session_name, "go", "Enter"], capture_output=True)
-                        _trigger_sent = True
+                    _entry = json.dumps({
+                        "ts": _dt_exec.now().isoformat(),
+                        "body": (
+                            f"[EXECUTE SYNC] New milestones need processing — process ALL queued milestones now.\n\n"
+                            f"GET {hub_api}/api/northstar/{proj_id}/milestones for current state.\n"
+                            f"TaskCreate + implement each queued milestone sequentially.\n\n"
+                            f"COMPLETION PROTOCOL — when patching status=pending_confirmation, include\n"
+                            f"  star_relation: <1 English line stating HOW this completion closed the star gap>\n"
+                            f"  (be concrete: which metric moved, by what mechanism. Mandatory.)\n\n"
+                            f"NO-OP PROTOCOL (M187, Rule 6 of ns-comment-reply-protocol.md) — if you\n"
+                            f"  decide NOT to act on a stone (already done, no actionable work, blocked\n"
+                            f"  on user, ambiguous), POST a 1-line append_message {{role:'claude'}} on\n"
+                            f"  that stone stating the reason. Silent skip is forbidden.\n\n"
+                            f"Newly queued:\n{_ms_snap}"
+                        ),
+                    }, ensure_ascii=False)
+                    with _qf.open("a", encoding="utf-8") as _qh:
+                        _qh.write(_entry + "\n")
+                    # M147: Stop-hook handles busy→idle transition.
+                    # M148: For truly-idle sessions (no spinner, no modal), also send "go"
+                    # to wake them up — Stop hook won't fire without a response event.
+                    _trigger_sent = True
+                    _wake_sent = False
+                    try:
+                        _pane = subprocess.run(
+                            ["tmux", "capture-pane", "-p", "-t", session_name, "-S", "-8"],
+                            capture_output=True, text=True, timeout=2,
+                        ).stdout
+                        # Busy detection: Claude Code's status bar shows
+                        # `· esc to interrupt ·` ONLY while a response is in progress.
+                        # Also "… (" matches the active spinner timer format.
+                        # Both are pattern-based — robust to verb rotation (Flowing/Boogieing/etc).
+                        _modal_signatures = ("extra usage", "Switch to Team plan",
+                                             "Stop and wait", "rate-limit-options",
+                                             "Press Enter to", "Continue?", "[Y/n]")
+                        _busy = "esc to interrupt" in _pane or "… (" in _pane
+                        _modal = any(s in _pane for s in _modal_signatures)
+                        _has_prompt = "❯" in _pane  # Claude's idle prompt marker
+                        if _has_prompt and not _busy and not _modal:
+                            subprocess.run(
+                                ["tmux", "send-keys", "-t", session_name, "go", "Enter"],
+                                capture_output=True, timeout=2,
+                            )
+                            _wake_sent = True
+                    except Exception:
+                        pass
                 return JSONResponse({
                     "ok": True, "mode": "tmux_active",
                     "session": session_name,
                     "tasks_created": len(actionable),
                     "new_injected": len(needs_trigger) if needs_trigger else 0,
                     "triggered": _trigger_sent if needs_trigger else False,
-                    "message": "Session active — trigger sent" if (needs_trigger and _trigger_sent) else
-                               "Session processing — prompt queued, will pick up when idle" if (needs_trigger and not _trigger_sent) else
-                               "Session active — no new work",
+                    "wake_sent": _wake_sent if needs_trigger else False,
+                    "message": ("Session idle — woke with 'go'; queued task injected" if (needs_trigger and _wake_sent) else
+                                "Session active — Stop hook will pick up on next idle" if needs_trigger else
+                                "Session active — no new work"),
                 })
             else:
                 # M123: Claude exited — stale shell session. Kill so fresh start below can proceed.
@@ -1611,7 +2170,8 @@ async def execute_project(proj_id: str):
                 f"  2. Edit/write files to implement the milestone.\n"
                 f"  3. Append completion-log:\n"
                 f'     echo \'{{\"session_id\":\"exec\",\"milestone_id\":\"<MID>\",\"evidence\":\"<one-line summary>\",\"timestamp\":\"\'$(date -Iseconds)\'\"}}\' >> ~/.claude/hub/projects/{proj_id}/completion-log.jsonl\n'
-                f"  4. PATCH {hub_api}/api/northstar/{proj_id}/milestones/<MID> body {{\"status\":\"pending_confirmation\"}}\n"
+                f"  4. PATCH {hub_api}/api/northstar/{proj_id}/milestones/<MID> body {{\"status\":\"pending_confirmation\", \"star_relation\":\"<1-line gap closure>\"}}\n"
+                f"     star_relation = ONE English line stating HOW this completion reduced the star gap (be concrete: which metric moved, by what mechanism). Mandatory.\n"
                 f"  5. TaskUpdate(<id>, status='completed')\n\n"
                 f"OPTIONAL — After all tasks done, update spec via {hub_api}/api/northstar/{proj_id}/doc.\n\n"
                 f"Active milestones (snapshot — TaskCreate only for status=queued):\n{all_ms_lines}"
@@ -1625,10 +2185,34 @@ async def execute_project(proj_id: str):
             # SessionStart hook injects directive via additionalContext from pending-execute-prompt.txt
             # A minimal trigger ("go") kicks Claude to process the injected context
             subprocess.run(["tmux", "kill-session", "-t", session_name], capture_output=True)
+            # Session-resume continuity (spec: docs/research/20260513-tmux-claude-session-resume-design.md MVF #2-3)
+            spawn_cwd = proj_dir if Path(proj_dir).exists() else str(Path.home())
+
+            # M181: clean up stale .lock in ~/.claude/tasks/hub-exec-{proj_id}/.
+            # If a previous Claude held the lock when killed, the next spawn fails
+            # to acquire it (Issue anthropics/claude-code#44917 — no auto cleanup).
+            # A lock file older than 10 s is definitionally stale because no live
+            # Claude could have written to it that long ago without a heartbeat.
+            try:
+                _task_dir = Path.home() / ".claude" / "tasks" / f"hub-exec-{proj_id}"
+                _lock = _task_dir / ".lock"
+                if _lock.exists():
+                    _age = time.time() - _lock.stat().st_mtime
+                    if _age > 10:
+                        _lock.unlink()
+            except Exception:
+                pass
+
+            resume_args = _get_resume_args(proj_id, spawn_cwd)
+            _record_spawn_info(proj_id, resume_args)
+            _tmux_env = ["-e", f"CLAUDE_CODE_TASK_LIST_ID=hub-exec-{proj_id}"]
+            for _k, _v in _get_project_spawn_env(proj_id).items():
+                _tmux_env += ["-e", f"{_k}={_v}"]
             subprocess.Popen([
                 "tmux", "new-session", "-d", "-s", session_name,
-                "-c", proj_dir if Path(proj_dir).exists() else str(Path.home()),
-                "claude", "--dangerously-skip-permissions"
+                "-c", spawn_cwd,
+                *_tmux_env,
+                "claude", "--dangerously-skip-permissions", *_get_project_model(proj_id), *resume_args,
             ])
             import asyncio as _aio
             # Wait for Claude + SessionStart hook to complete
@@ -1640,6 +2224,64 @@ async def execute_project(proj_id: str):
                 elapsed += 1
                 if not prompt_file.exists():
                     break  # hook fired and deleted the file — Claude is ready
+
+            # M180: post-spawn validation. If Claude failed to start (bad
+            # --resume id, rate-limit at boot, crash), the pane drops to bash
+            # and the SessionStart hook never fires (prompt_file stays).
+            # Detect by inspecting pane_current_command — must NOT be a shell.
+            _post_panes = subprocess.run(
+                ["tmux", "list-panes", "-t", session_name, "-F", "#{pane_current_command}"],
+                capture_output=True, text=True
+            ).stdout.split()
+            _post_alive = any(c.strip() and c.strip() not in _SHELLS for c in _post_panes)
+
+            # M181: auto-retry once with no resume args if first spawn failed
+            # while resume args were in play (likely stale --resume target).
+            _retried = False
+            if not _post_alive and resume_args:
+                # Kill pane, clear stale .last-session-id, respawn without resume
+                subprocess.run(["tmux", "kill-session", "-t", session_name], capture_output=True)
+                try:
+                    (PROJECTS_DIR / proj_id / ".last-session-id").unlink()
+                except Exception:
+                    pass
+                _retried = True
+                resume_args = []  # fresh spawn — no continuity
+                _record_spawn_info(proj_id, resume_args)
+                _tmux_env = ["-e", f"CLAUDE_CODE_TASK_LIST_ID=hub-exec-{proj_id}"]
+                for _k, _v in _get_project_spawn_env(proj_id).items():
+                    _tmux_env += ["-e", f"{_k}={_v}"]
+                subprocess.Popen([
+                    "tmux", "new-session", "-d", "-s", session_name,
+                    "-c", spawn_cwd,
+                    *_tmux_env,
+                    "claude", "--dangerously-skip-permissions", *_get_project_model(proj_id),
+                ])
+                elapsed = 0
+                while elapsed < deadline:
+                    await _aio.sleep(1)
+                    elapsed += 1
+                    if not prompt_file.exists():
+                        break
+                _post_panes = subprocess.run(
+                    ["tmux", "list-panes", "-t", session_name, "-F", "#{pane_current_command}"],
+                    capture_output=True, text=True
+                ).stdout.split()
+                _post_alive = any(c.strip() and c.strip() not in _SHELLS for c in _post_panes)
+
+            if not _post_alive:
+                # Spawn still failed even after retry — surface the error
+                return JSONResponse({
+                    "ok": False, "mode": "tmux_spawn_failed",
+                    "session": session_name,
+                    "pane_cmds": _post_panes,
+                    "resume_args": resume_args,
+                    "retried": _retried,
+                    "error": "Claude failed to start in tmux pane (pane fell back to shell)" +
+                             (" — auto-retry without --resume also failed. Likely rate-limit at boot or auth issue." if _retried else
+                              ". Likely cause: stale --resume target or rate-limit at boot."),
+                }, status_code=502)
+
             subprocess.run(["tmux", "send-keys", "-t", session_name, "go", "Enter"])
             return JSONResponse({
                 "ok": True, "mode": "tmux",
@@ -1701,11 +2343,15 @@ async def create_project(request: Request):
         "milestones": [], "log": [], "connections": [],
         "layer": 0, "x": None, "y": None,
     }
+    created_dir = False
     if repo_path:
-        frontmatter["repo_path"] = repo_path
+        # M258: if the node's repo_path doesn't exist on the server, mkdir -p it.
+        was_created, resolved = _ensure_repo_path_exists(repo_path)
+        created_dir = was_created
+        frontmatter["repo_path"] = resolved or repo_path
     text = "---\n" + _yaml.dump(frontmatter, allow_unicode=True, default_flow_style=False) + "---\n\n" + body
     md.write_text(text, encoding="utf-8")
-    return JSONResponse({"ok": True, "id": folder_id})
+    return JSONResponse({"ok": True, "id": folder_id, "created_repo_dir": created_dir})
 
 
 @app.delete("/api/northstar/{proj_id}")
@@ -1768,32 +2414,126 @@ async def rename_project(proj_id: str, request: Request):
 
 @app.patch("/api/northstar/{proj_id}")
 async def patch_project(proj_id: str, request: Request):
-    """Update simple top-level project fields (deadline, status, note, links, etc.)."""
+    """Update simple top-level project fields (deadline, status, note, links, metric/current/target/unit, etc.)."""
     data = await request.json()
     md = PROJECTS_DIR / proj_id / "north-star.md"
     if not md.exists():
         return JSONResponse({"ok": False}, status_code=404)
     proj = _parse_md_frontmatter(md)
-    allowed = {"deadline", "status", "note", "links", "stage"}
+    # M165: allow manual edit of star fields (metric/current/target/unit) from ns-dash UI
+    # M214: `model` controls --model flag passed to PTY/tmux Claude spawns for this project.
+    allowed = {"deadline", "status", "note", "links", "stage",
+               "metric", "current", "target", "unit", "model"}
     for k in allowed:
         if k in data:
-            proj[k] = data[k]
+            if k == "model":
+                v = (data[k] or "").strip()
+                if v and v not in _ALLOWED_MODELS:
+                    return JSONResponse({"ok": False, "error": f"unknown model '{v}'",
+                                         "allowed": sorted(_ALLOWED_MODELS)}, status_code=400)
+                proj[k] = v  # empty string = unset (CLI default)
+            else:
+                proj[k] = data[k]
     _save_project(proj_id, proj)
     return JSONResponse({"ok": True})
 
 
 @app.patch("/api/northstar/{proj_id}/layout")
 async def update_layout(proj_id: str, request: Request):
-    """Update swimlane layout fields: layer, parent, position_x."""
+    """Update swimlane layout fields: layer, parent, position_x.
+    M221: also accepts `parents` (list of project ids) for multi-parent links.
+    Mutually consistent: when `parents` is written, `parent` is set to parents[0]
+    so legacy single-parent readers still resolve to a valid edge."""
     data = await request.json()
     md = PROJECTS_DIR / proj_id / "north-star.md"
     if not md.exists():
         return JSONResponse({"ok": False}, status_code=404)
     proj = _parse_md_frontmatter(md)
+    created_dir = False
     for k in ("layer", "parent", "position_x", "x", "y", "repo_path", "stage"):
         if k in data:
-            proj[k] = data[k]
+            if k == "repo_path" and data[k]:
+                # M258: mkdir -p when the path doesn't exist yet on the server.
+                was_created, resolved = _ensure_repo_path_exists(data[k])
+                created_dir = created_dir or was_created
+                proj[k] = resolved or data[k]
+            else:
+                proj[k] = data[k]
+    if "parents" in data:
+        v = data["parents"]
+        if v is None:
+            proj["parents"] = []
+            proj["parent"] = None
+        elif isinstance(v, list):
+            # Dedup, drop empty, preserve order
+            seen = set()
+            cleaned = []
+            for item in v:
+                s = (str(item).strip() if item else "")
+                if s and s not in seen:
+                    seen.add(s); cleaned.append(s)
+            proj["parents"] = cleaned
+            proj["parent"] = cleaned[0] if cleaned else None
     _save_project(proj_id, proj)
+    return JSONResponse({"ok": True, "created_repo_dir": created_dir})
+
+
+# M267: centralized SSE push channel. Replaces the unreliable OS Notification path.
+# Only USER-originated events emit here — claude-originated mutations (autonomous PATCH,
+# M222 auto-flip, append_message role:claude) MUST NOT call _ns_push().
+_NS_PUSH_SUBSCRIBERS: list[asyncio.Queue] = []
+
+def _ns_push(event_type: str, **payload):
+    """Broadcast a user-originated event to every connected SSE subscriber.
+    Non-blocking — queues full are dropped so a slow tab can't stall the server."""
+    data = {"event": event_type, "ts": time.time(), **payload}
+    for q in list(_NS_PUSH_SUBSCRIBERS):
+        try:
+            q.put_nowait(data)
+        except asyncio.QueueFull:
+            pass
+
+@app.get("/api/notifications/stream")
+async def notifications_stream(request: Request):
+    """SSE stream of user-originated NS events. Each connected browser tab opens
+    one EventSource. Server retains every subscriber's Queue and broadcasts via
+    _ns_push(). Heartbeat every 25s keeps proxies from closing the connection."""
+    q: asyncio.Queue = asyncio.Queue(maxsize=64)
+    _NS_PUSH_SUBSCRIBERS.append(q)
+    async def gen():
+        # initial hello so the client knows the channel is up
+        yield f"event: hello\ndata: {json.dumps({'ts': time.time()})}\n\n"
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    data = await asyncio.wait_for(q.get(), timeout=25.0)
+                    yield f"event: {data['event']}\ndata: {json.dumps(data)}\n\n"
+                except asyncio.TimeoutError:
+                    # heartbeat — comment line, ignored by EventSource
+                    yield ": ping\n\n"
+        finally:
+            try: _NS_PUSH_SUBSCRIBERS.remove(q)
+            except ValueError: pass
+    return StreamingResponse(gen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# M238: server-backed swimlane memo (survives hub restarts; localStorage was per-browser only).
+_GLOBAL_MEMO_PATH = HERE / "global-memo.txt"
+
+@app.get("/api/hub/memo")
+async def get_global_memo():
+    content = _GLOBAL_MEMO_PATH.read_text(encoding="utf-8") if _GLOBAL_MEMO_PATH.exists() else ""
+    return JSONResponse({"ok": True, "content": content})
+
+@app.post("/api/hub/memo")
+async def save_global_memo(request: Request):
+    data = await request.json()
+    content = str(data.get("content", ""))
+    _GLOBAL_MEMO_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _GLOBAL_MEMO_PATH.write_text(content, encoding="utf-8")
     return JSONResponse({"ok": True})
 
 
@@ -1861,7 +2601,95 @@ async def kill_exec_session(proj_id: str):
     return {"ok": True, "killed": killed, "session": exec_session}
 
 
+@app.post("/api/northstar/{proj_id}/restart-session")
+async def restart_session(proj_id: str):
+    """Kill PTY + tmux exec sessions for a project so the next spawn picks up
+    fresh env (e.g. after a model change). Doesn't auto-respawn — next Execute
+    click or terminal open will spawn with the current model env."""
+    killed = {"pty": False, "tmux": False}
+    # Kill PTY (interactive terminal session)
+    if proj_id in _sessions:
+        try:
+            _kill_session(proj_id)
+            killed["pty"] = True
+        except Exception:
+            pass
+    # Kill tmux exec session
+    exec_session = f"claude-exec-{proj_id}"
+    r = subprocess.run(["tmux", "kill-session", "-t", exec_session], capture_output=True)
+    killed["tmux"] = (r.returncode == 0)
+    return JSONResponse({"ok": True, "killed": killed,
+                         "next_spawn_model": _get_project_model_value(proj_id) or "(default)"})
+
+
 _SHELLS = {"bash", "zsh", "sh", "fish", "dash"}
+
+
+_OSK_LOG_PATH = Path.home() / ".osk-litellm.log"
+_OSK_ERROR_PATTERNS = [
+    # (kind, regex, friendly_label)
+    ("quota_exceeded", r"insufficient_quota|quota.*exceeded|You exceeded your current quota", "OpenAI quota exhausted — top up billing"),
+    ("rate_limit",     r"RateLimitError|rate.?limit",                                         "Rate-limited by OpenAI — wait or upgrade tier"),
+    ("auth",           r"AuthenticationError|Incorrect API key|401 Unauthorized",             "Auth failure — OPENAI_API_KEY invalid or missing"),
+    ("upstream_5xx",   r"5\d\d (Internal|Bad Gateway|Service Unavailable|Gateway Timeout)",   "OpenAI upstream error"),
+    ("timeout",        r"ReadTimeout|TimeoutError|timed out",                                 "Upstream timeout"),
+]
+
+
+def _scan_osk_recent_errors(window_bytes: int = 200_000) -> list:
+    """Scan the tail of the LiteLLM proxy log for known upstream error classes
+    (quota, rate-limit, auth, 5xx, timeout). Returns the last occurrence per
+    class with a short excerpt — used by the UI to surface a banner in the
+    detail card so users know why their gpt session stopped responding."""
+    import re
+    if not _OSK_LOG_PATH.exists():
+        return []
+    try:
+        size = _OSK_LOG_PATH.stat().st_size
+        with open(_OSK_LOG_PATH, "r", errors="replace") as f:
+            if size > window_bytes:
+                f.seek(size - window_bytes)
+                f.readline()  # drop partial leading line
+            tail = f.read()
+        # Mtime of log file is good-enough freshness signal — proxy writes on every request
+        log_mtime = _OSK_LOG_PATH.stat().st_mtime
+        out = []
+        for kind, pat, label in _OSK_ERROR_PATTERNS:
+            matches = list(re.finditer(pat, tail, re.IGNORECASE))
+            if not matches:
+                continue
+            last = matches[-1]
+            start = max(0, last.start() - 60)
+            end = min(len(tail), last.end() + 200)
+            excerpt = tail[start:end].replace("\n", " ").strip()[:280]
+            out.append({"kind": kind, "label": label, "count": len(matches),
+                        "excerpt": excerpt, "log_mtime": log_mtime})
+        return out
+    except Exception:
+        return []
+
+
+@app.get("/api/osk/health")
+async def osk_health():
+    """Health check for the OSK LiteLLM proxy + recent-error scan. UI uses
+    `ok` to grey out gpt-* options when proxy is down, and `recent_errors`
+    to surface upstream failures (quota, rate-limit, auth) in the detail card."""
+    import urllib.request
+    out: dict = {"url": _OSK_PROXY_URL}
+    try:
+        t0 = time.time()
+        req = urllib.request.Request(_OSK_PROXY_URL + "/health/liveliness")
+        with urllib.request.urlopen(req, timeout=1.0) as r:
+            out["ok"] = (r.status == 200)
+        out["latency_ms"] = int((time.time() - t0) * 1000)
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)
+    errs = _scan_osk_recent_errors()
+    if errs:
+        out["recent_errors"] = errs
+    return JSONResponse(out)
+
 
 @app.get("/api/exec-sessions")
 async def get_exec_sessions():
@@ -1888,58 +2716,92 @@ async def get_exec_sessions():
             if not claude_running:
                 continue
 
-            # M97: detect idle — Claude at prompt, not processing a task
+            # M97/M183: detect busy first (positive signal), then idle is the complement.
+            # Claude's status bar always contains "bypass permissions on (shift+tab to cycle)"
+            # — that text is present during BOTH busy and idle, so it can't be used as
+            # an idle marker. The unique busy markers are "esc to interrupt" and the
+            # spinner timer pattern "… (". Same rules as the M148 wake-detection.
             pane_out = subprocess.run(
                 ["tmux", "capture-pane", "-p", "-t", session_name, "-S", "-5"],
                 capture_output=True, text=True
             ).stdout
-            # Strip ANSI codes for pattern matching
             import re as _re
-            clean = _re.sub(r'\x1b\[[0-9;]*[mKHJ]', '', pane_out).strip()
-            last_line = clean.splitlines()[-1].strip() if clean.splitlines() else ''
-            # Claude Code idle: ends with "> "/"? " caret, OR bypass-permissions mode prompt
-            idle = bool(_re.search(r'[>?]\s*$', last_line)) or \
-                   bool(_re.search(r'bypass permissions', clean, _re.IGNORECASE)) or \
-                   bool(_re.search(r'shift\+tab to cycle', clean, _re.IGNORECASE))
+            clean = _re.sub(r'\x1b\[[0-9;]*[mKHJ]', '', pane_out)
+            busy = ("esc to interrupt" in clean) or ("… (" in clean)
+            idle = not busy
 
-            # M133: if project still has queued milestones, session is live not idle
-            if idle:
-                md = PROJECTS_DIR / proj_id / "north-star.md"
-                if md.exists():
-                    try:
-                        _proj_data = _parse_md_frontmatter(md)
-                        _queued = [m for m in (_proj_data.get("milestones") or []) if m.get("status") == "queued"]
-                        if _queued:
-                            idle = False
-                    except Exception:
-                        pass
+            # M133 REMOVED (M179): the live/idle pill reflects ACTUAL pane state,
+            # not "pending work exists". Queued milestones are surfaced separately
+            # via D+N stone count and the task queue list; the badge must not lie
+            # about whether Claude is currently processing. Conflating these caused
+            # the badge to read "live" when Claude was at the ❯ prompt.
 
             from datetime import datetime as _dt
+            # Surface the resume flag used at spawn time so UI can show whether this
+            # live session is continuing prior stone work or started fresh.
+            spawn_mode = None
+            spawn_from = None
+            spawn_info_file = PROJECTS_DIR / proj_id / ".last-spawn-info.json"
+            if spawn_info_file.exists():
+                try:
+                    si = json.loads(spawn_info_file.read_text())
+                    si_at = si.get("at", "")
+                    # Only trust spawn_info if it was written at/after this tmux session's creation
+                    si_epoch = 0
+                    if si_at:
+                        try:
+                            si_epoch = int(_dt.fromisoformat(si_at).timestamp())
+                        except Exception:
+                            si_epoch = 0
+                    # Tight window: spawn_info must be within ±120s of tmux session creation.
+                    # Prevents matching a later PTY/respawn write to an older tmux session.
+                    if si_epoch and abs(si_epoch - created_ts) <= 120:
+                        spawn_mode = si.get("mode")
+                        spawn_from = si.get("from_id") or None
+                except Exception:
+                    pass
             sessions.append({
                 "session": session_name,
                 "proj_id": proj_id,
                 "created": _dt.fromtimestamp(created_ts).isoformat() if created_ts else "",
                 "alive": True,
                 "idle": idle,
+                "spawn_mode": spawn_mode,
+                "spawn_from": spawn_from,
             })
     return JSONResponse({"ok": True, "sessions": sessions})
 
 
 @app.get("/api/northstar/sessions")
 async def ns_sessions():
-    """Return terminal session status for all projects."""
+    """Return terminal session status for all projects.
+
+    M181: PTY `active`/`idle` semantics now match tmux exec — based on whether
+    Claude inside the PTY is actively processing (busy spinner), not whether
+    the WS is currently connected. Detection mirrors /api/exec-sessions:
+    inspect last ~4 KB of the PTY scrollback buffer; if a busy signature
+    (`esc to interrupt` / `… (`) is present, mark `active`; else `idle:N`.
+    Dead PTYs map to no entry. WS-not-attached PTYs are STILL tracked.
+    """
+    import re as _re_ns
     result = {}
     now = time.time()
 
-    # WS-connected sessions
     for proj_id, proc in list(_sessions.items()):
         if not proc.isalive():
-            result[proj_id] = "dead"
-        elif proj_id in _session_idle_since:
-            idle_secs = int(now - _session_idle_since[proj_id])
-            result[proj_id] = f"idle:{idle_secs}"
-        else:
+            continue
+        # M181: PTY busy detection via timestamp recorded by reader loop on each
+        # chunk containing "esc to interrupt" or "… (". Claude redraws ~5x/sec
+        # during busy, so 3s staleness threshold survives a single missed chunk.
+        # Buffer tail-scan is intentionally NOT used as a fallback because the
+        # buffer is append-only — historical busy markers persist forever and
+        # would cause permanent false-positive busy state.
+        last_busy = _pty_last_busy_ts.get(proj_id, 0)
+        if last_busy and now - last_busy < 3:
             result[proj_id] = "active"
+        else:
+            idle_since = _session_idle_since.get(proj_id) or now
+            result[proj_id] = f"idle:{int(now - idle_since)}"
 
     # Override with explicit hook-set status (WAITING, DONE, etc.)
     for proj_id, status in _pill_status.items():
@@ -1950,6 +2812,50 @@ async def ns_sessions():
         elif status == "IDLE" and proj_id not in result:
             pass  # IDLE is the default (no entry)
 
+    return JSONResponse(result)
+
+
+@app.get("/api/northstar/resume-info")
+async def ns_resume_info():
+    """Per-project resume-data inventory for the swimlane badge.
+
+    Reads .last-session-id (written by northstar-stop-inject Stop hook) and
+    checks for the matching transcript jsonl. Returns one entry per project
+    that has resume data — projects with no data are omitted.
+    """
+    from datetime import datetime as _dt
+    result = {}
+    if not PROJECTS_DIR.exists():
+        return JSONResponse(result)
+    for proj_dir in PROJECTS_DIR.iterdir():
+        if not proj_dir.is_dir():
+            continue
+        sid_file = proj_dir / ".last-session-id"
+        if not sid_file.exists():
+            continue
+        try:
+            sid = sid_file.read_text().strip()
+        except Exception:
+            continue
+        if not sid:
+            continue
+        try:
+            mtime = sid_file.stat().st_mtime
+        except Exception:
+            continue
+        # Resolve cwd → encoded transcript path
+        cwd = _get_project_dir(proj_dir.name) or ""
+        has_transcript = False
+        if cwd:
+            encoded = _encode_cwd_for_claude(cwd)
+            transcript = Path.home() / ".claude" / "projects" / encoded / f"{sid}.jsonl"
+            has_transcript = transcript.exists()
+        result[proj_dir.name] = {
+            "session_id_preview": sid[:8],
+            "at": _dt.fromtimestamp(mtime).isoformat(timespec="seconds"),
+            "at_epoch": int(mtime),
+            "has_transcript": has_transcript,
+        }
     return JSONResponse(result)
 
 
@@ -1966,6 +2872,69 @@ async def health(service: str):
             return JSONResponse({"ok": r.status_code < 500, "status": r.status_code})
     except Exception:
         return JSONResponse({"ok": False, "status": 0})
+
+
+@app.get("/api/corpus/skills-agents")
+async def corpus_skills_agents():
+    """List local Claude skills (~/.claude/skills/*/SKILL.md) and agents (~/.claude/agents/*.md).
+
+    Surfaces the corpus naturally on the Hub Corpus page so the panel stays useful
+    when the entity-corpus server (8989) is offline.
+    """
+    home = Path.home()
+    skills_dir = home / ".claude" / "skills"
+    agents_dir = home / ".claude" / "agents"
+
+    def _frontmatter(p: Path) -> dict:
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return {}
+        if not text.startswith("---"):
+            return {}
+        lines = text.splitlines(keepends=True)
+        end = None
+        for i, line in enumerate(lines[1:], 1):
+            if line.rstrip("\r\n") == "---":
+                end = i
+                break
+        if end is None:
+            return {}
+        try:
+            return _yaml.safe_load("".join(lines[1:end])) or {}
+        except Exception:
+            return {}
+
+    skills = []
+    if skills_dir.is_dir():
+        for p in sorted(skills_dir.iterdir(), key=lambda x: x.name.lower()):
+            if not p.is_dir():
+                continue
+            md = p / "SKILL.md"
+            if not md.is_file():
+                continue
+            fm = _frontmatter(md)
+            skills.append({
+                "name": (fm.get("name") or p.name).strip(),
+                "description": (fm.get("description") or "").strip(),
+            })
+
+    agents = []
+    if agents_dir.is_dir():
+        for p in sorted(agents_dir.iterdir(), key=lambda x: x.name.lower()):
+            if not p.is_file() or p.suffix.lower() != ".md":
+                continue
+            fm = _frontmatter(p)
+            agents.append({
+                "name": (fm.get("name") or p.stem).strip(),
+                "description": (fm.get("description") or "").strip(),
+            })
+
+    return JSONResponse({
+        "skills": skills,
+        "agents": agents,
+        "counts": {"skills": len(skills), "agents": len(agents)},
+    })
 
 
 @app.get("/api/verify-plan")

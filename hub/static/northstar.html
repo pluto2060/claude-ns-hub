@@ -124,28 +124,81 @@ header {
 .ns-col-ghost.drag-hover { opacity:.8; border-color:var(--accent); background:var(--accent-soft); }
 /* ── Project node card ── */
 .ns-node {
+  /* M198 v3: revert to 154px, .ns-node-rail repositioned as a "bump" tab
+     attached to the card's top edge — keeps card width tight and ⋮ menu visible. */
   width: 154px; background: var(--panel); border: 1px solid var(--panel-border);
   border-radius: 8px; padding: 8px 10px; cursor: pointer; user-select: none;
   transition: box-shadow .12s, border-color .12s, background .12s; flex-shrink: 0;
   position: relative;
   display: flex; flex-direction: column;
 }
+/* M198 v3: Q/R count pills as a "bump" tab attached to the card's top edge.
+   Card width stays at 154px; rail sits ABOVE the card via absolute positioning
+   so it does not steal horizontal space from the main content or cover the ⋮ menu. */
+.ns-node-main { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; }
+.ns-node-rail { position: absolute; top: -10px; right: 8px;
+  display: flex; flex-direction: row; align-items: center; gap: 3px;
+  z-index: 2; pointer-events: none; }
+.ns-node-rail > * { pointer-events: auto; }
+.ns-node-rail:empty { display: none; }
 .ns-node:hover { box-shadow: 0 2px 10px rgba(31,28,26,.10); }
 .ns-node.active { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
 /* Stage variants */
 .ns-node.stage-assigned    { border: 2px solid var(--blue); }
-.ns-node.stage-focused     { border: 2px solid var(--accent); background: var(--accent-soft); animation: focus-pulse 2s ease-in-out infinite; }
+/* M234: focus-pulse blink removed from stage-focused — only live exec-session border should blink. */
+.ns-node.stage-focused     { border: 2px solid var(--accent); background: var(--accent-soft); }
 .ns-node.stage-commercialized { border: 2px solid var(--green); background: var(--green-soft); }
 @keyframes focus-pulse { 0%,100% { box-shadow: 0 0 0 0 transparent; } 50% { box-shadow: 0 0 0 3px rgba(204,120,92,.2); } }
 @keyframes blink { 0%,100% { opacity:1; } 50% { opacity:.35; } }
 /* Stage badge (top-left, absolute) */
 .ns-stage-badge {
-  position: absolute; top: -1px; left: -1px;
+  /* M227 v3: stage badge moved to top-right so the per-card pointer can own the top-left corner. */
+  position: absolute; top: -1px; right: -1px;
   font-family: var(--mono); font-size: 8px; font-weight: 600; letter-spacing: .04em;
-  padding: 1px 5px; border-radius: 8px 0 4px 0;
+  padding: 1px 5px; border-radius: 0 8px 0 4px;
 }
 .ns-stage-badge.focused       { background: var(--accent); color: #fff; }
 .ns-stage-badge.commercialized { background: var(--green);  color: #fff; }
+/* M232: exec session state expressed as ns-card border (replaces the inline live/idle pill).
+   Idle = orange 2px solid. Live = green 2px solid + blink. No session = default panel border. */
+.ns-node.exec-idle { border: 2px solid var(--red, #c0392b); }
+.ns-node.exec-live {
+  border: 2px solid var(--green);
+  animation: sess-pulse 1.6s ease-in-out infinite;
+}
+/* M227 v4: per-card pointer overhangs the card's top-left corner so it never covers interior elements. */
+.ns-card-pointer {
+  position: absolute; top: -11px; left: -11px; z-index: 4;
+  width: 22px; height: 22px; padding: 3px; border-radius: 50%;
+  border: 1px solid var(--panel-border); background: var(--panel);
+  color: var(--text-dim); cursor: pointer; opacity: .85;
+  display: flex; align-items: center; justify-content: center;
+  transition: opacity .12s, color .12s, background .12s, border-color .12s, box-shadow .12s;
+}
+.ns-card-pointer:hover { opacity: 1; color: var(--accent); border-color: var(--accent); }
+.ns-card-pointer.on {
+  opacity: 1; color: #fff; background: var(--accent); border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  /* M227 v5: pulse like the tmux live session badge. */
+  animation: sess-pulse 1.6s ease-in-out infinite;
+}
+.ns-card-pointer.on:hover { background: var(--accent-deep); border-color: var(--accent-deep); }
+/* M259 v2: when a focused (pointer-on) card's session is idle/killed, the pointer
+   itself BECOMES the bang — no overlay, no spoke icon. The whole button turns into
+   a single solid '!' glyph for unmistakable alert presence. */
+.ns-card-pointer.bang {
+  background: var(--red, #c0392b); border-color: var(--red, #c0392b); color: #fff;
+  box-shadow: 0 0 0 3px rgba(192,57,43,.22);
+  /* M259 v2: enlarge the bang pointer so the alert reads from across the swimlane. */
+  width: 28px; height: 28px; top: -14px; left: -14px;
+  /* keep the existing M227 v5 pulse animation inherited from .on so the alert breathes. */
+}
+.ns-card-pointer.bang:hover {
+  background: #a83025; border-color: #a83025;
+}
+.ns-card-pointer.bang .ptr-spokes { display: none; }
+.ns-card-pointer.bang .ptr-bang   { display: inline-block; font: 800 20px/1 var(--mono); }
+.ns-card-pointer .ptr-bang { display: none; }
 /* Terminal button in card footer */
 .ns-node-term {
   font-family: var(--mono); font-size: 9px; color: var(--text-dim); cursor: pointer;
@@ -155,6 +208,9 @@ header {
   background: var(--bg-deep);
 }
 .ns-node-term:hover { background: var(--accent-soft); color: var(--accent-deep); border-color: var(--accent); }
+.ns-node-term.live  { color: #fff; background: #2d7a4f; border-color: #2d7a4f; animation: sess-pulse 1.6s ease-in-out infinite; }
+.ns-node-term.live:hover { background: #245f3d; border-color: #245f3d; color: #fff; }
+.ns-node-term.idle  { color: var(--accent-deep); background: var(--accent-soft); border-color: var(--accent); }
 .ns-node-menu { font-size: 13px; color: var(--text-dim); cursor: pointer; padding: 0 4px;
   border-radius: 4px; line-height: 1; transition: background .1s; flex-shrink: 0; }
 .ns-node-menu:hover { background: var(--panel-soft); color: var(--text); }
@@ -184,11 +240,41 @@ header {
 .ns-sess-done      { background: #3b6a9a; color: #fff; }
 .ns-sess-detached  { background: #6b5ea8; color: #fff; }
 @keyframes sess-pulse { 0%,100%{opacity:1} 50%{opacity:.65} }
-.ns-node-bar-wrap { height: 3px; background: var(--panel-border); border-radius: 2px; overflow: hidden; margin-bottom: 5px; }
+/* M175: detail-card loading spinner */
+@keyframes dm-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+.dm-spinner {
+  display: inline-block; width: 14px; height: 14px;
+  border: 2px solid var(--panel-border); border-top-color: var(--accent);
+  border-radius: 50%; animation: dm-spin .8s linear infinite;
+  vertical-align: middle; margin-right: 8px;
+}
+.dm-loading-box {
+  display: flex; align-items: center; justify-content: center;
+  padding: 32px 20px; color: var(--text-dim);
+  font-family: var(--mono); font-size: 12px; gap: 4px;
+}
+/* M215: full-card loading overlay shown until milestones+OKRs+doc all resolve. */
+.detail-modal.loading::after {
+  content: ""; position: absolute; inset: 0; z-index: 9000;
+  background: rgba(26,25,22,.55); pointer-events: none;
+  display: flex; align-items: center; justify-content: center;
+}
+.detail-modal.loading::before {
+  content: "loading…"; position: absolute; top: 50%; left: 50%;
+  transform: translate(-50%,-50%); z-index: 9001;
+  font-family: var(--mono); font-size: 12px; color: var(--accent);
+  padding: 10px 18px; background: var(--panel); border: 1px solid var(--accent);
+  border-radius: 6px; box-shadow: 0 4px 14px rgba(0,0,0,.35); letter-spacing: .08em;
+  pointer-events: none;
+}
+/* M260: tightened bar-wrap margin so the enlarged %/d-days row fits without growing the card. */
+.ns-node-bar-wrap { height: 3px; background: var(--panel-border); border-radius: 2px; overflow: hidden; margin-bottom: 2px; }
 .ns-node-bar { height: 100%; border-radius: 2px; }
-.ns-node-bottom { display: flex; justify-content: space-between; margin-top: auto; gap: 4px; overflow: hidden; }
-.ns-node-gap { font-family: var(--mono); font-size: 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-.ns-node-date { font-family: var(--mono); font-size: 9px; color: var(--text-dim); white-space: nowrap; flex-shrink: 0; }
+.ns-node-bottom { display: flex; justify-content: space-between; align-items: baseline; margin-top: auto; gap: 4px; overflow: hidden; }
+/* M260: % progress and d-days are the two glanceable metrics — bumped 9px → 13px, weight 700,
+   so they read at swimlane-zoom distance. White-space:nowrap + ellipsis prevents card growth. */
+.ns-node-gap  { font-family: var(--mono); font-size: 13px; font-weight: 700; letter-spacing: -.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.ns-node-date { font-family: var(--mono); font-size: 13px; font-weight: 700; letter-spacing: -.01em; color: var(--text-dim); white-space: nowrap; flex-shrink: 0; }
 /* SVG connection lines overlay */
 #ns-svg-lines {
   position: absolute; top: 0; left: 0; pointer-events: none;
@@ -713,6 +799,13 @@ header {
   font-size: 10px; font-family: var(--mono); text-transform: uppercase;
   letter-spacing: .09em; color: var(--text-dim); font-weight: 600;
 }
+/* M265: the NS metric "star sentence" reads as a sentence, not a section header —
+   drop the uppercase + dim styling, render in vivid accent for legibility. */
+.dm-layer-title[data-field="metric"] {
+  font-size: 13px; text-transform: none; letter-spacing: 0;
+  color: var(--accent); font-weight: 700;
+  font-family: var(--serif, system-ui);
+}
 .dm-layer-count { font-size: 10px; font-family: var(--mono); color: var(--text-dim); margin-left: auto; }
 .dm-sync-btn {
   font-size: 10px; font-family: var(--mono); background: none;
@@ -876,9 +969,10 @@ header {
   .dm-header { padding-top: 20px; position: relative; flex-wrap: wrap; }
 }
 
-/* Doc viewer overlay */
+/* Doc viewer overlay — M171: z-index above .detail-overlay (9001) so spec doc
+   modal appears IN FRONT of the open ns-detail card, not behind it. */
 .doc-overlay { display: none; position: fixed; top: 0; left: 0; bottom: 0; right: 0;
-  background: rgba(31,28,26,.3); z-index: 200; align-items: center; justify-content: center; }
+  background: rgba(31,28,26,.3); z-index: 9100; align-items: center; justify-content: center; }
 .doc-overlay.show { display: flex; }
 .doc-modal { background: var(--panel); border: 1px solid var(--panel-border); border-radius: 8px;
   padding: 22px 24px; max-width: 680px; width: 92%; max-height: 85vh; overflow: hidden;
@@ -952,6 +1046,9 @@ header {
       <div class="header-right">
         <button class="refresh-btn" onclick="showAddProject()" style="background:var(--accent-soft);color:var(--accent-deep);border-color:var(--accent)">+ node</button>
         <button class="refresh-btn" id="align-btn" onclick="cycleAlign()" title="Card alignment">⇤ align</button>
+        <!-- M227 v2: per-card pointer replaces the top-bar pointer button; element kept for legacy script but hidden. -->
+        <button class="refresh-btn" id="priority-toggle-btn" onclick="togglePriorityPointer()" style="display:none">+ pointer</button>
+        <button class="refresh-btn" id="notify-btn" onclick="requestNotifyPermission()" title="Enable browser notifications for live→idle session transitions">notify</button>
         <button class="refresh-btn" onclick="loadData()" title="Refresh">↻</button>
         <span class="updated-at" id="updated-at">—</span>
       </div>
@@ -959,6 +1056,24 @@ header {
     <div class="grid-wrap">
       <div class="ns-swimlane" id="ns-swimlane" style="position:relative">
         <svg id="ns-svg-lines"></svg>
+        <!-- M212 v5 → M227 v2: free-moving multi-pointer system retired in favor of per-card pointer. Container hidden. -->
+        <div id="ns-pp-container" style="position:absolute;inset:0;pointer-events:none;display:none"></div>
+        <div id="ns-priority-picker" style="display:none;position:absolute;z-index:51;
+            background:var(--panel);border:1px solid var(--accent);border-radius:8px;
+            padding:6px;gap:4px;flex-direction:row;align-items:center;
+            box-shadow:0 4px 14px rgba(0,0,0,.25);font-family:var(--mono);font-size:18px">
+          <span data-shape="hub" class="ns-pp-opt" style="cursor:pointer;padding:3px 8px;border-radius:4px;display:inline-flex;align-items:center" title="Hub logo">
+            <svg viewBox="0 0 32 32" width="20" height="20"><g transform="translate(16,16)" fill="var(--accent)"><ellipse rx="2.2" ry="6" transform="rotate(0)   translate(0,-4.5)"/><ellipse rx="2.2" ry="6" transform="rotate(60)  translate(0,-4.5)"/><ellipse rx="2.2" ry="6" transform="rotate(120) translate(0,-4.5)"/><ellipse rx="2.2" ry="6" transform="rotate(180) translate(0,-4.5)"/><ellipse rx="2.2" ry="6" transform="rotate(240) translate(0,-4.5)"/><ellipse rx="2.2" ry="6" transform="rotate(300) translate(0,-4.5)"/></g></svg>
+          </span>
+          <span data-shape="★" class="ns-pp-opt" style="cursor:pointer;padding:3px 8px;border-radius:4px">★</span>
+          <span data-shape="⚑" class="ns-pp-opt" style="cursor:pointer;padding:3px 8px;border-radius:4px">⚑</span>
+          <span data-shape="◎" class="ns-pp-opt" style="cursor:pointer;padding:3px 8px;border-radius:4px">◎</span>
+          <span data-shape="◆" class="ns-pp-opt" style="cursor:pointer;padding:3px 8px;border-radius:4px">◆</span>
+          <span data-shape="▲" class="ns-pp-opt" style="cursor:pointer;padding:3px 8px;border-radius:4px">▲</span>
+          <span data-shape="●" class="ns-pp-opt" style="cursor:pointer;padding:3px 8px;border-radius:4px">●</span>
+          <span style="border-left:1px solid var(--panel-border);height:18px;margin:0 4px"></span>
+          <span data-action="delete" class="ns-pp-opt" style="cursor:pointer;padding:3px 8px;border-radius:4px;color:var(--red);font-size:12px" title="Delete this pointer">delete</span>
+        </div>
         <div class="ns-lane" id="lane-0">
           <div class="ns-lane-label" id="lane-label-0" title="Double-click to rename" ondblclick="editLaneLabel(0)"></div>
           <div class="ns-lane-nodes" id="lane-nodes-0"></div>
@@ -971,6 +1086,17 @@ header {
           <div class="ns-lane-label" id="lane-label-2" title="Double-click to rename" ondblclick="editLaneLabel(2)"></div>
           <div class="ns-lane-nodes" id="lane-nodes-2"></div>
         </div>
+      </div>
+      <!-- M224 v4: blended into the swimlane — no wrapper bg/border, dim label, dashed textarea only. -->
+      <div id="ns-mini-note-wrap" style="margin-top:14px;padding:0;position:relative">
+        <span style="display:block;font-family:var(--mono);font-size:9px;color:var(--text-dim);
+          letter-spacing:.08em;text-transform:uppercase;margin:0 0 4px 2px;opacity:.55">memo</span>
+        <textarea id="ns-mini-note" placeholder="quick memo…" rows="7"
+          style="width:100%;background:transparent;border:1px dashed var(--panel-border);border-radius:4px;
+                 padding:8px 10px;font-family:var(--mono);font-size:11px;color:var(--text);outline:none;
+                 resize:vertical;min-height:140px;line-height:1.55;box-sizing:border-box"></textarea>
+        <span id="ns-mini-note-status" style="position:absolute;bottom:6px;right:10px;
+          font-family:var(--mono);font-size:9px;color:var(--text-dim);opacity:.55"></span>
       </div>
     </div>
 
@@ -991,22 +1117,14 @@ header {
     <!-- Right-click context menu -->
     <div class="ns-ctx-menu" id="ns-ctx-menu">
       <!-- Node actions (shown when right-clicking a node) -->
+      <!-- M232 follow-up: Set stage entry removed — exec-state border replaces it. -->
       <div id="ctx-node-items">
         <div class="ns-ctx-item" id="ctx-rename">✎ Rename</div>
-        <div class="ns-ctx-item" id="ctx-stage">◈ Set stage</div>
         <div class="ns-ctx-item" id="ctx-link-parent">⊂ Link to parent (click parent)</div>
         <div class="ns-ctx-item" id="ctx-unlink-parent">⊄ Disconnect parent link</div>
         <div class="ns-ctx-item" id="ctx-setpath">⌂ Set directory path</div>
         <div class="ns-ctx-sep"></div>
         <div class="ns-ctx-item danger" id="ctx-delete">✕ Remove node</div>
-      </div>
-      <!-- Stage submenu -->
-      <div id="ctx-stage-items" style="display:none" onclick="event.stopPropagation()">
-        <div class="ns-ctx-item" onclick="setStage('unassigned')">○ Unassigned</div>
-        <div class="ns-ctx-item" onclick="setStage('assigned')" style="color:var(--blue)">◉ Assigned</div>
-        <div class="ns-ctx-item" onclick="setStage('focused')" style="color:var(--accent)">● Focused</div>
-        <div class="ns-ctx-item" onclick="setStage('commercialized')" style="color:var(--green)">✓ Commercialized</div>
-        <div class="ns-ctx-item" onclick="document.getElementById('ctx-stage-items').style.display='none';document.getElementById('ctx-node-items').style.display=''">← Back</div>
       </div>
     </div>
 
@@ -1044,6 +1162,8 @@ header {
         <span class="dm-title" id="dm-title">—</span>
         <div id="dm-proj-dir" style="font-family:var(--mono);font-size:9px;color:var(--text-dim);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.7"></div>
       </div>
+      <!-- M233: Spec doc button moved into the header. populated by openDetail. -->
+      <span id="dm-spec-header-slot" style="margin-right:6px"></span>
       <span class="dm-status-pill" id="dm-status-pill"></span>
       <button class="dm-close" onclick="closeDetail()">×</button>
     </div>
@@ -1081,7 +1201,12 @@ header {
     flex-shrink:0;position:sticky;top:0;z-index:1">
     <div style="flex:1;font-family:var(--mono);font-size:11px;color:#aaa">
       claude @ <span id="ns-term-proj" style="color:#cc785c">—</span>
+      <!-- M178: live activity indicator visible when minimized so user knows work is ongoing -->
+      <span id="ns-term-live-dot" style="display:none;width:6px;height:6px;border-radius:50%;background:#3d8b5e;margin-left:6px;vertical-align:middle;animation:sess-pulse 1.2s ease-in-out infinite" title="Terminal active (output streaming)"></span>
+      <span id="ns-term-min-counter" style="display:none;font-size:9px;color:#888;margin-left:4px" title="lines received while minimized"></span>
     </div>
+    <!-- M208 v2: explicit Paste button for mobile (no paste key on phone keyboards) -->
+    <button onclick="pasteToPty()" style="background:none;border:1px solid #555;border-radius:4px;color:#cc785c;font-family:var(--mono);font-size:10px;padding:2px 7px;cursor:pointer" title="Paste clipboard into terminal">paste</button>
     <button onclick="minimizeTerminal()" style="background:none;border:1px solid #555;border-radius:4px;color:#888;font-family:var(--mono);font-size:10px;padding:2px 7px;cursor:pointer" id="ns-term-min-btn" title="Minimize">—</button>
     <button onclick="closeTerminal()" style="background:none;border:1px solid #555;border-radius:4px;color:#888;font-family:var(--mono);font-size:10px;padding:2px 7px;cursor:pointer" title="Close">✕</button>
     <button onclick="killSession()" style="background:none;border:1px solid #c0392b;border-radius:4px;color:#e05252;font-family:var(--mono);font-size:10px;padding:2px 7px;cursor:pointer" title="Kill session">⬛</button>
@@ -1130,8 +1255,8 @@ header {
 </div>
 
 <!-- Delete confirm dialog (inside hub modal, not browser confirm) -->
-<div id="ns-del-confirm" style="display:none;position:absolute;inset:0;z-index:500;
-  background:rgba(0,0,0,.55);border-radius:12px;align-items:center;justify-content:center">
+<div id="ns-del-confirm" style="display:none;position:fixed;inset:0;z-index:9002;
+  background:rgba(0,0,0,.55);align-items:center;justify-content:center">
   <div style="background:var(--panel);border:1px solid var(--panel-border);border-radius:8px;
     padding:20px 24px;max-width:280px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,.4)">
     <div style="font-size:13px;color:var(--text);margin-bottom:6px;font-weight:500">Delete stone?</div>
@@ -1296,6 +1421,17 @@ function gaugePath(pct, cx, cy, r) {
 
 function statusColor(status) {
   return { 'behind': 'var(--red)', 'on-track': 'var(--green)', 'achieved': 'var(--accent)', 'paused': 'var(--text-dim)' }[status] || 'var(--text-dim)';
+}
+// M262: progress bar color — only the THREE explicit "progress" statuses (behind / on-track /
+// achieved) lock the color to the status hue. Everything else (paused, pivoting, unknown, null)
+// derives from pct so bars never go gray on an active card and "pivoting" no longer rendered
+// as flat-gray. Previous M245 logic kept paused bars gray, which the user found confusing.
+const _PROGRESS_LOCKED_STATUSES = new Set(['behind', 'on-track', 'achieved']);
+function progressBarColor(p, pct) {
+  if (p && p.status && _PROGRESS_LOCKED_STATUSES.has(p.status)) return statusColor(p.status);
+  if (pct >= 0.66) return 'var(--green)';
+  if (pct >= 0.33) return 'var(--accent)';
+  return 'var(--red)';
 }
 
 // ── Card gauge SVG ────────────────────────────────────────────────────────────
@@ -1464,7 +1600,12 @@ function rowHtml(p, i) {
 
 // ── Swimlane render ───────────────────────────────────────────────────────────
 
-let _sessionStatus = {}; // proj_id → "active"|"idle:N"|"none"
+// M178: PTY (`>_ claude` button) and TMUX exec (top-right pill) are independent resources.
+// _ptyStatus  drives the `>_ claude / live / resume` button label.
+// _execStatus drives the live / idle pill at the top-right of the swimlane card.
+let _ptyStatus  = {}; // proj_id → 'active' | 'idle:N' | 'dead' | undefined
+let _execStatus = {}; // proj_id → 'running' | 'idle' | undefined
+let _resumeInfo = {}; // proj_id → {session_id_preview, at, at_epoch, has_transcript}
 
 // ── Milestone Creator ─────────────────────────────────────────────────────────
 let _msProjectId = null;
@@ -1592,12 +1733,48 @@ async function toggleNSMilestone(projId, nsId, mid, newDone, rowEl) {
   } catch(_) {}
 }
 
+// M183: auto-derive tags from milestone text (regex-based, no manual tagging needed)
+function _deriveTags(text) {
+  if (!text) return [];
+  const t = text.toLowerCase();
+  const tags = [];
+  const rules = [
+    ['bug',    /\b(fix|bug|broken|crash|error|fail|regression|hotfix|issue)\b/],
+    ['feat',   /\b(add|new|create|build|implement|introduce|feat)\b/],
+    ['ui',     /\b(ui|ux|frontend|button|modal|popup|badge|card|swimlane|css|hover|click|tap|색|버튼|모달|뱃지|페이지|화면|랜딩)\b/],
+    ['server', /\b(server|backend|api|endpoint|route|fastapi|uvicorn|서버|엔드포인트)\b/],
+    ['hook',   /\b(hook|stop[-\s]?hook|userpromptsubmit|sessionstart|훅)\b/],
+    ['verify', /\b(verify|test|check|validate|ensure|confirm|검증|테스트|확인)\b/],
+    ['mobile', /\b(mobile|responsive|ios|android|iphone|모바일|폰)\b/],
+  ];
+  for (const [name, re] of rules) {
+    if (re.test(t)) tags.push(name);
+  }
+  return tags;
+}
+
+function _renderTagBadges(text, maxInline) {
+  const tags = _deriveTags(text);
+  if (tags.length === 0) return '';
+  const limit = maxInline || 2;
+  const visible = tags.slice(0, limit);
+  const hidden  = tags.slice(limit);
+  let html = '<div class="nt-tags">';
+  for (const t of visible) html += `<span class="nt-tag ${t}">${t}</span>`;
+  if (hidden.length) html += `<span class="nt-tag nt-tag-more" title="${hidden.join(', ')}">+${hidden.length}</span>`;
+  html += '</div>';
+  return html;
+}
+
 function renderMilestoneCreator(projId, milestones) {
   const el = document.getElementById('dm-ms-creator');
   if (!el) return;
 
   // M129: skip re-render if milestone data unchanged — prevents stone blinking during live session
-  const fp = milestones.map(m => `${m.id}:${m.status}:${m.done?1:0}:${(m.conversation||[]).length}:${m.claude_ack?1:0}:${(m.text||'').slice(0,30)}`).join('|');
+  // M151: include project deadline + current/target so deadline-bar updates instantly when settings change
+  const _pFp = projects.find(x => (x.id||x.name) === projId) || {};
+  const fp = milestones.map(m => `${m.id}:${m.status}:${m.done?1:0}:${(m.conversation||[]).length}:${m.claude_ack?1:0}:${(m.text||'').slice(0,30)}`).join('|')
+    + `||dl:${_pFp.deadline||''}|cur:${_pFp.current||''}|tgt:${_pFp.target||''}|unit:${_pFp.unit||''}`;
   if (_msRenderFingerprint[projId] === fp) return;
   _msRenderFingerprint[projId] = fp;
 
@@ -1646,7 +1823,15 @@ function renderMilestoneCreator(projId, milestones) {
       const aNew = !a.claude_ack ? 1 : 0;
       const bNew = !b.claude_ack ? 1 : 0;
       if (aNew !== bNew) return bNew - aNew;
-      // 5. Stable: preserve server array order (Array.sort is stable in V8)
+      // M223: 5. Newer user_added_at first (lower-priority tiebreaker, after status/badge groups)
+      const aT = a.user_added_at ? new Date(a.user_added_at).getTime() : 0;
+      const bT = b.user_added_at ? new Date(b.user_added_at).getTime() : 0;
+      if (aT !== bT) return bT - aT;
+      // M254: held stones above non-held (last rule before stable order — only kicks in for full ties).
+      const aH = a.held ? 1 : 0;
+      const bH = b.held ? 1 : 0;
+      if (aH !== bH) return bH - aH;
+      // 7. Stable: preserve server array order (Array.sort is stable in V8)
       return 0;
     });
   const doneStones = milestones.filter(m => (m.layer || 0) === 0 && ((m.status||'') === 'done' || m.done));
@@ -1715,29 +1900,22 @@ function renderMilestoneCreator(projId, milestones) {
       `<span style="font-family:var(--mono);font-size:8px;color:${valueColor};flex-shrink:0;min-width:36px;text-align:right">${valueText}</span>` +
       `</div>`;
   };
-  // M113: deadline bar = day blocks (1 block = 1 remaining day, capped at 30 for display).
+  // M156: deadline bar = 7 fixed slots. Filled slots = daysLeft (when 1..7); else empty.
+  // d-1 → 1 filled / 6 empty.  d-7+ → all 7 filled.
+  // d-0 (today is deadline) and d+n (past) → ALL slots stay empty (per user rework).
   const _deadlineBar = (label, daysLeft, badge) => {
-    const MAX = 30;
+    const SLOTS = 7;
     const dlColor = badge ? badge.color : 'var(--text-dim)';
     const valueText = badge ? badge.text : '—';
-    if (daysLeft === null) return _barRow(label, 0, 'var(--panel-border)', valueText, dlColor);
-    if (daysLeft <= 0) {
-      // Past deadline: show filled blocks (count = how many days over, capped at MAX)
-      const overBlocks = Math.min(MAX, Math.max(1, Math.abs(daysLeft)));
-      const segs = Array.from({length: overBlocks}, () =>
-        `<div style="flex:1;height:6px;border-radius:1px;min-width:2px;background:${dlColor}"></div>`
-      ).join('');
-      return `<div style="display:flex;align-items:center;gap:7px;margin-bottom:5px">` +
-        `<span style="font-family:var(--mono);font-size:8px;color:var(--text-dim);letter-spacing:.04em;width:54px;flex-shrink:0">${label}</span>` +
-        `<div style="flex:1;display:flex;gap:1px">${segs}</div>` +
-        `<span style="font-family:var(--mono);font-size:8px;color:${dlColor};flex-shrink:0;min-width:36px;text-align:right">${valueText}</span>` +
-        `</div>`;
+    const emptyBg = 'var(--panel-border)';
+    let filled = 0;
+    if (typeof daysLeft === 'number' && daysLeft > 0) {
+      filled = Math.min(SLOTS, daysLeft);
     }
-    // Each filled block = 1 remaining day; capped at MAX
-    const totalBlocks = Math.min(MAX, daysLeft);
-    const segs = Array.from({length: totalBlocks}, () =>
-      `<div style="flex:1;height:6px;border-radius:1px;min-width:2px;background:${dlColor}"></div>`
-    ).join('');
+    const segs = Array.from({length: SLOTS}, (_, i) => {
+      const bg = i < filled ? dlColor : emptyBg;
+      return `<div style="flex:1;height:6px;border-radius:1px;min-width:2px;background:${bg}"></div>`;
+    }).join('');
     return `<div style="display:flex;align-items:center;gap:7px;margin-bottom:5px">` +
       `<span style="font-family:var(--mono);font-size:8px;color:var(--text-dim);letter-spacing:.04em;width:54px;flex-shrink:0">${label}</span>` +
       `<div style="flex:1;display:flex;gap:1px">${segs}</div>` +
@@ -1780,6 +1958,12 @@ function renderMilestoneCreator(projId, milestones) {
     .nt-text:empty::before { content: 'New milestone…'; color:var(--text-dim); opacity:.5; pointer-events:none; font-style:italic; }
     .nt-text:focus { color:var(--text); }
     .nt-done .nt-text { color:var(--text-dim); text-decoration:line-through; }
+    /* M196: paste-as-chip — long pasted content collapses into a Claude-Code-style chip
+       inside the .nt-text contenteditable. data-full holds the original text. */
+    .nt-paste-chip { display:inline-block; padding:1px 7px; margin:0 2px; border:1px solid var(--panel-border);
+      border-radius:10px; background:var(--bg-deep); font-family:var(--mono); font-size:10px;
+      color:var(--text-dim); cursor:pointer; user-select:none; vertical-align:middle; line-height:1.4; }
+    .nt-paste-chip:hover { background:var(--panel-soft); color:var(--text); border-color:var(--accent-soft); }
     .nt-meta { display:flex; align-items:center; gap:4px; flex-shrink:0; padding-top:2px; }
     .nt-del { opacity:0; transition:opacity .1s; background:none; border:none; cursor:pointer;
       color:var(--text-dim); font-size:11px; padding:0 2px; }
@@ -1807,27 +1991,68 @@ function renderMilestoneCreator(projId, milestones) {
     .nt-layer-label:first-child { padding-top:2px; }
     .nt-new-badge { font-size:9px; color:var(--accent); margin-left:3px; cursor:default; }
     /* M101: table layout for stone pane */
-    .nt-table { width:100%; border-collapse:collapse; border:1px solid var(--panel-border); border-radius:6px; overflow:hidden; margin-bottom:8px; display:table; }
+    /* M189: table-layout:fixed enforces explicit column widths so the text column
+       wraps inside the card instead of pushing other cells off-screen on long milestones.
+       overflow-wrap on the text cell breaks long words (URLs, identifiers). */
+    .nt-table { width:100%; table-layout:fixed; border-collapse:collapse; border:1px solid var(--panel-border); border-radius:6px; overflow:hidden; margin-bottom:8px; display:table; }
+    .nt-table .ms-td-text { overflow-wrap:anywhere; word-break:break-word; }
+    /* Column dividers — make the badge column boundary unambiguous when text wraps
+       (M202 case: long text + stacked msg/hold badges visually drifted inward
+       because there was no vertical line separating the columns). */
+    .nt-table td.ms-td-id,
+    .nt-table td.ms-td-text,
+    .nt-table td.ms-td-msg { border-right:1px solid var(--panel-border); }
     .nt-table tr.nt-draggable-row { border-bottom:1px solid var(--panel-border); cursor:pointer; transition:background .08s; }
     .nt-table tr.nt-draggable-row:last-child { border-bottom:none; }
     .nt-table tr.nt-draggable-row:hover td { background:var(--panel-soft); }
     .nt-table tr.nt-draggable-row:hover .nt-del { opacity:1; }
     .nt-table tr.nt-draggable-row:hover .nt-drag-handle { opacity:.85; }
     .nt-table tr.nt-draggable-row.drag-over td { border-top:2px solid var(--accent); }
-    .nt-table td { padding:4px 3px; vertical-align:top; }
-    .nt-table .ms-td-drag { width:18px; padding:5px 2px 4px 4px; }
-    .nt-table .ms-td-id { width:58px; white-space:nowrap; padding-top:5px; }
-    .nt-table .ms-td-state { width:50px; padding-top:4px; }
-    .nt-table .ms-td-text { padding-top:4px; }
-    .nt-table .ms-td-meta { white-space:nowrap; padding-top:3px; }
+    /* M180: unified vertical alignment — remove per-column padding-top tweaks (was 5/5/4/4/3 → misaligned).
+       Single padding + vertical-align:middle aligns all column content to the row's optical center. */
+    .nt-table td { padding:6px 4px; vertical-align:middle; }
+    .nt-table .ms-td-drag { width:18px; padding-left:4px; padding-right:2px; }
+    /* M186: merged id+state column. Content stacks vertically — M-id at top, then tags, then state badge. */
+    .nt-table .ms-td-id { width:78px; white-space:nowrap; vertical-align:top; }
+    .nt-table .ms-td-id .nt-id-stack { display:flex; flex-direction:column; gap:3px; align-items:flex-start; }
+    .nt-table .ms-td-id .nt-id-stack > * { display:block; }
+    /* Meta column holds only the X delete button — pin it tight so the freed
+       horizontal space flows to the text column instead of inflating this cell. */
+    .nt-table .ms-td-meta { white-space:nowrap; width:32px; text-align:center; padding:6px 4px; }
+    /* M204: dedicated msg column — separates the msg badge from the meta column
+       so the badge has its own predictable slot per row. */
+    .nt-table .ms-td-msg { width:50px; white-space:nowrap; text-align:center; padding:6px 2px; }
+    /* M206: red '!' nudge when last conv entry is from claude — user reply pending. */
+    .nt-msg-bang { color:var(--red); font-weight:700; font-size:12px; margin-left:3px;
+      vertical-align:middle; line-height:1; animation: blink 1.4s ease-in-out infinite; }
+    /* M183: auto-derived tag badges under M-id */
+    .nt-tags { display:flex; flex-wrap:wrap; gap:2px; margin-top:3px; max-width:64px; }
+    .nt-tag {
+      font-family:var(--mono); font-size:7px; padding:1px 4px; border-radius:2px;
+      background:var(--panel-soft); border:1px solid var(--panel-border); color:var(--text-dim);
+      letter-spacing:.04em; line-height:1.3; white-space:nowrap;
+    }
+    .nt-tag.bug    { color:var(--red);   border-color:rgba(192,57,43,.35); }
+    .nt-tag.feat   { color:var(--green); border-color:rgba(61,139,94,.35); }
+    .nt-tag.ui     { color:var(--accent);border-color:rgba(204,120,92,.4);  }
+    .nt-tag.server { color:#7b9fd4;      border-color:rgba(90,120,200,.35); }
+    .nt-tag.hook   { color:#a569bd;      border-color:rgba(142,68,173,.35); }
+    .nt-tag.verify { color:#b8860b;      border-color:rgba(184,134,11,.4);  }
+    .nt-tag.mobile { color:#17a589;      border-color:rgba(23,165,137,.35); }
+    .nt-tag-more   { cursor:default; }
     .nt-table tr.ms-sub-tr td { border-top:none; background:var(--bg-deep); }
     .nt-table tr.ms-sub-tr:hover td { background:var(--panel-soft); }
     /* M81: queued stones show execution-priority indicator */
     .nt-table tr.nt-draggable-row[data-status="queued"] td { border-left:none; }
-    .nt-table tr.nt-draggable-row[data-status="queued"] td:first-child { border-left:2px solid var(--accent); }
+    .nt-table tr.nt-draggable-row[data-status="queued"]:not([data-held="1"]) td:first-child { border-left:2px solid var(--accent); }
+    /* M220 follow-up: held rows dim out and drop the queued left-border + ▶ priority tag. */
+    .nt-table tr.nt-draggable-row[data-held="1"] td { opacity:.5; }
+    .nt-table tr.nt-draggable-row[data-held="1"] .nt-priority-tag { display:none; }
     .nt-priority-tag { font-family:var(--mono); font-size:8px; color:var(--accent); letter-spacing:.04em;
       opacity:.75; flex-shrink:0; padding-top:3px; }
-    .nt-table .nt-draggable-row { display:block; }
+    /* Removed a stale .nt-table .nt-draggable-row display:block override from pre-table layout.
+       It disabled table-layout:fixed (each row sized cells to its content) so msg/hold badges
+       drifted across X positions per row. Removing it restores uniform column widths. */
   </style>
   <div>
     <button class="nt-add" style="margin-bottom:8px;display:block;width:100%;text-align:center"
@@ -1835,29 +2060,38 @@ function renderMilestoneCreator(projId, milestones) {
     ${l0.length > 0 ? `<span class="nt-layer-label">L0 · Strategic</span>` : ''}
     <table class="nt-table"><tbody>
     ${l0.map((m, idx) => {
-      const escJs = s => esc(s).replace(/'/g, '&#39;');  // escape for single-quoted JS attrs
+      // Multi-line pasted text (M26 case) was breaking inline single-quoted JS strings
+      // with literal newlines → SyntaxError on click → button no-ops silently.
+      const escJs = s => esc(s)
+        .replace(/\\/g, '\\\\')
+        .replace(/'/g, '&#39;')
+        .replace(/\r?\n/g, '\\n');
       const children = l1.filter(c => c.parent_id === m.id);
       // 3-state: pending / queued / done
       // state derives from m.status field (new) or m.done (old compat)
       const mStatus = m.status || (m.done ? 'done' : 'pending');
-      // needs_clarification: compact row with ? badge in meta; click ? → popup with explanation + answer input
+      // needs_clarification: compact row with ? badge in state; click ? → SAME comment popup as msg
+      // (M177: unified with msg badge UX — clarification question shows as Claude's comment at top
+      //  of thread, user reply appended to conversation, server REPLY SYNC handles Claude follow-up)
       if (mStatus === 'needs_clarification') {
-        const hasAnswer = !!(m.clarification_answer || '').trim();
-        // Use data-* attributes to avoid inline JS string escaping issues with apostrophes/special chars
+        const clarQ = m.clarification_question || 'Why is this milestone unclear? Please describe the task in more detail.';
         const clarDataAttrs = `data-projid="${esc(projId)}" data-mid="${esc(m.id)}" `
-          + `data-clarq="${esc(m.clarification_question || 'Why is this milestone unclear? Please describe the task in more detail.')}" `
-          + `data-clara="${esc(m.clarification_answer || '')}" data-has-answer="${hasAnswer}"`;
-        const clarOnClick = `event.stopPropagation();const d=this.dataset;showClarifyPopup(event,d.projid,d.mid,d.clarq,d.clara,d.hasAnswer==='true')`;
+          + `data-clarq="${esc(clarQ)}" data-status="${esc(mStatus)}"`;
+        const clarOnClick = `event.stopPropagation();const d=this.dataset;showCommentPopup(event,d.clarq,d.projid,d.mid,d.status)`;
+        const msgCnt = (_msConversations[m.id]||[]).length;
         return `
-          <tr class="nt-draggable-row" data-mid="${esc(m.id)}" draggable="true"
+          <tr class="nt-draggable-row" data-mid="${esc(m.id)}" data-held="${m.held?'1':'0'}" draggable="true"
             ondragstart="_msDragStart(event,'${esc(m.id)}')" ondragend="_msDragEnd(event)" ondragover="_msDragOver(event)"
             ondragleave="_msDragLeave(event)" ondrop="_msDrop(event,'${esc(projId)}')" style="opacity:.85">
             <td class="ms-td-drag"><span class="nt-drag-handle" title="Drag to reorder">⋮⋮</span></td>
-            <td class="ms-td-id"><span class="nt-mid" title="Milestone ID">${esc(m.id)}</span></td>
-            <td class="ms-td-state"><button class="nt-check" style="border:1px solid #7b9fd4;background:rgba(90,120,200,.1);color:#7b9fd4;cursor:pointer;border-radius:4px;width:auto;padding:0 5px;font-size:8px;letter-spacing:.03em;min-width:30px" title="Needs clarification" ${clarDataAttrs} onclick="${clarOnClick}">?</button></td>
+            <td class="ms-td-id"><div class="nt-id-stack"><span class="nt-mid" title="Milestone ID">${esc(m.id)}</span>${m.user_added_at ? `<span style="font-family:var(--mono);font-size:9px;color:var(--accent-deep);font-weight:600;letter-spacing:.04em" title="Added ${esc(m.user_added_at)}">${esc((m.user_added_at||'').slice(5,10))} ${esc((m.user_added_at||'').slice(11,16))}</span>` : ''}${_renderTagBadges(m.text)}</div></td>
             <td class="ms-td-text" style="color:var(--text-soft)">${esc(m.text)}</td>
+            <td class="ms-td-msg">
+              <!-- M226: msg badge styled as a hold-style pill. -->
+              <button class="nt-why" title="Needs clarification — click to view question & reply" style="${_msBadgeStyle('clar')}" ${clarDataAttrs} onclick="${clarOnClick}">${msgCnt>0 ? msgCnt+' msg' : '?'}</button>${_msBangHtml(m.id)}
+              ${_msHoldBtnHtml(projId, m.id, !!m.held)}
+            </td>
             <td class="ms-td-meta">
-              <span style="font-size:11px;color:#7b9fd4;cursor:pointer" title="Clarify" ${clarDataAttrs} onclick="${clarOnClick}">❓</span>
               <button class="nt-del" title="Delete" onclick="event.stopPropagation();confirmDeleteMs('${esc(projId)}','${esc(m.id)}','${escJs(m.text.slice(0,60))}')">✕</button>
             </td>
           </tr>`;
@@ -1866,24 +2100,34 @@ function renderMilestoneCreator(projId, milestones) {
       if (mStatus === 'pending_confirmation') {
         const msgCnt = (_msConversations[m.id]||[]).length;
         const confirmHtml = `
-          <tr class="nt-draggable-row" data-mid="${esc(m.id)}" draggable="true"
+          <tr class="nt-draggable-row" data-mid="${esc(m.id)}" data-held="${m.held?'1':'0'}" draggable="true"
             ondragstart="_msDragStart(event,'${esc(m.id)}')" ondragend="_msDragEnd(event)" ondragover="_msDragOver(event)"
             ondragleave="_msDragLeave(event)" ondrop="_msDrop(event,'${esc(projId)}')">
             <td class="ms-td-drag"><span class="nt-drag-handle" title="Drag to reorder">⋮⋮</span></td>
-            <td class="ms-td-id"><span class="nt-mid" title="Milestone ID">${esc(m.id)}</span></td>
-            <td class="ms-td-state" style="vertical-align:top">
-              <div style="display:flex;flex-direction:column;gap:6px">
-                <button onclick="event.stopPropagation();confirmMsDone('${esc(projId)}','${esc(m.id)}')"
-                  style="font-size:8px;padding:3px 6px;border-radius:3px;border:1px solid var(--green);background:var(--green-soft);color:var(--green);cursor:pointer;font-family:var(--mono);line-height:1.4;white-space:nowrap;min-height:22px">Confirm</button>
-                <button onclick="event.stopPropagation();reopenMs('${esc(projId)}','${esc(m.id)}')"
-                  style="font-size:8px;padding:3px 6px;border-radius:3px;border:1px solid var(--red,#c0392b);background:rgba(192,57,43,.08);color:var(--red,#c0392b);cursor:pointer;font-family:var(--mono);line-height:1.4;min-height:22px">Reopen</button>
-              </div>
-            </td>
+            <td class="ms-td-id"><div class="nt-id-stack"><span class="nt-mid" title="Milestone ID">${esc(m.id)}</span>${(() => {
+              if (!m.star_relation) return '';
+              const _p = projects.find(x => (x.id||x.name) === projId);
+              const _curTgt = _p ? (_p.target ?? '') : '';
+              const _snapTgt = m.star_target_at_completion ?? '';
+              const _stale = _snapTgt && _curTgt && String(_snapTgt) !== String(_curTgt);
+              const _staleTitle = _stale ? ` — STALE: recorded against target "${_snapTgt}", current is "${_curTgt}"` : '';
+              const _staleGlyph = _stale ? `<span style="color:var(--red,#c0392b);font-size:9px;margin-left:1px;vertical-align:super" title="Rationale is stale (target changed)">⚠</span>` : '';
+              return `<button class="nt-mid-star" title="Gap closure note (click for detail)${_staleTitle}" style="background:none;border:none;cursor:pointer;font-size:13px;color:${_stale?'var(--text-dim)':'var(--accent)'};padding:0 3px;margin-left:2px;line-height:1;vertical-align:baseline" onclick="event.stopPropagation();showStarRelModal(event,'${escJs(m.star_relation)}','${escJs(m.text.slice(0,60))}')">★</button>${_staleGlyph}`;
+            })()}${m.user_added_at ? `<span style="font-family:var(--mono);font-size:9px;color:var(--accent-deep);font-weight:600;letter-spacing:.04em" title="Added ${esc(m.user_added_at)}">${esc((m.user_added_at||'').slice(5,10))} ${esc((m.user_added_at||'').slice(11,16))}</span>` : ''}${_renderTagBadges(m.text)}<button onclick="event.stopPropagation();confirmMsDone('${esc(projId)}','${esc(m.id)}')" style="font-size:8px;padding:3px 6px;border-radius:3px;border:1px solid var(--green);background:var(--green-soft);color:var(--green);cursor:pointer;font-family:var(--mono);line-height:1.4;white-space:nowrap;min-height:22px">Confirm</button><button onclick="event.stopPropagation();reopenMs('${esc(projId)}','${esc(m.id)}')" style="font-size:8px;padding:3px 6px;border-radius:3px;border:1px solid var(--red,#c0392b);background:rgba(192,57,43,.08);color:var(--red,#c0392b);cursor:pointer;font-family:var(--mono);line-height:1.4;min-height:22px">Reopen</button></div></td>
             <td class="ms-td-text" style="background:rgba(204,120,92,.06);font-size:12px;color:var(--text);overflow-wrap:anywhere">
               ${esc(m.text)}
             </td>
+            <td class="ms-td-msg">
+              ${(() => {
+                const _clicked = sessionStorage.getItem(`m182-requested-${m.id}`) === '1';
+                const _label = msgCnt > 0 ? `${msgCnt} msg` : (_clicked ? '+ msg' : 'msg');
+                const _variant = msgCnt > 0 ? 'has' : (_clicked ? 'clicked' : 'empty');
+                const _title = msgCnt > 0 ? 'View comment thread' : (_clicked ? 'Awaiting Claude initial comment' : 'Request Claude comment on this stone');
+                return `<button class="nt-why" title="${_title}" style="${_msBadgeStyle(_variant)}" onclick="event.stopPropagation();showCommentPopup(event,'${escJs(m.claude_comment||'')}','${esc(projId)}','${esc(m.id)}','${esc(mStatus)}')">${_label}</button>`;
+              })()}${_msBangHtml(m.id)}
+              ${_msHoldBtnHtml(projId, m.id, !!m.held)}
+            </td>
             <td class="ms-td-meta" style="white-space:nowrap">
-              <button class="nt-why" title="Add/view comment" style="font-size:9px;opacity:${msgCnt>0?'1':'.45'}" onclick="event.stopPropagation();showCommentPopup(event,'${escJs(m.claude_comment||'')}','${esc(projId)}','${esc(m.id)}','${esc(mStatus)}')">${msgCnt>0 ? msgCnt+' msg' : 'msg'}</button>
               <button class="nt-del" style="opacity:1" title="Delete" onclick="event.stopPropagation();confirmDeleteMs('${esc(projId)}','${esc(m.id)}','${escJs(m.text.slice(0,60))}')">✕</button>
             </td>
           </tr>`;
@@ -1914,21 +2158,17 @@ function renderMilestoneCreator(projId, milestones) {
         return `
           <tr class="ms-sub-tr ${cs==='done'?'nt-done':''}">
             <td class="ms-td-drag"></td>
-            <td class="ms-td-id"><span class="nt-mid" title="Child milestone">${esc(c.id)}</span></td>
-            <td class="ms-td-state">
-              ${cs!=='done' ? `<span class="${c.claude_ack?'nt-ack-g':'nt-ack-o'}" style="font-size:8px" title="${cAckTitle}">${c.claude_ack?'ack':'rev'}</span>` : ''}
-              <button class="nt-check" ${cBtnAttrs}
-                style="border:1px solid ${csc};background:${csbg};color:${csfg};cursor:default;opacity:${cs==='pending'?'.4':'1'};border-radius:4px;width:auto;padding:0 4px;font-size:7px;letter-spacing:.03em;min-width:26px;display:block;margin-top:2px"
-              >${csIcon}</button>
-            </td>
+            <td class="ms-td-id"><div class="nt-id-stack"><span class="nt-mid" title="Child milestone">${esc(c.id)}</span>${_renderTagBadges(c.text)}${cs!=='done' ? `<span class="${c.claude_ack?'nt-ack-g':'nt-ack-o'}" style="font-size:8px" title="${cAckTitle}">${c.claude_ack?'ack':'rev'}</span>` : ''}<button class="nt-check" ${cBtnAttrs} style="border:1px solid ${csc};background:${csbg};color:${csfg};cursor:default;opacity:${cs==='pending'?'.4':'1'};border-radius:4px;width:auto;padding:0 4px;font-size:7px;letter-spacing:.03em;min-width:26px">${csIcon}</button></div></td>
             <td class="ms-td-text" style="padding-left:12px">
               <div class="nt-text" style="font-size:11.5px;${c.done?'color:var(--text-dim);text-decoration:line-through;':''}"
                 contenteditable="true" data-ms-id="${esc(c.id)}"
-                onblur="saveMs('${esc(projId)}','${esc(c.id)}',this.textContent)"
+                onblur="saveMs('${esc(projId)}','${esc(c.id)}',_readNtText(this))"
+                onpaste="_ntPasteHandler(event)"
                 onkeydown="handleMsTab(event,'${esc(projId)}','${esc(c.id)}')"
                 onclick="event.stopPropagation()"
-              >${esc(c.text)}</div>
+              >${_renderNtTextHtml(c.text)}</div>
             </td>
+            <td class="ms-td-msg"></td>
             <td class="ms-td-meta">
               <button class="nt-del" title="Delete" onclick="event.stopPropagation();confirmDeleteMs('${esc(projId)}','${esc(c.id)}','${escJs(c.text.slice(0,60))}')">✕</button>
             </td>
@@ -1955,7 +2195,7 @@ function renderMilestoneCreator(projId, milestones) {
 
       const mCommentHtml = '';  // replaced by comment badge in meta row
       return `
-        <tr class="nt-draggable-row ${mStatus==='done'?'nt-done':''}" data-mid="${esc(m.id)}" data-status="${esc(mStatus)}" draggable="true"
+        <tr class="nt-draggable-row ${mStatus==='done'?'nt-done':''}" data-mid="${esc(m.id)}" data-status="${esc(mStatus)}" data-held="${m.held?'1':'0'}" draggable="true"
           ondragstart="_msDragStart(event,'${esc(m.id)}')"
           ondragover="_msDragOver(event)"
           ondragleave="_msDragLeave(event)"
@@ -1963,31 +2203,54 @@ function renderMilestoneCreator(projId, milestones) {
           onclick="toggleMsExpand('${esc(projId)}','${esc(m.id)}')">
           <td class="ms-td-drag"><span class="nt-drag-handle" title="Drag to reorder">⋮⋮</span></td>
           <td class="ms-td-id">
-            ${mStatus === 'queued' ? `<span class="nt-priority-tag" title="Queued">▶</span>` : ''}
-            <span class="nt-mid" title="Milestone ID">${esc(m.id)}</span>
-            <span class="nt-arrow" style="font-size:10px;color:var(--text-soft)">${children.length ? (isOpen?'▾':'▸') : ''}</span>
-          </td>
-          <td class="ms-td-state">
-            ${mStatus!=='done' ? `<span class="${m.claude_ack?'nt-ack-g':'nt-ack-o'}" title="${mAckTitle}" style="display:block;margin-bottom:2px">${m.claude_ack?'acked':'review'}</span>` : ''}
-            <button class="nt-check"
-              ${mBtnAttrs}
-              style="border:1px solid ${sc};background:${sbg};color:${sfg};cursor:default;opacity:${mStatus==='pending'?'.4':'1'};border-radius:4px;width:auto;padding:1px 5px;font-size:8px;letter-spacing:.03em;line-height:1.3"
-            >${stateLabel}</button>
+            <div class="nt-id-stack">
+              <span><span class="nt-mid" title="Milestone ID">${esc(m.id)}</span>${(() => {
+                if (!m.star_relation) return '';
+                // M266: stale-flag — when star_target_at_completion differs from current project target,
+                // the rationale was authored against an old goalpost.
+                const _p = projects.find(x => (x.id||x.name) === projId);
+                const _curTgt = _p ? (_p.target ?? '') : '';
+                const _snapTgt = m.star_target_at_completion ?? '';
+                const _stale = _snapTgt && _curTgt && String(_snapTgt) !== String(_curTgt);
+                const _staleTitle = _stale ? ` — STALE: recorded against target "${_snapTgt}", current is "${_curTgt}"` : '';
+                const _staleGlyph = _stale ? `<span style="color:var(--red,#c0392b);font-size:9px;margin-left:1px;vertical-align:super" title="Rationale is stale (target changed)">⚠</span>` : '';
+                return `<button class="nt-mid-star" title="Gap closure note (click for detail)${_staleTitle}" style="background:none;border:none;cursor:pointer;font-size:13px;color:${_stale?'var(--text-dim)':'var(--accent)'};padding:0 3px;margin-left:2px;line-height:1;vertical-align:baseline" onclick="event.stopPropagation();showStarRelModal(event,'${escJs(m.star_relation)}','${escJs(m.text.slice(0,60))}')">★</button>${_staleGlyph}`;
+              })()}${mStatus === 'queued' ? ` <span class="nt-priority-tag" title="Queued">▶</span>` : ''}${children.length ? ` <span class="nt-arrow" style="font-size:10px;color:var(--text-soft)">${isOpen?'▾':'▸'}</span>` : ''}</span>
+              ${m.user_added_at ? `<span style="font-family:var(--mono);font-size:9px;color:var(--accent-deep);font-weight:600;letter-spacing:.04em" title="Added ${esc(m.user_added_at)}">${esc((m.user_added_at||'').slice(5,10))} ${esc((m.user_added_at||'').slice(11,16))}</span>` : ''}
+              ${_renderTagBadges(m.text)}
+              ${mStatus!=='done' ? `<span class="${m.claude_ack?'nt-ack-g':'nt-ack-o'}" title="${mAckTitle}">${m.claude_ack?'acked':'review'}</span>` : ''}
+              <button class="nt-check" ${mBtnAttrs}
+                style="border:1px solid ${sc};background:${sbg};color:${sfg};cursor:default;opacity:${mStatus==='pending'?'.4':'1'};border-radius:4px;width:auto;padding:1px 5px;font-size:8px;letter-spacing:.03em;line-height:1.3"
+              >${stateLabel}</button>
+            </div>
           </td>
           <td class="ms-td-text">
             <div class="nt-text" style="font-weight:${mStatus==='queued'?'500':'400'};${m.done?'color:var(--text-dim);text-decoration:line-through;':''}"
               contenteditable="true" data-ms-id="${esc(m.id)}"
               onclick="event.stopPropagation()"
               onkeydown="handleMsTab(event,'${esc(projId)}','${esc(m.id)}')"
-              onblur="saveMs('${esc(projId)}','${esc(m.id)}',this.textContent)"
-            >${esc(m.text)}</div>
+              onpaste="_ntPasteHandler(event)"
+              onblur="saveMs('${esc(projId)}','${esc(m.id)}',_readNtText(this))"
+            >${_renderNtTextHtml(m.text)}</div>
+          </td>
+          <td class="ms-td-msg">
+            <!-- M249: queue badge moved ABOVE the msg badge. Order: queue → msg+! → lock. -->
+            ${_msQueueBtnHtml(projId, m.id, mStatus)}
+            ${(() => {
+              const _n = (_msConversations[m.id]||[]).length;
+              const _clicked = sessionStorage.getItem(`m182-requested-${m.id}`) === '1';
+              const _label = _n > 0 ? `${_n} msg` : (_clicked ? '+ msg' : 'msg');
+              const _variant = _n > 0 ? 'has' : (_clicked ? 'clicked' : 'empty');
+              const _title = _n > 0 ? 'View comment thread' : (_clicked ? 'Awaiting Claude initial comment' : 'Request Claude comment on this stone');
+              return `<button class="nt-why" title="${_title}" style="${_msBadgeStyle(_variant)}" onclick="event.stopPropagation();showCommentPopup(event,'${escJs(m.claude_comment||'')}','${esc(projId)}','${esc(m.id)}','${esc(mStatus)}')">${_label}</button>`;
+            })()}${_msBangHtml(m.id)}
+            ${_msHoldBtnHtml(projId, m.id, !!m.held)}
           </td>
           <td class="ms-td-meta">
             ${children.length ? `<span style="font-family:var(--mono);font-size:9px;color:var(--text-dim)">${childDone}/${children.length}</span>` : ''}
             ${(!m.claude_ack && m.user_added_at) ? `<span style="font-size:9px;color:var(--accent)" title="New — Claude hasn't seen this">★</span>` : ''}
-            ${m.user_added_at ? `<span style="font-family:var(--mono);font-size:8px;color:var(--text-dim);opacity:.6;border:1px solid var(--panel-border);border-radius:3px;padding:0 3px" title="Added ${esc(m.user_added_at)}">+${esc((m.user_added_at||'').slice(5,10))}</span>` : ''}
-            ${(mStatus !== 'done' || m.star_relation) ? `<button class="nt-why" title="${m.star_relation ? 'Why this matters' : 'Generate: why this matters'}" style="opacity:${m.star_relation?'1':'.3'};font-size:18px;padding:6px 10px;min-width:40px;min-height:36px;line-height:1" onclick="event.stopPropagation();${m.star_relation ? `showStarRelModal('${escJs(m.star_relation)}','${escJs(m.text.slice(0,60))}')` : `generateStarRelation('${esc(projId)}','${esc(m.id)}',this)`}">★</button>` : ''}
-            <button class="nt-why" title="Chat" style="font-size:9px;opacity:${(_msConversations[m.id]||[]).length>0?'1':'.45'}" onclick="event.stopPropagation();showCommentPopup(event,'${escJs(m.claude_comment||'')}','${esc(projId)}','${esc(m.id)}','${esc(mStatus)}')">${(_msConversations[m.id]||[]).length>0 ? (_msConversations[m.id].length+' msg') : 'msg'}</button>
+            <!-- M239: removed duplicate +MM-DD date badge; timestamp lives in nt-id-stack now. -->
+            <!-- M244: gap-closure ★ moved to right of M-id in nt-id-stack (1st col). -->
             <button class="nt-del" title="Delete" onclick="event.stopPropagation();confirmDeleteMs('${esc(projId)}','${esc(m.id)}','${escJs(m.text.slice(0,60))}')">✕</button>
           </td>
         </tr>
@@ -2003,13 +2266,44 @@ function renderMilestoneCreator(projId, milestones) {
            onclick="const n=this.nextElementSibling;const arr=this.querySelector('.ret-arrow');n.style.display=n.style.display==='none'?'block':'none';if(arr)arr.textContent=n.style.display==='none'?'▸':'▾'">
         <span class="ret-arrow">▸</span> RETIRED (${doneStones.length})</div>
       <div style="display:none;margin-top:4px">
-        ${doneStones.map(m => `<div style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--text-dim);text-decoration:line-through;padding:2px 4px;font-family:var(--mono);opacity:.6">${esc(m.text.slice(0,60))}${m.star_relation ? `<button style="flex-shrink:0;background:none;border:none;cursor:pointer;font-size:16px;padding:2px 6px;min-width:28px;min-height:28px;opacity:.7;text-decoration:none;color:inherit" title="Why this mattered" onclick="event.stopPropagation();showStarRelModal('${esc(m.star_relation).replace(/'/g,"&#39;")}','${esc(m.text.slice(0,60)).replace(/'/g,"&#39;")}')">★</button>` : ''}</div>`).join('')}
+        ${doneStones.map(m => `<div style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--text-dim);text-decoration:line-through;padding:2px 4px;font-family:var(--mono);opacity:.6">${esc(m.text.slice(0,60))}${m.star_relation ? `<button style="flex-shrink:0;background:none;border:none;cursor:pointer;font-size:16px;padding:2px 6px;min-width:28px;min-height:28px;opacity:.7;text-decoration:none;color:inherit" title="Gap closure note" onclick="event.stopPropagation();showStarRelModal(event,'${esc(m.star_relation).replace(/'/g,"&#39;")}','${esc(m.text.slice(0,60)).replace(/'/g,"&#39;")}')">★</button>` : ''}</div>`).join('')}
       </div>
     </div>` : '';
 
   // Progress bars go into NS section, not milestone pane
   const nsBarSlot = document.getElementById('dm-ns-bars');
   if (nsBarSlot) nsBarSlot.innerHTML = progressBar;
+
+  // Session info pane: last Claude session that produced a Stop event for this project
+  // (captured by northstar-stop-inject hook in .last-session-id; surfaces resume-readiness).
+  // Renders into dm-session-slot — sits directly below the Execute button, above stones.
+  const sessSlot = document.getElementById('dm-session-slot');
+  if (sessSlot) {
+    const ri = _resumeInfo[projId];
+    if (!ri) {
+      sessSlot.innerHTML = `<div style="display:flex;align-items:center;gap:8px;padding:4px 6px;border:1px dashed var(--panel-border);border-radius:4px;font-family:var(--mono);font-size:9px;color:var(--text-dim);letter-spacing:.04em">
+        <span style="opacity:.7">last session</span>
+        <span style="opacity:.5">— no prior session captured (Stop hook hasn't fired here yet)</span>
+      </div>`;
+    } else {
+      const at = ri.at || '';
+      const hhmm = at.length >= 16 ? at.slice(11,16) : '';
+      const dayPart = at.length >= 10 ? at.slice(5,10).replace('-','/') : '';
+      const ageH = ri.at_epoch ? Math.round((Date.now()/1000 - ri.at_epoch) / 3600) : null;
+      const ageStr = ageH === null ? '' : ageH < 1 ? '<1h ago' : ageH < 24 ? `${ageH}h ago` : `${Math.round(ageH/24)}d ago`;
+      const okMark = ri.has_transcript ? '↻' : '⚠';
+      const verbColor = ri.has_transcript ? 'var(--green)' : 'var(--yellow,#d4a574)';
+      const verb = ri.has_transcript ? 'resumable' : 'transcript missing';
+      sessSlot.innerHTML = `<div style="display:flex;align-items:center;gap:8px;padding:4px 6px;border:1px solid var(--panel-border);border-radius:4px;font-family:var(--mono);font-size:9px;color:var(--text-dim);letter-spacing:.04em">
+        <span style="opacity:.7">last session</span>
+        <span style="color:var(--text);font-weight:500" title="Full session id starts with ${esc(ri.session_id_preview||'?')}">${esc(ri.session_id_preview||'?')}…</span>
+        <span style="opacity:.7">${esc(dayPart)} ${esc(hhmm)}</span>
+        <span style="opacity:.55">${esc(ageStr)}</span>
+        <span style="color:${verbColor};font-weight:500;margin-left:auto">${okMark} ${esc(verb)}</span>
+      </div>`;
+    }
+  }
+
   el.innerHTML = toggleHtml + doneSection; // M118: show retired section
 }
 
@@ -2211,12 +2505,29 @@ function _nodeTouchDrag() {
   });
 }
 
+function _msTouchCleanup() {
+  // M191: defensive cleanup — removes ghost + restores source opacity even if
+  // touchend never fires (e.g., touchcancel, re-render mid-drag, off-screen lift).
+  if (_touchDragGhost) { _touchDragGhost.remove(); _touchDragGhost = null; }
+  if (_touchDragEl) { _touchDragEl.style.opacity = ''; }
+  document.querySelectorAll('.nt-draggable-row.drag-over').forEach(r => r.classList.remove('drag-over'));
+  // Belt-and-suspenders: any row left at .3 opacity from a stale drag
+  document.querySelectorAll('.nt-draggable-row').forEach(r => {
+    if (r.style.opacity === '0.3') r.style.opacity = '';
+  });
+  _touchDragMid = null; _touchDragEl = null; _touchDragProjId = null;
+}
+
 function _msTouchSetup(projId) {
+  // M191: clear any orphaned ghost from a previous render before re-binding
+  _msTouchCleanup();
   document.querySelectorAll('.nt-draggable-row').forEach(row => {
     row.addEventListener('touchstart', e => {
       // M92: on mobile, only initiate drag when touch starts on the drag handle
       if (!e.target?.closest('.nt-drag-handle')) return;
       if (e.touches.length !== 1) return;
+      // M191: defensive cleanup of any prior stale state
+      if (_touchDragGhost || _touchDragEl) _msTouchCleanup();
       const t = e.touches[0];
       const rect = row.getBoundingClientRect();
       _touchDragMid = row.dataset.mid;
@@ -2232,6 +2543,10 @@ function _msTouchSetup(projId) {
       document.body.appendChild(_touchDragGhost);
       row.style.opacity = '0.3';
     }, {passive: true});
+
+    // M191: handle touchcancel (incoming call, scroll override, etc.) — without
+    // this the ghost stays + source row keeps opacity:.3 ("afterimage" remains).
+    row.addEventListener('touchcancel', _msTouchCleanup);
 
     row.addEventListener('touchmove', e => {
       if (!_touchDragMid) return;
@@ -2305,6 +2620,222 @@ async function toggleMsQueue(projId, mid) {
 // Alias kept for backwards compat (auto-ack still uses this)
 async function toggleMs(projId, mid) { return toggleMsQueue(projId, mid); }
 
+// Paste-as-chip helpers. Only TRUE paste events trigger the chip — long typed text
+// stays inline. Persistence uses U+E000 sentinels (Private Use Area, unlikely to
+// collide with user content) to mark paste boundaries inside the stored text:
+//   ...typed prefix...<PASTE_OPEN>pasted body<PASTE_CLOSE>...typed suffix...
+// _readNtText emits sentinels when serializing chips back; _renderNtTextHtml
+// splits on sentinels and rebuilds chips only for paste segments.
+const _NT_PASTE_THRESHOLD_CHARS = 200;
+const _NT_PASTE_THRESHOLD_LINES = 3;
+const _PASTE_OPEN = 'PASTE';
+const _PASTE_CLOSE = '/PASTE';
+function _readNtText(el) {
+  let out = '';
+  for (const node of el.childNodes) {
+    if (node.nodeType === 3) { out += node.textContent; continue; }
+    if (node.nodeType !== 1) continue;
+    if (node.classList && node.classList.contains('nt-paste-chip')) {
+      const raw = node.dataset.full || node.textContent || '';
+      out += _PASTE_OPEN + raw + _PASTE_CLOSE;
+    } else {
+      out += node.textContent;
+    }
+  }
+  return out;
+}
+function _pasteChipHtml(raw) {
+  const lines = raw.split('\n').length;
+  const enc = esc(raw).replace(/"/g, '&quot;');
+  return `<span class="nt-paste-chip" contenteditable="false" data-full="${enc}" `
+    + `title="Click to expand pasted text" `
+    + `onclick="event.stopPropagation();if(confirm('Expand pasted text inline? (${lines} lines, ${raw.length} chars)')){const t=document.createTextNode(this.dataset.full||'');this.replaceWith(t);}"`
+    + `>[Pasted text +${lines} lines, ${raw.length} chars]</span>`;
+}
+function _renderNtTextHtml(text) {
+  // Render typed text inline; only paste-sentinel segments collapse into chips.
+  text = text || '';
+  if (text.indexOf(_PASTE_OPEN) === -1) return esc(text);
+  let out = '';
+  let i = 0;
+  while (i < text.length) {
+    const open = text.indexOf(_PASTE_OPEN, i);
+    if (open === -1) { out += esc(text.slice(i)); break; }
+    if (open > i) out += esc(text.slice(i, open));
+    const bodyStart = open + _PASTE_OPEN.length;
+    const close = text.indexOf(_PASTE_CLOSE, bodyStart);
+    if (close === -1) { out += esc(text.slice(open)); break; }
+    out += _pasteChipHtml(text.slice(bodyStart, close));
+    i = close + _PASTE_CLOSE.length;
+  }
+  return out;
+}
+
+// M226: msg badge styled like the hold pill (pill shape, fill, border). Returns inline-style string.
+//   variant:
+//     'has'     → vivid solid accent fill (active conv, click to view)
+//     'clicked' → solid accent-deep fill (awaiting claude initial comment)
+//     'empty'   → outlined ghost (default placeholder)
+//     'clar'    → solid blue fill (needs clarification)
+function _msBadgeStyle(variant) {
+  // Bg/border styles below override .nt-why class fills, but .nt-why also forces
+  // `opacity:0` (visible-on-hover only). Every variant must therefore set
+  // `opacity:1` explicitly or the badge appears transparent at rest.
+  const base = 'display:inline-block;font-family:var(--mono);font-size:8px;letter-spacing:.04em;'
+    + 'padding:2px 7px;min-height:18px;border-radius:3px;cursor:pointer;line-height:1.3;opacity:1;'
+    + '-webkit-tap-highlight-color:rgba(204,120,92,.25);text-decoration:none;';
+  if (variant === 'has')     return base + 'color:#fff;background:var(--accent);border:1px solid var(--accent);';
+  if (variant === 'clicked') return base + 'color:#fff;background:var(--accent-deep);border:1px solid var(--accent-deep);';
+  if (variant === 'clar')    return base + 'color:#fff;background:#7b9fd4;border:1px solid #7b9fd4;';
+  /* M247: empty msg badge text muted to var(--text-dim) so it matches the queue/lock badges' default-state colour. */
+  return base + 'color:var(--text-dim);background:var(--panel-soft);border:1px solid var(--panel-border);';
+}
+
+function _msBangHtml(mid) {
+  // M206: red blinking '!' shown right of the msg badge when the last
+  // conversation entry is from claude (i.e., user's turn to reply).
+  const conv = _msConversations[mid] || [];
+  if (!conv.length) return '';
+  const last = conv[conv.length - 1];
+  if (!last || last.role !== 'claude') return '';
+  return `<span class="nt-msg-bang" title="Awaiting your reply">!</span>`;
+}
+
+function _msHoldBtnHtml(projId, mid, isHeld) {
+  // M216: hold/release toggle below the msg badge. Held stones are dropped from
+  // EXECUTE/REPLY SYNC queues server-side, so claude will not act on them.
+  // M246: hold badge redesigned as a lock icon (자물쇠) — closed lock when held, open lock when free.
+  const fg = isHeld ? '#fff' : 'var(--text-dim)';
+  const bg = isHeld ? 'var(--accent-deep)' : 'transparent';
+  const bd = isHeld ? 'var(--accent-deep)' : 'var(--panel-border)';
+  const ttl = isHeld ? 'Held — click to release (re-enable execution)' : 'Hold — pause this stone (claude will skip it)';
+  // Inline SVG: closed-lock shackle when held, open-lock shackle (right hasp raised) when free.
+  const lockSvg = isHeld
+    ? `<svg viewBox="0 0 12 14" width="11" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 6V4a2.5 2.5 0 0 1 5 0v2"/><rect x="2" y="6" width="8" height="6.5" rx="1.2" fill="currentColor" stroke="none"/></svg>`
+    : `<svg viewBox="0 0 12 14" width="11" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 6V4a2.5 2.5 0 0 1 5 0"/><rect x="2" y="6" width="8" height="6.5" rx="1.2"/></svg>`;
+  return `<button class="nt-hold" title="${ttl}"
+    draggable="false"
+    style="display:flex;align-items:center;justify-content:center;margin:3px auto 0;
+      width:24px;height:22px;padding:0;border-radius:3px;border:1px solid ${bd};background:${bg};color:${fg};
+      cursor:pointer;-webkit-tap-highlight-color:rgba(204,120,92,.25)"
+    onmousedown="event.stopPropagation()"
+    ontouchstart="event.stopPropagation()"
+    ondragstart="event.preventDefault();event.stopPropagation();return false"
+    onclick="event.stopPropagation();toggleHold('${esc(projId)}','${esc(mid)}',${!isHeld?'true':'false'})">${lockSvg}</button>`;
+}
+
+// M187: explicit user-driven queue toggle. Replaces the auto-promote race that fires before
+//   the user has finished typing a fresh milestone. New stones stay pending until the user
+//   clicks the "queue" badge in the msg column → status:queued.
+function _msQueueBtnHtml(projId, mid, status) {
+  if (status === 'done' || status === 'pending_confirmation' || status === 'needs_clarification') return '';
+  const isQueued = status === 'queued';
+  const lbl = isQueued ? 'queued' : 'queue';
+  const fg = isQueued ? '#fff' : 'var(--text-dim)';
+  const bg = isQueued ? 'var(--accent)' : 'transparent';
+  const bd = isQueued ? 'var(--accent)' : 'var(--panel-border)';
+  const ttl = isQueued
+    ? 'Queued — click to take it back to pending (claude will skip it)'
+    : 'Click to queue this stone — only then will claude work on it';
+  const nextStatus = isQueued ? 'pending' : 'queued';
+  return `<button class="nt-queue" title="${ttl}"
+    draggable="false"
+    style="display:block;margin:3px auto 0;font-family:var(--mono);font-size:8px;letter-spacing:.04em;
+      padding:2px 7px;min-height:18px;border-radius:3px;border:1px solid ${bd};background:${bg};color:${fg};
+      cursor:pointer;line-height:1.3;-webkit-tap-highlight-color:rgba(204,120,92,.25)"
+    onmousedown="event.stopPropagation()"
+    ontouchstart="event.stopPropagation()"
+    ondragstart="event.preventDefault();event.stopPropagation();return false"
+    onclick="event.stopPropagation();toggleQueueStatus('${esc(projId)}','${esc(mid)}','${nextStatus}')">${lbl}</button>`;
+}
+
+async function toggleQueueStatus(projId, mid, nextStatus) {
+  // M187: optimistic flip — update row's data-status + the queue button visually before PATCH.
+  const rows = document.querySelectorAll(`tr[data-mid="${CSS.escape(mid)}"]`);
+  rows.forEach(row => row.setAttribute('data-status', nextStatus));
+  if (_msCacheByProject[projId]) {
+    const cache = _msCacheByProject[projId].find(m => m.id === mid);
+    if (cache) cache.status = nextStatus;
+  }
+  try {
+    await fetch(`/api/northstar/${encodeURIComponent(projId)}/milestones/${encodeURIComponent(mid)}`, {
+      method: 'PATCH', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({status: nextStatus}),
+    });
+    // M240: queuing a stone should immediately dispatch (same as msg-badge reply behavior).
+    if (nextStatus === 'queued') {
+      fetch(`/api/northstar/${encodeURIComponent(projId)}/execute`, {method:'POST'}).catch(() => {});
+    }
+  } catch (_) {}
+  await loadMilestones(projId);
+}
+
+async function toggleHold(projId, mid, newHeld) {
+  // M220 v2: optimistic UI flip — update the button visually immediately so the
+  // user sees the state change without waiting for PATCH + loadMilestones round-trip.
+  // M231: also flip the row data-held attribute right away so the row opacity dims/undims instantly.
+  const held = !!newHeld;
+  const rows = document.querySelectorAll(`tr[data-mid="${CSS.escape(mid)}"]`);
+  rows.forEach(row => { row.setAttribute('data-held', held ? '1' : '0'); });
+  const _opt = document.querySelectorAll(`tr[data-mid="${CSS.escape(mid)}"] .nt-hold`);
+  const _lockSvg = held
+    ? '<svg viewBox="0 0 12 14" width="11" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 6V4a2.5 2.5 0 0 1 5 0v2"/><rect x="2" y="6" width="8" height="6.5" rx="1.2" fill="currentColor" stroke="none"/></svg>'
+    : '<svg viewBox="0 0 12 14" width="11" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 6V4a2.5 2.5 0 0 1 5 0"/><rect x="2" y="6" width="8" height="6.5" rx="1.2"/></svg>';
+  _opt.forEach(btn => {
+    btn.innerHTML = _lockSvg;
+    btn.style.color = held ? '#fff' : 'var(--text-dim)';
+    btn.style.background = held ? 'var(--accent-deep)' : 'transparent';
+    btn.style.borderColor = held ? 'var(--accent-deep)' : 'var(--panel-border)';
+    btn.title = held ? 'Held — click to release (re-enable execution)' : 'Hold — pause this stone (claude will skip it)';
+    btn.setAttribute('onclick', `event.stopPropagation();toggleHold('${projId}','${mid}',${!held ? 'true' : 'false'})`);
+  });
+  // Also keep the cached milestone in sync so next render doesn't revert.
+  if (_msCacheByProject[projId]) {
+    const cache = _msCacheByProject[projId].find(m => m.id === mid);
+    if (cache) cache.held = held;
+  }
+  try {
+    await fetch(`/api/northstar/${encodeURIComponent(projId)}/milestones/${encodeURIComponent(mid)}`, {
+      method: 'PATCH', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({held}),
+    });
+  } catch (_) {}
+  await loadMilestones(projId);
+}
+
+function _ntPasteHandler(ev) {
+  const txt = (ev.clipboardData || window.clipboardData)?.getData('text') || '';
+  if (!txt) return;
+  const lines = txt.split('\n').length;
+  if (txt.length < _NT_PASTE_THRESHOLD_CHARS && lines <= _NT_PASTE_THRESHOLD_LINES) return;
+  ev.preventDefault();
+  const chip = document.createElement('span');
+  chip.className = 'nt-paste-chip';
+  chip.contentEditable = 'false';
+  chip.dataset.full = txt;
+  chip.title = 'Click to expand pasted text';
+  chip.textContent = `[Pasted text +${lines} lines, ${txt.length} chars]`;
+  chip.onclick = (e) => {
+    e.stopPropagation();
+    if (!confirm(`Expand pasted text inline? (${lines} lines, ${txt.length} chars)`)) return;
+    const t = document.createTextNode(chip.dataset.full || '');
+    chip.replaceWith(t);
+  };
+  // Insert at the current cursor position
+  const sel = window.getSelection();
+  if (sel && sel.rangeCount) {
+    const range = sel.getRangeAt(0);
+    range.deleteContents();
+    range.insertNode(chip);
+    range.setStartAfter(chip);
+    range.setEndAfter(chip);
+    sel.removeAllRanges();
+    sel.addRange(range);
+  } else {
+    ev.target.appendChild(chip);
+  }
+}
+
 async function saveMs(projId, mid, text) {
   const trimmed = text.trim();
   // Auto-delete if left empty (user dismissed without typing)
@@ -2339,6 +2870,57 @@ async function reopenMs(projId, mid) {
   render(); // M106: refresh swimlane cards
 }
 
+// M214: persist per-project model choice. Server validates against allowed list.
+// Empty value = unset = CLI default. Takes effect on the NEXT spawn (PTY/tmux).
+async function setProjectModel(projId, model, sel) {
+  const status = document.getElementById('dm-model-status');
+  if (status) { status.textContent = '…'; status.style.color = 'var(--text-dim)'; }
+  try {
+    const r = await fetch(`/api/northstar/${encodeURIComponent(projId)}`, {
+      method: 'PATCH',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({model})
+    });
+    const d = await r.json();
+    if (!r.ok || !d.ok) {
+      if (status) { status.textContent = '✗ ' + (d.error||'err'); status.style.color = 'var(--red,#c54)'; }
+      return;
+    }
+    if (status) {
+      status.textContent = model ? `✓ ${model.replace(/^claude-/,'')}` : '✓ default';
+      status.style.color = 'var(--green,#4caf50)';
+      setTimeout(()=>{ if (status.textContent.startsWith('✓')) { status.textContent=''; } }, 4000);
+    }
+    // Keep in-memory project state in sync so re-renders preserve the new choice
+    const cur = window.activeIdx != null ? window.projects?.[window.activeIdx] : null;
+    if (cur && cur.id === projId) cur.model = model;
+    // M233 v2: sync all per-session row selectors so they show the same value.
+    document.querySelectorAll('.dm-model-select').forEach(s => { if (s !== sel) s.value = model; });
+    // If a session is alive, offer to restart so the new model env applies now.
+    // Otherwise the change only takes effect on the next manual spawn.
+    try {
+      const sessR = await fetch('/api/exec-sessions');
+      const sessD = await sessR.json();
+      const live = (sessD.sessions || []).some(s => s.proj_id === projId);
+      if (live) {
+        const lbl = model || '(default)';
+        if (confirm(`Restart this project's live session so it runs on "${lbl}"?\n(Resume args are kept — current stone work continues.)`)) {
+          if (status) { status.textContent = 'restarting…'; status.style.color = 'var(--text-dim)'; }
+          await fetch(`/api/northstar/${encodeURIComponent(projId)}/restart-session`, {method:'POST'});
+          if (status) {
+            status.textContent = `✓ ${lbl} (restarted)`;
+            status.style.color = 'var(--green,#4caf50)';
+            setTimeout(()=>{ if (status.textContent.startsWith('✓')) status.textContent=''; }, 5000);
+          }
+          if (typeof loadProjects === 'function') loadProjects();
+        }
+      }
+    } catch(_) {}
+  } catch (e) {
+    if (status) { status.textContent = '✗ network'; status.style.color = 'var(--red,#c54)'; }
+  }
+}
+
 async function executeProject(projId, btn) {
   if (btn.classList.contains('running')) return;
   btn.classList.add('running', 'exec-loading');
@@ -2347,6 +2929,19 @@ async function executeProject(projId, btn) {
   try {
     const r = await fetch(`/api/northstar/${encodeURIComponent(projId)}/execute`, {method:'POST'});
     const d = await r.json();
+    // M237: if there are no actionable stones, show "no tasks" on the button for 2.5s.
+    const noWork = d.ok && (
+      (d.tasks_created === 0) ||
+      (d.mode === 'tmux_active' && (d.tasks_created || 0) === 0)
+    );
+    if (noWork) {
+      btn.classList.remove('exec-loading');
+      btn.textContent = 'no tasks';
+      btn.title = 'No queued / pending stones to dispatch';
+      btn.style.opacity = '.7';
+      setTimeout(() => { btn.textContent = orig; btn.title = 'Execute'; btn.style.opacity = ''; btn.classList.remove('running'); }, 2500);
+      return;
+    }
     if (d.ok) {
       btn.title = d.message;
       if (d.mode === 'tmux' || d.mode === 'tmux_active') {
@@ -2463,24 +3058,52 @@ async function deleteMs(projId, mid) {
   await loadMilestones(projId);
 }
 
-function showStarRelModal(relation, stoneText) {
-  let overlay = document.getElementById('star-rel-overlay');
-  if (!overlay) {
-    overlay = document.createElement('div');
-    overlay.id = 'star-rel-overlay';
-    overlay.style.cssText = 'position:fixed;inset:0;z-index:9000;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.45)';
-    overlay.innerHTML = `<div style="background:var(--panel);border:1px solid var(--panel-border);border-radius:10px;padding:20px 22px;max-width:380px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,.3)">
-      <div style="font-size:9px;font-family:var(--mono);color:var(--accent);letter-spacing:.06em;margin-bottom:6px">★ WHY THIS STONE MATTERS</div>
-      <div id="star-rel-stone" style="font-size:11px;color:var(--text-dim);font-family:var(--mono);margin-bottom:10px;opacity:.7"></div>
-      <div id="star-rel-body" style="font-size:13px;color:var(--text);line-height:1.6"></div>
-      <button onclick="document.getElementById('star-rel-overlay').remove()" style="margin-top:14px;font-size:11px;font-family:var(--mono);background:none;border:1px solid var(--panel-border);border-radius:5px;padding:3px 12px;cursor:pointer;color:var(--text-dim)">close</button>
-    </div>`;
-    overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
-    document.body.appendChild(overlay);
+// M173: Re-skin to match comment popup style (positioned near click, mono font,
+// click-outside closes). Star_relation now represents the post-completion
+// gap-closure note (1-line statement of how the work reduced the star gap).
+function showStarRelModal(event, relation, stoneText) {
+  document.getElementById('star-rel-popup')?.remove();
+  const popup = document.createElement('div');
+  popup.id = 'star-rel-popup';
+  const isMob = window.innerWidth < 600;
+  const BOTTOM_GUTTER = 56;
+  const TOP_GUTTER = 12;
+  const availH = Math.max(120, window.innerHeight - BOTTOM_GUTTER - TOP_GUTTER);
+  const maxH = Math.min(availH, isMob ? Math.round(window.innerHeight * 0.7) : 320);
+  popup.style.cssText = `position:fixed;z-index:9999;background:var(--panel);border:1px solid var(--accent-soft);
+    border-radius:8px;padding:10px 13px;box-shadow:0 6px 24px rgba(0,0,0,.25);
+    font-family:var(--mono);font-size:11px;line-height:1.55;color:var(--text);
+    max-height:${maxH}px;overflow-y:auto;
+    ${isMob ? `left:8px;right:8px;bottom:${BOTTOM_GUTTER}px;max-width:calc(100vw - 16px)` : 'max-width:340px;min-width:240px'}`;
+  if (!isMob && event && typeof event.clientX === 'number') {
+    const x = Math.min(event.clientX, window.innerWidth - 360);
+    const safeBottom = window.innerHeight - BOTTOM_GUTTER;
+    const spaceBelow = safeBottom - (event.clientY + 8);
+    let y;
+    if (spaceBelow >= maxH) {
+      y = event.clientY + 8;
+    } else {
+      y = Math.max(TOP_GUTTER, event.clientY - maxH - 8);
+      if (y + maxH > safeBottom) y = Math.max(TOP_GUTTER, safeBottom - maxH);
+    }
+    popup.style.left = x + 'px';
+    popup.style.top = y + 'px';
   }
-  document.getElementById('star-rel-stone').textContent = stoneText;
-  document.getElementById('star-rel-body').textContent = relation;
-  overlay.style.display = 'flex';
+  popup.innerHTML = `<div style="font-size:9px;color:var(--accent);margin-bottom:6px;letter-spacing:.05em">★ GAP CLOSURE</div>
+    <div style="font-size:10px;color:var(--text-dim);margin-bottom:6px;opacity:.7">${esc(stoneText)}</div>
+    <div style="color:var(--text-soft)">${esc(relation)}</div>`;
+  document.body.appendChild(popup);
+  setTimeout(() => {
+    function _hStar(e) {
+      if (!popup.contains(e.target)) {
+        popup.remove();
+        document.removeEventListener('click', _hStar);
+        document.removeEventListener('touchstart', _hStar);
+      }
+    }
+    document.addEventListener('click', _hStar);
+    document.addEventListener('touchstart', _hStar, {passive: true});
+  }, 100);
 }
 
 // M65/M70: generate star-stone relation + OKR rationale for a milestone
@@ -2523,7 +3146,7 @@ async function generateStarRelation(projId, msId, btn) {
 
 async function _openWithTerminal(origIdx, projId) {
   // M77/M90: card badge is for exec-running/exec-idle (live session) only
-  if (_sessionStatus[projId] === 'exec-running' || _sessionStatus[projId] === 'exec-idle') {
+  if (_execStatus[projId]) {  // M178: exec running OR idle → attach to tmux watch
     startTmuxWatch(projId);
     return;
   }
@@ -2531,40 +3154,127 @@ async function _openWithTerminal(origIdx, projId) {
   openTerminal(projId);
 }
 
+// M210: state-transition notifier. Stores the previous poll's state so we can
+// detect live → idle transitions and fire a browser notification.
+let _prevExecStatus = null;
+let _prevPtyStatus = null;
+function _notifyTransition(projId, kind) {
+  if (typeof Notification === 'undefined') return;
+  if (Notification.permission !== 'granted') return;
+  try {
+    new Notification(`${projId} ${kind} → idle`, {
+      body: `Hub session for ${projId} just went idle.`,
+      tag: `idle-${projId}-${kind}`,
+      silent: false,
+      // M255 rolled back: requireInteraction was not working reliably across
+      // user's browser/OS combo, so reverted to default auto-dismiss banner.
+    });
+  } catch (_) {}
+}
+function _ensureNotificationPermission() {
+  if (typeof Notification === 'undefined') return;
+  if (Notification.permission === 'default') {
+    try { Notification.requestPermission(); } catch (_) {}
+  }
+}
+document.addEventListener('click', _ensureNotificationPermission, { once: false });
+
+// M210 v2: explicit notify-permission button. Shows current state, prompts on click,
+// and fires a confirmation notification so the user knows it worked.
+async function requestNotifyPermission() {
+  const btn = document.getElementById('notify-btn');
+  if (typeof Notification === 'undefined') {
+    alert('Browser does not support Notification API.');
+    return;
+  }
+  let perm = Notification.permission;
+  if (perm === 'default') {
+    try {
+      perm = await Notification.requestPermission();
+    } catch (_) {
+      perm = Notification.permission;
+    }
+  }
+  if (perm === 'granted') {
+    if (btn) { btn.textContent = 'notify ✓'; btn.style.color = 'var(--green)'; btn.style.borderColor = 'var(--green)'; }
+    // Fire a confirmation notification so user sees the system works
+    try {
+      new Notification('Hub notifications enabled', {
+        body: 'You will be notified when an exec/PTY session transitions to idle.',
+        tag: 'hub-notify-enabled',
+        // M255 rolled back.
+      });
+    } catch (_) {}
+  } else if (perm === 'denied') {
+    if (btn) { btn.textContent = 'notify ✗'; btn.style.color = 'var(--red)'; btn.style.borderColor = 'var(--red)'; }
+    alert('Notifications were denied. Re-enable in your browser site settings (URL bar → site info → Notifications → Allow), then click notify again.');
+  } else {
+    if (btn) btn.textContent = 'notify ?';
+  }
+}
+// On page load, reflect current permission state on the button label
+document.addEventListener('DOMContentLoaded', () => {
+  if (typeof Notification === 'undefined') return;
+  const btn = document.getElementById('notify-btn');
+  if (!btn) return;
+  if (Notification.permission === 'granted') { btn.textContent = 'notify ✓'; btn.style.color = 'var(--green)'; }
+  else if (Notification.permission === 'denied') { btn.textContent = 'notify ✗'; btn.style.color = 'var(--red)'; }
+});
+
 async function refreshSessionStatus() {
   try {
-    const [sessR, execR] = await Promise.all([
+    const [sessR, execR, resumeR] = await Promise.all([
       fetch('/api/northstar/sessions'),
-      fetch('/api/exec-sessions')
+      fetch('/api/exec-sessions'),
+      fetch('/api/northstar/resume-info').catch(() => null),
     ]);
-    _sessionStatus = await sessR.json();
-    // M77: exec-running overlays PTY state; badge shows exec (live Execute) state primarily
+    // M178: PTY and exec states tracked independently; no merging.
+    const newPty = await sessR.json();
+    const newExec = {};
     const execData = await execR.json();
     for (const s of (execData.sessions || [])) {
-      // M124: distinguish idle exec session (Claude at prompt) from active (processing)
-      _sessionStatus[s.proj_id] = s.idle ? 'exec-idle' : 'exec-running';
+      newExec[s.proj_id] = s.idle ? 'idle' : 'running';
+    }
+    // M210: detect live→idle transitions and notify (only after first poll).
+    if (_prevExecStatus) {
+      for (const [pid, st] of Object.entries(newExec)) {
+        if (_prevExecStatus[pid] === 'running' && st === 'idle') _notifyTransition(pid, 'exec');
+      }
+    }
+    if (_prevPtyStatus) {
+      for (const [pid, st] of Object.entries(newPty)) {
+        const wasActive = _prevPtyStatus[pid] === 'active';
+        const nowIdle = typeof st === 'string' && st.startsWith('idle:');
+        if (wasActive && nowIdle) _notifyTransition(pid, 'pty');
+      }
+    }
+    _prevExecStatus = { ...newExec };
+    _prevPtyStatus = { ...newPty };
+    _ptyStatus = newPty;
+    _execStatus = newExec;
+    // Last-used Claude session per project (.last-session-id captured by Stop hook)
+    if (resumeR && resumeR.ok) {
+      try { _resumeInfo = await resumeR.json(); } catch(_) { _resumeInfo = {}; }
     }
   } catch(_) {}
 }
 
-function buildSessPill(s) {
-  // M77: badge shows exec/live-session state only — PTY terminal states are hidden from badge
-  if (!s || s === 'dead' || s === 'none') return { cls: '', label: '' };
-  if (s === 'exec-running')  return { cls: 'ns-sess-running', label: 'live' };
-  if (s === 'exec-idle')    return { cls: 'ns-sess-idle',    label: 'idle' };
-  if (s === 'waiting' || s === 'wait') return { cls: 'ns-sess-waiting', label: 'wait' };
-  if (s === 'done')          return { cls: 'ns-sess-done',    label: 'done' };
-  // PTY states (active, idle:N, detached) — no badge; terminal indicator is the terminal button itself
+function buildSessPill(execState) {
+  // M178: badge reads _execStatus ONLY. PTY state has its own button label, never appears here.
+  if (execState === 'running') return { cls: 'ns-sess-running', label: 'live' };
+  if (execState === 'idle')    return { cls: 'ns-sess-idle',    label: 'idle' };
   return { cls: '', label: '' };
 }
 
 function sessCell(projId) {
-  const s = _sessionStatus[projId];
-  if (!s || s === 'dead') return `<span class="sess-dot sess-none"><span class="sess-indicator"></span>—</span>`;
-  if (s === 'active') return `<span class="sess-dot sess-active"><span class="sess-indicator"></span>live</span>`;
-  if (s === 'exec-running') return `<span class="sess-dot sess-active"><span class="sess-indicator"></span>live</span>`;
-  if (s.startsWith('idle:')) {
-    const secs = parseInt(s.split(':')[1]);
+  // M178: prefer exec state (the canonical "live work" indicator). Fall back to PTY.
+  if (_execStatus[projId] === 'running') return `<span class="sess-dot sess-active"><span class="sess-indicator"></span>live</span>`;
+  if (_execStatus[projId] === 'idle')    return `<span class="sess-dot sess-idle"><span class="sess-indicator"></span>idle</span>`;
+  const p = _ptyStatus[projId];
+  if (!p || p === 'dead') return `<span class="sess-dot sess-none"><span class="sess-indicator"></span>—</span>`;
+  if (p === 'active')     return `<span class="sess-dot sess-active"><span class="sess-indicator"></span>live</span>`;
+  if (typeof p === 'string' && p.startsWith('idle:')) {
+    const secs = parseInt(p.split(':')[1]);
     const label = secs < 60 ? `${secs}s` : secs < 3600 ? `${Math.round(secs/60)}m` : `${Math.round(secs/3600)}h`;
     return `<span class="sess-dot sess-idle"><span class="sess-indicator"></span>${label}</span>`;
   }
@@ -2588,55 +3298,95 @@ function deadlineBadge(deadline) {
 
 function nodeCard(p, idx) {
   const pct = Math.round(projectPct(p) * 100);
-  const color = statusColor(p.status);
+  // M245: bar color derives from pct when status is null/unknown (no more all-gray bars).
+  const color = progressBarColor(p, projectPct(p));
   const dotColor = statusColor(p.status || 'paused');
   const lastLog = p.log?.length ? p.log[p.log.length-1] : null;
   const logDate = lastLog ? (lastLog.date||'').slice(5) : '—';
   const dl = deadlineBadge(p.deadline);
-  let gapText = pct+'%', gapColor = 'var(--text-dim)';
-  if (p.current && p.current !== '—' && p.target && p.target !== '—') {
-    const c = parseNum(p.current), t = parseNum(p.target);
-    if (c !== null && t !== null) {
-      const rem = t - c;
-      const u = p.unit||'';
-      gapText = rem > 0 ? `${formatGapNum(rem)}${u}` : 'done';
-      gapColor = p.status === 'behind' ? 'var(--red)' : p.status === 'on-track' ? 'var(--green)' : 'var(--text-dim)';
-    }
-  }
-  const sKey = _sessionStatus[p.id||p.name];
-  const sessPill = buildSessPill(sKey);
+  // M217: always show star-arc percentage on the card's bottom-left, regardless of current/target.
+  let gapText = pct+'%';
+  let gapColor = p.status === 'behind' ? 'var(--red)' : p.status === 'on-track' ? 'var(--green)' : 'var(--text-dim)';
+  // M178: badge = exec state, button = PTY state (independent)
+  const _execKey = _execStatus[p.id||p.name];
+  const _ptyKey  = _ptyStatus[p.id||p.name];
+  const sessPill = buildSessPill(_execKey);
   const active = idx === activeIdx ? 'active' : '';
   const stage = p.stage || 'unassigned';
   const stageClass = stage !== 'unassigned' ? `stage-${stage}` : '';
+  // M207: badge label reflects the actual stage name (no more renamed FOCUS/LIVE).
   const stageBadge = (stage === 'focused' || stage === 'commercialized')
-    ? `<span class="ns-stage-badge ${stage}">${stage === 'focused' ? 'FOCUS' : 'LIVE'}</span>` : '';
+    ? `<span class="ns-stage-badge ${stage}">${stage.toUpperCase()}</span>` : '';
   const pid = esc(p.id||p.name);
-  const remaining = (p.milestones || []).filter(m => !m.done && (m.status||'') !== 'done').length;
-  const stoneTag = remaining > 0
-    ? `<span style="font-family:var(--mono);font-size:9px;color:var(--text-dim);white-space:nowrap;flex-shrink:0" title="${remaining} remaining stones">D+${remaining}</span>`
-    : '';
-  return `<div class="ns-node ${active} ${stageClass}" data-idx="${idx}" data-pid="${pid}" draggable="true">
+  // M158: count only not-yet-run stones (pre-execution).
+  // M188: separate counts for queued (waiting) vs reviewing (pending_confirmation).
+  // Excludes done + needs_clarification (the latter blocked on user).
+  const _ms = p.milestones || [];
+  // M219 v2: 4 independent count badges, ordered by stone status cycle
+  //   P (pending, not-yet-acked by claude) → Q (queued) → ! (claude replied, awaiting you) → R (review = pending_confirmation)
+  // M220 follow-up: held stones are excluded from ALL count badges (claude won't act on them).
+  const pendingN = _ms.filter(m => (m.status||'') === 'pending' && !m.done && !m.claude_ack && !m.held).length;
+  const queuedN  = _ms.filter(m => (m.status||'') === 'queued' && !m.done && !m.held).length;
+  const reviewN  = _ms.filter(m => (m.status||'') === 'pending_confirmation' && !m.done && !m.held).length;
+  const replyN   = _ms.filter(m => {
+    if (m.done || m.held) return false;
+    const c = m.conversation;
+    return c && c.length && c[c.length-1]?.role === 'claude';
+  }).length;
+  const _railTabStyle = 'font-family:var(--mono);font-size:9px;font-weight:600;line-height:1.2;'
+    + 'padding:2px 6px 3px;border-radius:6px 6px 0 0;border:1px solid;border-bottom:none;'
+    + 'box-shadow:0 -1px 2px rgba(0,0,0,.04);';
+  const _railParts = [];
+  // Order = status cycle: P → Q → ! → R
+  if (pendingN > 0) _railParts.push(`<span style="${_railTabStyle}color:#fff;background:#7b9fd4;border-color:#7b9fd4" title="${pendingN} pending (not yet reviewed by claude)">P${pendingN}</span>`);
+  if (queuedN  > 0) _railParts.push(`<span style="${_railTabStyle}color:#fff;background:var(--accent);border-color:var(--accent)" title="${queuedN} queued (waiting to run)">Q${queuedN}</span>`);
+  if (replyN   > 0) _railParts.push(`<span style="${_railTabStyle}color:#fff;background:var(--red);border-color:var(--red)" title="${replyN} awaiting your reply">!${replyN}</span>`);
+  if (reviewN  > 0) _railParts.push(`<span style="${_railTabStyle}color:#fff;background:var(--green);border-color:var(--green)" title="${reviewN} reviewing (pending your confirm)">R${reviewN}</span>`);
+  const railHtml = _railParts.length ? `<div class="ns-node-rail">${_railParts.join('')}</div>` : '';
+  // M227 v2: per-card pointer icon at top-left. Click toggles on/off (localStorage-backed).
+  const _cardPtrOn = _ncpIsOn(pid);
+  // M252: bang badge when the pointed card's session is idle / killed (anything not actively running).
+  const _cardPtrBang = _cardPtrOn && _execKey !== 'running';
+  const _cardPtrTitle = !_cardPtrOn ? 'Click to focus this card'
+    : (_cardPtrBang ? 'Focus pointer on — live session is idle / killed (click to turn off)'
+                    : 'Focus pointer on — click to turn off');
+  const _cardPtrHtml = `<button class="ns-card-pointer${_cardPtrOn ? ' on' : ''}${_cardPtrBang ? ' bang' : ''}" title="${_cardPtrTitle}"
+    onmousedown="event.stopPropagation()" ondragstart="event.preventDefault();event.stopPropagation();return false"
+    onclick="event.stopPropagation();_ncpToggle('${pid}')">
+    <svg class="ptr-spokes" viewBox="0 0 32 32" width="14" height="14"><g transform="translate(16,16)" fill="currentColor"><ellipse rx="2.2" ry="6" transform="rotate(0)   translate(0,-4.5)"/><ellipse rx="2.2" ry="6" transform="rotate(60)  translate(0,-4.5)"/><ellipse rx="2.2" ry="6" transform="rotate(120) translate(0,-4.5)"/><ellipse rx="2.2" ry="6" transform="rotate(180) translate(0,-4.5)"/><ellipse rx="2.2" ry="6" transform="rotate(240) translate(0,-4.5)"/><ellipse rx="2.2" ry="6" transform="rotate(300) translate(0,-4.5)"/></g></svg>
+    <span class="ptr-bang">!</span>
+  </button>`;
+  // M232: exec session state → ns-card border color (idle=orange / live=green-blink / none=default).
+  const _execClass = _execKey === 'running' ? 'exec-live' : (_execKey === 'idle' ? 'exec-idle' : '');
+  return `<div class="ns-node ${active} ${stageClass} ${_execClass}" data-idx="${idx}" data-pid="${pid}" draggable="true">
+    ${_cardPtrHtml}
     ${stageBadge}
-    <div class="ns-node-top">
-      <span class="ns-node-sdot" style="background:${dotColor}"></span>
-      <span class="ns-node-name" ondblclick="renameNode(this,'${pid}')"
-        onblur="saveNodeName(this,'${pid}')"
-        onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur()}"
-        >${esc(p.name)}</span>
-      <span class="ns-sess-pill ${sessPill.cls}" title="View live session"
-        onclick="event.stopPropagation();_openWithTerminal(${idx},'${pid}')"
-        style="${sessPill.cls ? 'cursor:pointer' : ''}">${sessPill.label}</span>
+    <div class="ns-node-main">
+      <div class="ns-node-top">
+        <span class="ns-node-sdot" style="background:${dotColor}"></span>
+        <span class="ns-node-name" ondblclick="event.stopPropagation();renameNode(this,'${pid}')"
+          onclick="if(this.isContentEditable){event.stopPropagation()}"
+          onmousedown="if(this.isContentEditable){event.stopPropagation()}"
+          onblur="saveNodeName(this,'${pid}')"
+          onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur()}"
+          >${esc(p.name)}</span>
+      </div>
+      <div class="ns-node-bar-wrap"><div class="ns-node-bar" style="width:${pct}%;background:${color}"></div></div>
+      <div class="ns-node-bottom">
+        <span class="ns-node-gap" style="color:${gapColor}">${esc(gapText)}</span>
+        <span class="ns-node-date" style="color:${dl.color}" title="deadline: ${esc(p.deadline||'none')}">${esc(dl.text)}</span>
+        ${(()=>{ /* M178: PTY-only — reads _ptyStatus, never exec. M180: 'idle' matches tmux vocabulary.
+                    M260: shortened labels to free horizontal room for the enlarged %/d-days. */
+                  const _termClass = _ptyKey==='active' ? ' live' : (typeof _ptyKey==='string' && _ptyKey.startsWith('idle:')) ? ' idle' : '';
+                  const _termLabel = _termClass===' live' ? 'live' : _termClass===' idle' ? 'idle' : '›_';
+                  const _termTitle = _termClass===' live' ? 'Attach to running Claude PTY' : _termClass===' idle' ? 'Resume idle Claude PTY (context preserved)' : 'Open Claude PTY';
+                  return `<span class="ns-node-term${_termClass}" title="${_termTitle}" onclick="event.stopPropagation();openTerminal('${pid}')">${_termLabel}</span>`;
+                })()}
+        <span class="ns-node-menu" title="More actions"
+          onclick="event.stopPropagation();showNodeCtxMenu('${pid}',event.clientX,event.clientY)">⋮</span>
+      </div>
     </div>
-    <div class="ns-node-bar-wrap"><div class="ns-node-bar" style="width:${pct}%;background:${color}"></div></div>
-    <div class="ns-node-bottom">
-      <span class="ns-node-gap" style="color:${gapColor}">${esc(gapText)}</span>
-      ${stoneTag}
-      <span class="ns-node-date" style="color:${dl.color}" title="deadline: ${esc(p.deadline||'none')}">${esc(dl.text)}</span>
-      <span class="ns-node-term" title="Open Claude session"
-        onclick="event.stopPropagation();openTerminal('${pid}')">›_ claude</span>
-      <span class="ns-node-menu" title="More actions"
-        onclick="event.stopPropagation();showNodeCtxMenu('${pid}',event.clientX,event.clientY)">⋮</span>
-    </div>
+    ${railHtml}
   </div>`;
 }
 
@@ -2715,12 +3465,18 @@ function render() {
         }
         cancelLink();
         if (childP) {
-          await fetch(`/api/northstar/${encodeURIComponent(childPid)}/layout`, {
-            method:'PATCH', headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({parent: parentPid}),
-          });
-          childP.parent = parentPid;
-          render();
+          // M221: append to parents list (dedup) instead of replacing the single parent.
+          const cur = _getParents(childP);
+          if (!cur.includes(parentPid)) {
+            const nextParents = [...cur, parentPid];
+            await fetch(`/api/northstar/${encodeURIComponent(childPid)}/layout`, {
+              method:'PATCH', headers:{'Content-Type':'application/json'},
+              body: JSON.stringify({parents: nextParents}),
+            });
+            childP.parents = nextParents;
+            childP.parent = nextParents[0];
+            render();
+          }
         }
         return;
       }
@@ -2862,6 +3618,35 @@ function renameNode(el, projId) {
   window.getSelection().removeAllRanges();
   window.getSelection().addRange(r);
 }
+// M165: PATCH a single star field (metric/current/target/unit) on blur/change.
+// Optimistic UI: update local projects[] + re-render swimlane immediately so the
+// metric badge / arc / star-arc bar reflect the new value without a round-trip.
+async function saveStarField(el) {
+  const projId = el.dataset.pid;
+  const field  = el.dataset.field;
+  if (!projId || !field) return;
+  const val = (el.tagName === 'INPUT' ? el.value : el.textContent).trim();
+  const p = projects.find(x => (x.id||x.name) === projId);
+  if (!p) return;
+  if ((p[field] ?? '') === val) return; // no-op
+  p[field] = val;
+  // Optimistic re-render: gauge + star-arc bar
+  try { render(); } catch (_) {}
+  // Trigger milestone-creator re-render so star-arc bar in dm-ns-bars updates
+  if (_msCacheByProject[projId]) renderMilestoneCreator(projId, _msCacheByProject[projId]);
+  const status = document.getElementById('dm-star-save-status');
+  if (status) { status.style.opacity = '0'; }
+  try {
+    await fetch(`/api/northstar/${encodeURIComponent(projId)}`, {
+      method: 'PATCH', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({[field]: val})
+    });
+    if (status) { status.style.opacity = '1'; setTimeout(() => status.style.opacity = '0', 900); }
+  } catch (_) {
+    if (status) { status.textContent = 'save failed'; status.style.color = 'var(--red)'; status.style.opacity = '1'; }
+  }
+}
+
 async function saveDeadline(projId, dateStr) {
   if (!dateStr) return;
   await fetch(`/api/northstar/${encodeURIComponent(projId)}`, {
@@ -2962,6 +3747,14 @@ function offsetRelTo(el, ancestor) {
   return { x, y, w: el.offsetWidth, h: el.offsetHeight };
 }
 
+// M221: return the list of parent ids for a project. Prefers `parents` list,
+// falls back to single legacy `parent` field. Always returns an array.
+function _getParents(p) {
+  if (Array.isArray(p && p.parents) && p.parents.length) return p.parents.filter(Boolean);
+  if (p && p.parent) return [p.parent];
+  return [];
+}
+
 function drawParentLines() {
   const svg = document.getElementById('ns-svg-lines');
   const swimlane = document.getElementById('ns-swimlane');
@@ -2971,41 +3764,45 @@ function drawParentLines() {
 
   const paths = [];
   projects.forEach(p => {
-    if (!p.parent) return;
+    const parents = _getParents(p);
+    if (!parents.length) return;
     const pid = p.id || p.name;
     const childEl = document.querySelector(`.ns-node[data-pid="${CSS.escape(pid)}"]`);
-    const parentEl = document.querySelector(`.ns-node[data-pid="${CSS.escape(p.parent)}"]`);
-    if (!childEl || !parentEl) return;
-    // Use offset-based positioning (stable across scroll/viewport changes)
+    if (!childEl) return;
     const cO = offsetRelTo(childEl, swimlane);
-    const pO = offsetRelTo(parentEl, swimlane);
-    const x1 = pO.x + pO.w / 2;
-    const y1 = pO.y + pO.h + 2;
-    const x2 = cO.x + cO.w / 2;
-    const y2 = cO.y - 2;
-    const mid = (y1 + y2) / 2;
-    const d = `M${x1},${y1} C${x1},${mid} ${x2},${mid} ${x2},${y2}`;
-    // Visible dashed line
-    paths.push(`<path d="${d}" stroke="${lineColor}" stroke-width="1.5" fill="none" stroke-dasharray="5,3"/>`);
-    // Invisible wide hit area for click-to-remove
-    paths.push(`<path d="${d}" stroke="transparent" stroke-width="12" fill="none" class="ns-line-hit" data-child="${pid}" style="cursor:pointer"/>`);
+    parents.forEach(parentPid => {
+      const parentEl = document.querySelector(`.ns-node[data-pid="${CSS.escape(parentPid)}"]`);
+      if (!parentEl) return;
+      const pO = offsetRelTo(parentEl, swimlane);
+      const x1 = pO.x + pO.w / 2;
+      const y1 = pO.y + pO.h + 2;
+      const x2 = cO.x + cO.w / 2;
+      const y2 = cO.y - 2;
+      const mid = (y1 + y2) / 2;
+      const d = `M${x1},${y1} C${x1},${mid} ${x2},${mid} ${x2},${y2}`;
+      paths.push(`<path d="${d}" stroke="${lineColor}" stroke-width="1.5" fill="none" stroke-dasharray="5,3"/>`);
+      paths.push(`<path d="${d}" stroke="transparent" stroke-width="12" fill="none" class="ns-line-hit" data-child="${pid}" data-parent="${parentPid}" style="cursor:pointer"/>`);
+    });
   });
   svg.setAttribute('width', swimlane.scrollWidth);
   svg.setAttribute('height', swimlane.scrollHeight);
   svg.innerHTML = paths.join('');
 
-  // Click hit area → remove parent link
+  // Click hit area → remove that specific parent link (M221: multi-parent aware)
   svg.querySelectorAll('.ns-line-hit').forEach(el => {
     el.addEventListener('click', async e => {
       e.stopPropagation();
       const childPid = el.dataset.child;
+      const parentToRemove = el.dataset.parent;
       const p = projects.find(x => (x.id||x.name) === childPid);
       if (!p) return;
+      const remaining = _getParents(p).filter(pp => pp !== parentToRemove);
       await fetch(`/api/northstar/${encodeURIComponent(childPid)}/layout`, {
         method:'PATCH', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({parent: null}),
+        body: JSON.stringify({parents: remaining}),
       });
-      p.parent = null;
+      p.parents = remaining;
+      p.parent = remaining[0] || null;
       render();
     });
   });
@@ -3025,10 +3822,14 @@ function getAlign() { return localStorage.getItem('ns-card-align') || 'free'; }
 function applyAlign() {
   const key = getAlign();
   const opt = ALIGN_OPTIONS.find(o => o.key === key) || ALIGN_OPTIONS[4];
+  // M209: button now labels the NEXT mode (what the click will apply), so the
+  // text matches the action — "left" on the button means clicking applies left.
+  const _nextOpt = ALIGN_OPTIONS[(ALIGN_OPTIONS.findIndex(o => o.key === key) + 1) % ALIGN_OPTIONS.length];
+  const _btnLabel = _nextOpt.icon + ' ' + _nextOpt.label.toLowerCase();
   // 'free' = keep saved position_x, no override
   if (key === 'free') {
     const btn = document.getElementById('align-btn');
-    if (btn) btn.textContent = opt.icon + ' align';
+    if (btn) btn.textContent = _btnLabel;
     return;
   }
   // Other modes: recompute left offsets based on alignment
@@ -3050,8 +3851,260 @@ function applyAlign() {
     cards.forEach((card, i) => { card.style.left = x + 'px'; x += widths[i] + gap; });
   });
   const btn = document.getElementById('align-btn');
-  if (btn) btn.textContent = opt.icon + ' align';
+  if (btn) btn.textContent = _btnLabel;
 }
+
+// M212 v5: multi-pointer model. Storage = { pointers: [{id,x,y,shape}] }.
+// Migration: legacy { x, y, shape, visible } → if visible, single-entry array.
+const _PP_KEY = 'ns-priority-pointer';
+const _PP_HUB_SVG = '<svg viewBox="0 0 32 32" width="40" height="40" style="display:block">'
+  + '<g transform="translate(16,16)" fill="currentColor">'
+  + '<ellipse rx="2.2" ry="6" transform="rotate(0)   translate(0,-4.5)"/>'
+  + '<ellipse rx="2.2" ry="6" transform="rotate(60)  translate(0,-4.5)"/>'
+  + '<ellipse rx="2.2" ry="6" transform="rotate(120) translate(0,-4.5)"/>'
+  + '<ellipse rx="2.2" ry="6" transform="rotate(180) translate(0,-4.5)"/>'
+  + '<ellipse rx="2.2" ry="6" transform="rotate(240) translate(0,-4.5)"/>'
+  + '<ellipse rx="2.2" ry="6" transform="rotate(300) translate(0,-4.5)"/>'
+  + '</g></svg>';
+// M227 v2: per-card pointer toggle. localStorage key = ns-card-pointer-on.
+//   Storage shape: { [projId]: true } — only on-cards stored. Click toggles.
+const _NCP_KEY = 'ns-card-pointer-on';
+function _ncpLoadMap() {
+  try { return JSON.parse(localStorage.getItem(_NCP_KEY) || '{}') || {}; }
+  catch (_) { return {}; }
+}
+function _ncpSaveMap(m) { try { localStorage.setItem(_NCP_KEY, JSON.stringify(m)); } catch (_) {} }
+function _ncpIsOn(pid) { return !!_ncpLoadMap()[pid]; }
+function _ncpToggle(pid) {
+  const m = _ncpLoadMap();
+  if (m[pid]) delete m[pid]; else m[pid] = true;
+  _ncpSaveMap(m);
+  // M259 v3: fully-optimistic flip — turn on/off the .on class AND the .bang class
+  // immediately based on the current _execStatus, so the user sees the toggle land
+  // on the same frame as the click (no waiting up to 3s for the next render tick).
+  const btn = document.querySelector(`.ns-node[data-pid="${CSS.escape(pid)}"] .ns-card-pointer`);
+  if (btn) {
+    const isOn = !!m[pid];
+    const execKey = (typeof _execStatus !== 'undefined') ? _execStatus[pid] : null;
+    const shouldBang = isOn && execKey !== 'running';
+    btn.classList.toggle('on', isOn);
+    btn.classList.toggle('bang', shouldBang);
+    btn.title = !isOn ? 'Click to focus this card'
+              : shouldBang ? 'Focus pointer on — live session is idle / killed (click to turn off)'
+              : 'Focus pointer on — click to turn off';
+  }
+}
+
+function _ppLoadAll() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(_PP_KEY) || 'null');
+    if (raw && Array.isArray(raw.pointers)) return raw.pointers;
+    // Legacy single-pointer migration
+    if (raw && typeof raw === 'object' && raw.visible) {
+      return [{ id: 'p1', x: raw.x ?? 50, y: raw.y ?? 50, shape: raw.shape || 'hub' }];
+    }
+  } catch (_) {}
+  return [];
+}
+function _ppSaveAll(pointers) {
+  try { localStorage.setItem(_PP_KEY, JSON.stringify({ pointers })); } catch (_) {}
+}
+function _ppNewId() { return 'p' + Math.random().toString(36).slice(2, 8); }
+let _ppEditingId = null;  // pointer currently being shape-picked
+
+function _ppApplyAll() {
+  const container = document.getElementById('ns-pp-container');
+  if (!container) return;
+  const pointers = _ppLoadAll();
+  container.innerHTML = '';
+  pointers.forEach(p => {
+    const el = document.createElement('div');
+    el.className = 'ns-pp-item';
+    el.dataset.id = p.id;
+    el.style.cssText = 'position:absolute;z-index:50;font-size:32px;line-height:1;cursor:grab;'
+      + 'user-select:none;text-shadow:0 1px 3px rgba(0,0,0,.35);color:var(--accent);'
+      + 'padding:4px;border-radius:6px;touch-action:none;pointer-events:auto;'
+      + `left:${p.x}px;top:${p.y}px`;
+    if (p.shape === 'hub') el.innerHTML = _PP_HUB_SVG;
+    else el.textContent = p.shape || '★';
+    _ppAttachHandlers(el, p.id);
+    container.appendChild(el);
+  });
+  const picker = document.getElementById('ns-priority-picker');
+  if (picker && !pointers.length) picker.style.display = 'none';
+  // Top-bar button always reads "+ pointer" — there is no global toggle now.
+  const btn = document.getElementById('priority-toggle-btn');
+  if (btn) btn.textContent = '+ pointer';
+}
+
+function _ppAttachHandlers(el, id) {
+  const canvas = document.getElementById('ns-swimlane');
+  const picker = document.getElementById('ns-priority-picker');
+  let drag = null;
+  const onDown = (e) => {
+    e.stopPropagation();
+    const t = e.touches ? e.touches[0] : e;
+    const r = el.getBoundingClientRect();
+    drag = { ox: t.clientX - r.left, oy: t.clientY - r.top, sx: t.clientX, sy: t.clientY, moved: false };
+    el.style.cursor = 'grabbing';
+  };
+  const onMove = (e) => {
+    if (!drag) return;
+    const t = e.touches ? e.touches[0] : e;
+    const dx = t.clientX - drag.sx, dy = t.clientY - drag.sy;
+    if (!drag.moved && (dx*dx + dy*dy) < 16) return;  // 4px threshold
+    const cRect = canvas.getBoundingClientRect();
+    const x = Math.max(0, Math.min(canvas.scrollWidth - 30, t.clientX - cRect.left - drag.ox));
+    const y = Math.max(0, Math.min(canvas.clientHeight - 30, t.clientY - cRect.top - drag.oy));
+    el.style.left = x + 'px';
+    el.style.top  = y + 'px';
+    drag.lastX = x; drag.lastY = y;
+    drag.moved = true;
+    if (e.cancelable) e.preventDefault();
+  };
+  const onUp = () => {
+    if (!drag) return;
+    if (drag.moved) {
+      const pointers = _ppLoadAll();
+      const p = pointers.find(pp => pp.id === id);
+      if (p) { p.x = drag.lastX ?? p.x; p.y = drag.lastY ?? p.y; _ppSaveAll(pointers); }
+    } else {
+      _ppEditingId = id;
+      picker.style.left = (parseFloat(el.style.left) + 40) + 'px';
+      picker.style.top  = el.style.top;
+      picker.style.display = 'flex';
+    }
+    drag = null;
+    el.style.cursor = 'grab';
+  };
+  el.addEventListener('mousedown', onDown);
+  el.addEventListener('touchstart', onDown, { passive: false });
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('touchmove', onMove, { passive: false });
+  document.addEventListener('mouseup', onUp);
+  document.addEventListener('touchend', onUp);
+  // M227: double-click deletes this pointer.
+  el.addEventListener('dblclick', (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+    const pointers = _ppLoadAll().filter(p => p.id !== id);
+    _ppSaveAll(pointers);
+    const picker = document.getElementById('ns-priority-picker');
+    if (picker) picker.style.display = 'none';
+    _ppEditingId = null;
+    _ppApplyAll();
+  });
+  // M227: also suppress browser context menu on right-click so it doesn't interfere.
+  el.addEventListener('contextmenu', (e) => { e.preventDefault(); });
+}
+
+function togglePriorityPointer() {
+  // M212 v5: always ADDS a new pointer (multi-pointer support). Delete via picker per-pointer.
+  // M227 follow-up: default placement follows current card-alignment mode.
+  const canvas = document.getElementById('ns-swimlane');
+  const rect = canvas?.getBoundingClientRect();
+  let x, y;
+  if (canvas) {
+    const align = (typeof getAlign === 'function') ? getAlign() : 'free';
+    const w = canvas.scrollWidth;
+    const h = canvas.clientHeight;
+    if (align === 'left')   x = canvas.scrollLeft + 16;
+    else if (align === 'right') x = canvas.scrollLeft + Math.max(16, rect.width - 56);
+    else /* center, spread, free */ x = canvas.scrollLeft + Math.round(rect.width / 2) - 20;
+    x = Math.max(8, Math.min(w - 40, Math.round(x)));
+    y = Math.max(8, Math.round(canvas.scrollTop + (rect.height / 2) - 20));
+  } else { x = 50; y = 50; }
+  const pointers = _ppLoadAll();
+  pointers.push({ id: _ppNewId(), x, y, shape: 'hub' });
+  _ppSaveAll(pointers);
+  _ppApplyAll();
+}
+
+function _ppInit() {
+  const picker = document.getElementById('ns-priority-picker');
+  if (!picker) return;
+  picker.querySelectorAll('.ns-pp-opt').forEach(opt => {
+    opt.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (!_ppEditingId) return;
+      const pointers = _ppLoadAll();
+      if (opt.dataset.action === 'delete') {
+        const next = pointers.filter(p => p.id !== _ppEditingId);
+        _ppSaveAll(next);
+      } else if (opt.dataset.shape) {
+        const p = pointers.find(pp => pp.id === _ppEditingId);
+        if (p) { p.shape = opt.dataset.shape; _ppSaveAll(pointers); }
+      }
+      picker.style.display = 'none';
+      _ppEditingId = null;
+      _ppApplyAll();
+    });
+  });
+  document.addEventListener('click', (e) => {
+    if (!picker.contains(e.target) && !e.target.classList?.contains('ns-pp-item')) {
+      picker.style.display = 'none';
+    }
+  });
+  _ppApplyAll();
+}
+document.addEventListener('DOMContentLoaded', _ppInit);
+if (document.readyState !== 'loading') setTimeout(_ppInit, 0);
+
+// M224: mini note pane. M238: server-backed (~/.claude/hub/global-memo.txt) so memo survives
+// hub restarts AND syncs across devices/browsers. localStorage kept as offline cache.
+const _MN_KEY = 'ns-mini-note';
+// M251: stretch the memo textarea to use all available vertical space down to the viewport bottom.
+//   Different gutter for mobile (smaller) vs desktop. Recomputes on resize.
+function _mnResize() {
+  const el = document.getElementById('ns-mini-note');
+  if (!el) return;
+  const isMob = window.innerWidth < 600;
+  const bottomGutter = isMob ? 16 : 24;   // mobile has no fixed-bottom chrome; desktop leaves a bit more room
+  const rect = el.getBoundingClientRect();
+  const available = Math.max(120, window.innerHeight - rect.top - bottomGutter);
+  el.style.minHeight = available + 'px';
+}
+function _mnInit() {
+  const el = document.getElementById('ns-mini-note');
+  const status = document.getElementById('ns-mini-note-status');
+  if (!el) return;
+  // initial stretch + listen for viewport changes
+  _mnResize();
+  window.addEventListener('resize', _mnResize);
+  // re-stretch shortly after load to capture final layout (lanes may shift it down)
+  setTimeout(_mnResize, 200);
+  setTimeout(_mnResize, 800);
+  // Show cached value immediately, then overwrite with server's version when it arrives.
+  try { el.value = localStorage.getItem(_MN_KEY) || ''; } catch (_) {}
+  fetch('/api/hub/memo').then(r => r.json()).then(d => {
+    if (d && typeof d.content === 'string') {
+      el.value = d.content;
+      try { localStorage.setItem(_MN_KEY, d.content); } catch (_) {}
+    }
+  }).catch(() => {});
+  let saveTimer = null;
+  const save = () => {
+    const v = el.value;
+    try { localStorage.setItem(_MN_KEY, v); } catch (_) {}
+    if (status) { status.textContent = '…'; }
+    fetch('/api/hub/memo', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({content: v}),
+    }).then(() => {
+      if (status) { status.textContent = 'saved'; setTimeout(() => { if (status) status.textContent = ''; }, 1200); }
+    }).catch(() => {
+      if (status) { status.textContent = 'local'; setTimeout(() => { if (status) status.textContent = ''; }, 1500); }
+    });
+  };
+  el.addEventListener('input', () => {
+    if (status) { status.textContent = '…'; }
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(save, 500);
+  });
+  el.addEventListener('blur', save);
+}
+document.addEventListener('DOMContentLoaded', _mnInit);
+if (document.readyState !== 'loading') setTimeout(_mnInit, 0);
 
 function cycleAlign() {
   const cur = getAlign();
@@ -3160,26 +4213,7 @@ function cancelLink() {
   if (b) b.style.display = 'none';
 }
 
-document.getElementById('ctx-stage').onclick = (e) => {
-  e.stopPropagation(); // prevent document click from closing menu
-  document.getElementById('ctx-node-items').style.display = 'none';
-  document.getElementById('ctx-stage-items').style.display = '';
-};
-
-async function setStage(stageName) {
-  const pid = _ctxNodeId; if (!pid) return; // read BEFORE hideCtxMenu clears it
-  document.getElementById('ctx-stage-items').style.display = 'none';
-  document.getElementById('ctx-node-items').style.display = '';
-  hideCtxMenu();
-  const p = projects.find(x => (x.id||x.name) === pid);
-  if (!p) return;
-  await fetch(`/api/northstar/${encodeURIComponent(pid)}/layout`, {
-    method:'PATCH', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({stage: stageName}),
-  });
-  p.stage = stageName;
-  render();
-}
+// M232 follow-up: ctx-stage / setStage removed — exec-session state now drives the card border.
 
 document.getElementById('ctx-link-parent').onclick = () => {
   const pid = _ctxNodeId; if (!pid) return;
@@ -3303,7 +4337,8 @@ function drawConnections() {} // no-op — vis-network handles connections
 
 function nodeHtml(p, idx) {
   const pct = Math.round(projectPct(p) * 100);
-  const color = statusColor(p.status);
+  // M245: bar color derives from pct when status is null/unknown (no more all-gray bars).
+  const color = progressBarColor(p, projectPct(p));
   const dotColor = statusColor(p.status || 'paused');
   const lastLog = p.log?.length ? p.log[p.log.length - 1] : null;
   const logDate = lastLog ? (lastLog.date || '').slice(5) : '—';
@@ -3316,10 +4351,10 @@ function nodeHtml(p, idx) {
       gapColor = p.status === 'behind' ? 'var(--red)' : p.status === 'on-track' ? 'var(--green)' : 'var(--text-dim)';
     }
   }
-  const sKey = _sessionStatus[p.id || p.name];
-  // M77: badge shows exec-running state only; PTY active/idle are not surfaced on the card
-  const sessClass = sKey === 'exec-running' ? 'live' : sKey === 'exec-idle' ? 'idle' : '';
-  const sessDot = (sKey === 'exec-running' || sKey === 'exec-idle') ? '●' : '·';
+  // M178: badge reads _execStatus only (exec session is the "live work" indicator)
+  const _execKey2 = _execStatus[p.id || p.name];
+  const sessClass = _execKey2 === 'running' ? 'live' : _execKey2 === 'idle' ? 'idle' : '';
+  const sessDot   = _execKey2 ? '●' : '·';
   const active = idx === activeIdx ? 'active' : '';
   return `<div class="ns-node ${active}" data-proj-idx="${idx}" data-proj-id="${esc(p.id||p.name)}" data-layer="${p.layer||0}" draggable="true">
     <div class="ns-node-top">
@@ -3402,7 +4437,16 @@ function closeDetail() {
   window.__multiNSActive = null;  // clear multi-NS lock
   window.__nsLPCur = 0;           // reset NS page for next open
   document.getElementById('detail-overlay').classList.remove('show');
+  // M215: ensure loading state is cleared so next open starts fresh.
+  const _m = document.getElementById('detail-modal');
+  if (_m) _m.classList.remove('loading');
+  // M233: clear the header spec-doc slot so next open's spec doesn't leak from prior project.
+  const _sh = document.getElementById('dm-spec-header-slot');
+  if (_sh) _sh.innerHTML = '';
   stopTmuxWatch();
+  if (typeof stopTaskBoardPoll === 'function') stopTaskBoardPoll();
+  // Stop the OSK upstream-error poll so it doesn't keep firing after the card closes.
+  clearInterval(window._oskHealthPoll);
   render();
 }
 
@@ -3505,6 +4549,26 @@ function openTerminal(projId) {
       // Reset AFTER onData fires so the final syllable isn't sent twice
       setTimeout(() => { _imeComposing = false; }, 0);
     });
+    // M208: mobile clipboard paste — xterm.js does not natively pipe paste into
+    // onData on touch keyboards. Capture the `paste` event on the hidden textarea
+    // and forward clipboard text directly to the websocket (bypassing onData).
+    _xtArea.addEventListener('paste', e => {
+      const txt = (e.clipboardData || window.clipboardData)?.getData('text');
+      if (!txt) return;
+      e.preventDefault();
+      if (ws.readyState === 1) ws.send(txt);
+    });
+  }
+  // M208: also expose paste on the .xterm container itself — some mobile
+  // browsers fire paste on the parent rather than the inner textarea.
+  const _xtContainer = document.getElementById('dm-xterm');
+  if (_xtContainer) {
+    _xtContainer.addEventListener('paste', e => {
+      const txt = (e.clipboardData || window.clipboardData)?.getData('text');
+      if (!txt) return;
+      e.preventDefault();
+      if (ws.readyState === 1) ws.send(txt);
+    });
   }
 
   // Resize handle — bottom-right drag
@@ -3563,9 +4627,35 @@ function openTerminal(projId) {
       if (_wsBatch) { _term.write(_wsBatch); _wsBatch = ''; }
       _wsRaf = null;
     });
+    // M178: when minimized, increment line-count indicator so user sees activity
+    if (_termMinimized && typeof e.data === 'string') {
+      const newlines = (e.data.match(/\n/g) || []).length;
+      if (newlines > 0) {
+        _termMinCounter = (_termMinCounter || 0) + newlines;
+        const cEl = document.getElementById('ns-term-min-counter');
+        if (cEl) cEl.textContent = `+${_termMinCounter}`;
+      }
+    }
   };
-  ws.onopen    = () => { _termFit.fit(); _sendResize(ws); };
-  ws.onclose   = () => _term.write('\r\n\x1b[33m[session closed]\x1b[0m\r\n');
+  // M155: optimistic status update so the >claude button flips to "live" the
+  // instant the WS connects (previously the user waited up to 10 s for the
+  // next /api/northstar/sessions poll). On WS close, ask the server for the
+  // authoritative state immediately instead of guessing 'detached' — the PTY
+  // usually survives a WS close, so the button should flip straight to
+  // "›_ resume" rather than briefly flash "›_ claude" until the next 3 s poll.
+  ws.onopen    = () => {
+    _termFit.fit(); _sendResize(ws);
+    _ptyStatus[projId] = 'active';  // M178: PTY-only update
+    if (typeof render === 'function') render();
+  };
+  ws.onclose   = () => {
+    _term.write('\r\n\x1b[33m[session closed]\x1b[0m\r\n');
+    // Refresh from server: server returns idle:N if PTY still alive, removes
+    // entry if it died. Either way the rendered label will be correct.
+    if (typeof refreshSessionStatus === 'function') {
+      refreshSessionStatus().then(() => { if (typeof render === 'function') render(); });
+    }
+  };
   ws.onerror   = () => _term.write('\r\n\x1b[31m[connection error — is hub server running?]\x1b[0m\r\n');
 
   // Resize observer
@@ -3616,6 +4706,31 @@ function _setupTermScrollbar() {
 }
 
 let _termMinimized = false;
+let _termMinCounter = 0; // M178: lines received while minimized
+
+// M208 v2: explicit paste button — reads clipboard via async API and pipes the
+// text directly into the WebSocket. Bypasses xterm.js onData entirely.
+// Required because mobile keyboards have no paste key + long-press on xterm
+// canvas does not surface the native textarea context menu.
+async function pasteToPty() {
+  if (!_termWs || _termWs.readyState !== 1) {
+    alert('Terminal not connected — open a session first.');
+    return;
+  }
+  let txt = '';
+  try {
+    if (navigator.clipboard && navigator.clipboard.readText) {
+      txt = await navigator.clipboard.readText();
+    }
+  } catch (e) {
+    // Permission denied or insecure context — fall back to prompt
+  }
+  if (!txt) {
+    txt = prompt('Paste text:') || '';
+  }
+  if (!txt) return;
+  _termWs.send(txt);
+}
 
 function closeTerminal() {
   const projId = document.getElementById('ns-term-proj')?.textContent?.trim();
@@ -3624,13 +4739,27 @@ function closeTerminal() {
   document.getElementById('ns-terminal-float').style.display = 'none';
   const bd = document.getElementById('ns-term-backdrop');
   if (bd) bd.style.display = 'none';
-  // Mark as detached — only if no exec session is active (don't clobber live/idle badge)
+  // M159: optimistic flip — when the user closes the terminal (PTY survives WS),
+  // surface "›_ resume" immediately so the button never visibly hangs on "›_ live"
+  // for a poll tick. killSession() sets window._termPtyKilled so we know to skip
+  // the optimistic resume state (PTY is actually gone → keep idle clear).
   if (projId && projId !== '—') {
-    const cur = _sessionStatus[projId];
-    if (cur !== 'exec-running' && cur !== 'exec-idle') {
-      _sessionStatus[projId] = 'detached';
+    // M178: closeTerminal only affects PTY state. Exec state is untouched.
+    const ptyKilled = window._termPtyKilled === projId;
+    if (!ptyKilled) {
+      // WS detached but PTY likely survives → flip to idle:0 so button shows resume.
+      if (_ptyStatus[projId] === 'active' || !_ptyStatus[projId]) {
+        _ptyStatus[projId] = 'idle:0';
+      }
+    } else {
+      // PTY actually killed → clear so button falls back to '›_ claude'.
+      delete _ptyStatus[projId];
+      window._termPtyKilled = null;
     }
     render();
+    if (typeof refreshSessionStatus === 'function') {
+      refreshSessionStatus().then(() => render());
+    }
   }
 }
 
@@ -3638,17 +4767,38 @@ function minimizeTerminal() {
   const float = document.getElementById('ns-terminal-float');
   const btn = document.getElementById('ns-term-min-btn');
   _termMinimized = !_termMinimized;
+  // M178: live activity indicator + line counter shown only while minimized
+  const liveDot = document.getElementById('ns-term-live-dot');
+  const counter = document.getElementById('ns-term-min-counter');
   if (_termMinimized) {
     float.dataset.lastH = float.style.height || float.offsetHeight + 'px' || '680px';
     float.style.removeProperty('height'); // clear any !important inline height so CSS class wins
     float.classList.add('ns-term-minimized');
     btn.textContent = '□';
+    _termMinCounter = 0;
+    if (liveDot) liveDot.style.display = 'inline-block';
+    if (counter) { counter.style.display = 'inline'; counter.textContent = '+0'; }
   } else {
     float.classList.remove('ns-term-minimized');
     float.style.height = float.dataset.lastH || '680px';
     btn.textContent = '—';
+    if (liveDot) liveDot.style.display = 'none';
+    if (counter) counter.style.display = 'none';
+    _termMinCounter = 0;
     // M127: fit at 80ms, 200ms, 400ms — CSS transition takes time, single call is too early
-    [80, 200, 400].forEach(d => setTimeout(() => _termFit?.fit(), d));
+    // M157: also refresh xterm renderer + scroll to bottom — on mobile, hiding via
+    // display:none leaves the renderer in a 0-row state and incoming PTY data renders
+    // as broken text until a full repaint is triggered.
+    [80, 200, 400].forEach(d => setTimeout(() => {
+      try {
+        _termFit?.fit();
+        if (_term) {
+          _term.refresh(0, _term.rows - 1);
+          _term.scrollToBottom();
+          if (_termWs && _termWs.readyState === 1) _sendResize(_termWs);
+        }
+      } catch (_) {}
+    }, d));
   }
 }
 
@@ -3693,6 +4843,9 @@ function minimizeTerminal() {
 
 async function killSession() {
   const projId = document.getElementById('ns-term-proj')?.textContent?.trim();
+  // M159: flag for closeTerminal so it skips the "resume" optimistic update —
+  // the PTY is actually dying, button should fall back to "›_ claude".
+  if (projId) window._termPtyKilled = projId;
 
   if (_termWs && _termWs.readyState === 1) {
     _termWs.send('\x00kill-session');
@@ -3743,6 +4896,9 @@ async function openDetail(idx) {
   const myProjId = p.id;
   const overlay = document.getElementById('detail-overlay');
   overlay.classList.add('show');
+  // M215: full-card loading state until first batch of async fetches resolves.
+  const modal = document.getElementById('detail-modal');
+  if (modal) modal.classList.add('loading');
   document.getElementById('dm-title').textContent = p.name;
   const dirEl = document.getElementById('dm-proj-dir');
   if (dirEl) dirEl.textContent = p.repo_path || '';
@@ -3755,7 +4911,7 @@ async function openDetail(idx) {
   delete _msRenderFingerprint[p.id];
   renderHierarchy(p);
   document.getElementById('dm-right').innerHTML =
-    '<div style="padding:20px;color:var(--text-dim);font-family:var(--mono);font-size:12px">Loading…</div>';
+    '<div class="dm-loading-box"><span class="dm-spinner"></span><span>Loading…</span></div>';
   // M137: clear task board immediately so no stale project data persists
   const boardEl = document.getElementById('dm-task-board');
   if (boardEl) boardEl.innerHTML = '';
@@ -3770,6 +4926,9 @@ async function openDetail(idx) {
     fetch(`/api/northstar/${esc(p.id)}/doc`).then(r=>r.json()).catch(()=>({ok:false})),
   ]);
 
+  // M215: first batch resolved — drop the full-card loading overlay.
+  if (modal) modal.classList.remove('loading');
+
   // M137: abort if another project was opened while we were waiting
   if (_activeDetailProjId !== myProjId) return;
 
@@ -3778,6 +4937,8 @@ async function openDetail(idx) {
   // Render right column then load milestones
   renderRight(p, ctxData.topics || [], docData);
   loadTaskBoard(p.id);
+  // M168: poll task-board every 4s so live session work surfaces without manual refresh
+  startTaskBoardPoll(p.id);
   // M120: do NOT auto-open live session on card click — user must explicitly click the session row
 
   // Multi-NS: full left-panel pagination (arc + milestones per NS page)
@@ -3822,8 +4983,17 @@ function renderHierarchy(p) {
     <div class="dm-layer">
       <div class="dm-layer-head">
         <div class="dm-layer-icon ns" title="North Star metric">☆</div>
-        <span class="dm-layer-title">${esc(p.metric || 'North Star')}</span>
+        <!-- M165: metric is now editable inline -->
+        <span class="dm-layer-title" contenteditable="true" spellcheck="false"
+          data-field="metric" data-pid="${esc(p.id||p.name)}"
+          onblur="saveStarField(this)"
+          onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur()}"
+          title="Click to edit the North Star metric"
+          style="cursor:text;border-bottom:1px dashed transparent;transition:border-color .12s"
+          onfocus="this.style.borderBottomColor='var(--accent)'"
+          >${esc(p.metric || 'North Star')}</span>
       </div>
+      <!-- M172: manual current/target/unit pane removed — percentage auto-computed from milestone done/total via projectPct(). Metric (label) stays editable above. -->
       <!-- Compact summary bar: ◎ stones → ☆ % | deadline | count -->
       <div style="display:flex;align-items:center;gap:6px;padding:5px 8px;margin-top:4px;background:var(--panel-soft);border-radius:6px;font-family:var(--mono);font-size:11px;flex-wrap:wrap">
         <span style="color:var(--text-dim);opacity:.7">◎ →</span>
@@ -3844,6 +5014,8 @@ function renderHierarchy(p) {
       <div id="dm-ns-bars" style="margin-top:6px"></div>
       <!-- Spec doc slot — injected by renderRight, shown near NS section top -->
       <div id="dm-spec-slot" style="margin-top:6px"></div>
+      <!-- Session info slot — last Claude session id, populated by renderMilestoneCreator -->
+      <div id="dm-session-slot" style="margin-top:6px"></div>
       <!-- Task execution results (shown after Execute is clicked) -->
       <div id="dm-task-results" style="display:none;margin-top:8px;padding:8px 10px;border-radius:5px;background:var(--bg-deep);border:1px solid var(--panel-border)">
         <div style="font-size:9px;font-family:var(--mono);color:var(--text-dim);margin-bottom:5px;letter-spacing:.05em">EXECUTION LOG</div>
@@ -3861,11 +5033,9 @@ function renderHierarchy(p) {
         <span class="dm-layer-title">Milestones</span>
         <span class="dm-layer-count" id="dm-ms-ack-badge"></span>
       </div>
-      <div id="dm-ms-creator" style="font-size:12px;font-family:var(--mono);color:var(--text-dim)">Loading…</div>
+      <div id="dm-ms-creator" style="font-size:12px;font-family:var(--mono);color:var(--text-dim)"><div class="dm-loading-box"><span class="dm-spinner"></span><span>Loading milestones…</span></div></div>
     </div>
 
-    <!-- Note (moved from right pane) -->
-    ${p.note ? `<div id="dm-note-inline" style="margin-top:6px;padding:8px 10px;border-radius:5px;background:var(--bg-deep);border:1px solid var(--panel-border);font-size:11px;color:var(--text-dim);line-height:1.6">${esc(p.note)}</div>` : ''}
   `;
 }
 
@@ -3903,22 +5073,83 @@ let _tmuxWatchInterval = null;
 
 function showCommentPopup(event, comment, projId, mid, currentStatus) {
   document.getElementById('comment-popup')?.remove();
+  // M182: when user opens msg popup on a stone with NO prior comment AND
+  // empty conversation, auto-request Claude to post an initial comment.
+  // This is rate-limited client-side via a sessionStorage flag per mid to
+  // avoid spamming the queue if user re-opens the popup.
+  if (projId && mid && !comment && (_msConversations[mid] || []).length === 0) {
+    const flagKey = `m182-requested-${mid}`;
+    if (!sessionStorage.getItem(flagKey)) {
+      // 1st click on faded badge: vivid + fire request-comment
+      sessionStorage.setItem(flagKey, '1');
+      fetch(`/api/northstar/${encodeURIComponent(projId)}/milestones/${encodeURIComponent(mid)}/request-comment`, {
+        method: 'POST',
+      }).catch(() => {});
+      // M190 follow-up: turning badge ON reopens stone if it's in pending_confirmation or done
+      // M243: also auto-queue on first msg-badge click for a pending stone (new stone shortcut).
+      if (currentStatus === 'pending_confirmation' || currentStatus === 'done' || currentStatus === 'pending') {
+        fetch(`/api/northstar/${encodeURIComponent(projId)}/milestones/${encodeURIComponent(mid)}`, {
+          method: 'PATCH', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({status:'queued', done:false}),
+        }).then(() => {
+          // M240 parity: queuing should also fire /execute so the live session picks it up immediately.
+          fetch(`/api/northstar/${encodeURIComponent(projId)}/execute`, {method:'POST'}).catch(() => {});
+          loadMilestones(projId);
+        }).catch(() => {});
+      }
+    } else {
+      // M190 follow-up: 2nd click on vivid-but-empty badge → toggle back to faded
+      sessionStorage.removeItem(flagKey);
+    }
+    if (_msProjectId && typeof renderMilestoneCreator === 'function' && _msCacheByProject[_msProjectId]) {
+      // M241: sync any actively-edited .nt-text into the cache BEFORE re-render, otherwise
+      // the user's just-typed (unblurred) milestone text would disappear during the re-paint.
+      try {
+        const cache = _msCacheByProject[_msProjectId];
+        document.querySelectorAll('#dm-ms-creator .nt-text[contenteditable="true"]').forEach(div => {
+          const mid2 = div.dataset.msId;
+          if (!mid2) return;
+          const txt = (typeof _readNtText === 'function' ? _readNtText(div) : div.textContent) || '';
+          const m2 = cache.find(x => x.id === mid2);
+          if (m2 && txt && m2.text !== txt) m2.text = txt;
+        });
+      } catch (_) {}
+      delete _msRenderFingerprint[_msProjectId];
+      renderMilestoneCreator(_msProjectId, _msCacheByProject[_msProjectId]);
+    }
+    // M190 follow-up: no popup when there is no history — badge is the only affordance
+    return;
+  }
   const popup = document.createElement('div');
   popup.id = 'comment-popup';
   const isMob = window.innerWidth < 600;
+  // M153: reserve a gutter at the bottom so the modal never tucks under the Windows
+  // taskbar / mobile browser chrome. Use a generous 56px margin and clamp the modal
+  // strictly inside the viewport.
+  const BOTTOM_GUTTER = 56;
+  const TOP_GUTTER    = 12;
+  const availH = Math.max(120, window.innerHeight - BOTTOM_GUTTER - TOP_GUTTER);
+  const maxH   = Math.min(availH, isMob ? Math.round(window.innerHeight * 0.7) : 480);
   popup.style.cssText = `position:fixed;z-index:9999;background:var(--panel);border:1px solid var(--accent-soft);
     border-radius:8px;padding:10px 13px;box-shadow:0 6px 24px rgba(0,0,0,.25);
     font-family:var(--mono);font-size:11px;line-height:1.55;color:var(--text);
-    max-height:${isMob?'70vh':'65vh'};overflow-y:auto;
-    ${isMob ? 'left:8px;right:8px;bottom:60px;max-width:calc(100vw - 16px)' : 'max-width:340px;min-width:240px'}`;
+    max-height:${maxH}px;overflow-y:auto;
+    ${isMob ? `left:8px;right:8px;bottom:${BOTTOM_GUTTER}px;max-width:calc(100vw - 16px)` : 'max-width:340px;min-width:240px'}`;
   if (!isMob) {
     const x = Math.min(event.clientX, window.innerWidth - 360);
-    // M142: flip above click when there's not enough room below (scroll-at-bottom scenario)
-    const estH = Math.min(window.innerHeight * 0.65, 380);
-    const spaceBelow = window.innerHeight - (event.clientY + 8);
-    const y = spaceBelow >= estH
-      ? event.clientY + 8
-      : Math.max(8, event.clientY - estH - 8);
+    // M142+M153: estH matches actual max-height; place above click if it would clip the bottom gutter.
+    const estH = maxH;
+    const safeBottom = window.innerHeight - BOTTOM_GUTTER;
+    const spaceBelow = safeBottom - (event.clientY + 8);
+    let y;
+    if (spaceBelow >= estH) {
+      y = event.clientY + 8;
+    } else {
+      // Try above the click
+      y = Math.max(TOP_GUTTER, event.clientY - estH - 8);
+      // If even that overflows downward (small viewport), clamp to fit inside the safe area
+      if (y + estH > safeBottom) y = Math.max(TOP_GUTTER, safeBottom - estH);
+    }
     popup.style.left = x + 'px';
     popup.style.top = y + 'px';
   }
@@ -3948,21 +5179,40 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
     </div>`;
   }
 
-  popup.innerHTML = `<div style="font-size:9px;color:var(--accent);margin-bottom:6px;letter-spacing:.05em">CLAUDE COMMENT</div>
+  // M218: explicit close (×) button in top-right of comment popup.
+  popup.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+      <div style="font-size:9px;color:var(--accent);letter-spacing:.05em">CLAUDE COMMENT</div>
+      <button onclick="event.stopPropagation();document.getElementById('comment-popup')?.remove()"
+        title="Close"
+        style="background:none;border:1px solid var(--panel-border);border-radius:4px;color:var(--text-dim);
+          cursor:pointer;font-family:var(--mono);font-size:12px;line-height:1;padding:1px 7px">×</button>
+    </div>
     <div style="color:var(--text-soft)">${esc(comment)}</div>
     <div id="comment-thread-area">${buildThreadHtml()}</div>
     ${buildReplyInput()}`;
   document.body.appendChild(popup);
   setTimeout(() => popup.querySelector('#comment-reply-input')?.focus(), 50);
-  // M130: close on click OR touchstart outside (mobile tap doesn't always fire click)
-  setTimeout(() => {
-    function _hComment(e) {
-      if (!popup.contains(e.target)) {
-        popup.remove();
-        document.removeEventListener('click', _hComment);
-        document.removeEventListener('touchstart', _hComment);
-      }
+  // M263: restore click-outside auto-close (user wants swimlane click to dismiss the
+  // chat history popup). M255 sticky-popup intent was actually about OS notifications,
+  // which already persist via requireInteraction (M255 v1). ESC also dismisses.
+  const _escClose = (e) => {
+    if (e.key === 'Escape') {
+      popup.remove();
+      document.removeEventListener('keydown', _escClose);
+      document.removeEventListener('click', _hComment);
+      document.removeEventListener('touchstart', _hComment);
     }
+  };
+  document.addEventListener('keydown', _escClose);
+  function _hComment(e) {
+    if (!popup.contains(e.target)) {
+      popup.remove();
+      document.removeEventListener('click', _hComment);
+      document.removeEventListener('touchstart', _hComment);
+      document.removeEventListener('keydown', _escClose);
+    }
+  }
+  setTimeout(() => {
     document.addEventListener('click', _hComment);
     document.addEventListener('touchstart', _hComment, {passive: true});
   }, 100);
@@ -3995,31 +5245,73 @@ async function _doCommentReply(projId, mid, inputEl, currentStatus) {
   }
   // Clear input
   if (inputEl) inputEl.value = '';
-  // M119: auto-reopen pending_confirmation stone when user replies
-  const patchBody = {conversation: thread};
-  if (currentStatus === 'pending_confirmation') patchBody.status = 'queued';
+  // M210 follow-up (restored): if user replies on a pending_confirmation or done stone,
+  // auto-reopen to queued so claude re-engages. User explicit "Confirm" button is the
+  // path for ack — sending a textual reply implies more work is needed.
+  // M230: also flip needs_clarification → queued on user reply, since the reply
+  // IS the clarification answer (claude can now work on the stone).
+  const patchBody = {append_message: entry};
+  if (currentStatus === 'pending_confirmation' || currentStatus === 'done' || currentStatus === 'needs_clarification') {
+    patchBody.status = 'queued';
+  }
   // Persist to server and refresh milestone badge count
+  // M257: when the reply re-opens the stone to queued, also POST /execute so the
+  // live claude session picks the message up immediately (parity with M240/M243).
+  // Without this, the user typed→Send→queued path silently waited for the next
+  // Stop-hook fire, which felt like the message wasn't being dispatched.
+  const _willReopen = patchBody.status === 'queued';
   fetch(`/api/northstar/${encodeURIComponent(projId)}/milestones/${encodeURIComponent(mid)}`, {
     method: 'PATCH', headers: {'Content-Type':'application/json'},
     body: JSON.stringify(patchBody)
-  }).then(() => loadMilestones(projId)).catch(() => {});
+  }).then(() => {
+    if (_willReopen) {
+      fetch(`/api/northstar/${encodeURIComponent(projId)}/execute`, {method:'POST'}).catch(() => {});
+    }
+    loadMilestones(projId);
+  }).catch(() => {});
 }
 
 function showClarifyPopup(event, projId, mid, clarQ, clarA, hasAnswer) {
   document.getElementById('clarify-popup')?.remove();
   const popup = document.createElement('div');
   popup.id = 'clarify-popup';
+  // M177: scrollable popup so chat history fits like showCommentPopup
+  const isMob = window.innerWidth < 600;
+  const BOTTOM_GUTTER = 56;
+  const TOP_GUTTER = 12;
+  const availH = Math.max(160, window.innerHeight - BOTTOM_GUTTER - TOP_GUTTER);
+  const maxH = Math.min(availH, isMob ? Math.round(window.innerHeight * 0.7) : 420);
   popup.style.cssText = `position:fixed;z-index:9999;background:var(--panel);border:1px solid rgba(90,120,200,.4);
-    border-radius:8px;padding:12px 14px;max-width:300px;box-shadow:0 6px 24px rgba(0,0,0,.25);
-    font-family:var(--mono);font-size:11px;line-height:1.6`;
-  const x = Math.min(event.clientX, window.innerWidth - 320);
-  const y = Math.min(event.clientY + 8, window.innerHeight - 180);
+    border-radius:8px;padding:12px 14px;max-width:320px;box-shadow:0 6px 24px rgba(0,0,0,.25);
+    font-family:var(--mono);font-size:11px;line-height:1.6;
+    max-height:${maxH}px;overflow-y:auto`;
+  const x = Math.min(event.clientX, window.innerWidth - 340);
+  const safeBottom = window.innerHeight - BOTTOM_GUTTER;
+  const spaceBelow = safeBottom - (event.clientY + 8);
+  let y;
+  if (spaceBelow >= maxH) {
+    y = event.clientY + 8;
+  } else {
+    y = Math.max(TOP_GUTTER, event.clientY - maxH - 8);
+    if (y + maxH > safeBottom) y = Math.max(TOP_GUTTER, safeBottom - maxH);
+  }
   popup.style.left = x + 'px';
   popup.style.top = y + 'px';
+  // M177: render conversation thread (same as showCommentPopup)
+  const thread = _msConversations[mid] || [];
+  const threadHtml = thread.length
+    ? `<div id="clarify-thread" style="margin:8px 0;border-top:1px solid var(--panel-border);padding-top:8px">` +
+      thread.map(msg => `<div style="margin-bottom:6px">
+        <div style="font-size:9px;color:${msg.role==='user'?'var(--text-dim)':'var(--accent)'}">
+          ${msg.role==='user'?'you':'claude'} · ${(msg.ts||'').slice(11,16)}</div>
+        <div style="font-size:11px;color:var(--text);margin-top:1px">${esc(msg.text)}</div>
+      </div>`).join('') + `</div>`
+    : '';
   popup.innerHTML = `
     <div style="font-size:9px;color:var(--text-dim);margin-bottom:8px;letter-spacing:.05em">WHY CLAUDE FLAGGED THIS</div>
     <div style="color:#7b9fd4;margin-bottom:10px;line-height:1.5">❓ ${clarQ}</div>
-    <div style="display:flex;gap:6px">
+    ${threadHtml}
+    <div style="display:flex;gap:6px;margin-top:${thread.length ? '8px' : '0'}">
       <input id="clarify-popup-input" type="text" value="${clarA}"
         placeholder="Your answer…"
         style="flex:1;font-size:11px;font-family:var(--mono);padding:4px 8px;border-radius:4px;
@@ -4068,7 +5360,7 @@ async function killExecSession() {
   }).catch(()=>{});
   await new Promise(r => setTimeout(r, 2000));
   await fetch(`/api/northstar/${encodeURIComponent(projId)}/exec-session`, {method:'DELETE'}).catch(()=>{});
-  if (output) { output.style.color = 'var(--green,#4caf50)'; output.style.fontWeight = '700'; output.style.textAlign = 'center'; output.style.fontSize = '13px'; output.style.letterSpacing = '.12em'; output.textContent = 'SAVED'; setTimeout(() => { if (output) { output.style.color = ''; output.style.fontWeight = ''; output.style.textAlign = ''; output.style.fontSize = ''; output.style.letterSpacing = ''; output.textContent = '(session ended)'; } }, 2000); }
+  if (output) { output.style.color = 'var(--green,#4caf50)'; output.style.fontWeight = '700'; output.style.textAlign = 'center'; output.style.fontSize = '13px'; output.style.letterSpacing = '.12em'; output.textContent = 'SAVED'; setTimeout(() => { if (output) { output.style.color = ''; output.style.fontWeight = ''; output.style.textAlign = ''; output.style.fontSize = '10px'; output.style.letterSpacing = ''; output.textContent = '(session ended)'; } }, 2000); }
   // M89: do NOT flip button directly — let _refreshExecState drive that after poll confirms gone
   // Burst-poll after kill: 500ms, 1.5s, 3s, then settle to normal 5s interval
   window._execLaunchBtn = null;
@@ -4087,6 +5379,15 @@ function startTmuxWatch(projId) {
   if (overlay) overlay.style.display = 'block';
   const liveBackdrop = document.getElementById('tmux-live-backdrop');
   if (liveBackdrop) liveBackdrop.style.display = 'block';
+  // M176/M179: reset to base inline styles after killExecSession's STOPPING/SAVED display.
+  // Note: the HTML declares style="font-size:10px" inline, so setting fontSize='' clears
+  // that and falls back to inherited 14px → text appears LARGER on every viewport.
+  // Restore fontSize='10px' explicitly to match the original markup.
+  output.style.color = '';
+  output.style.fontWeight = '';
+  output.style.textAlign = '';
+  output.style.fontSize = '10px';
+  output.style.letterSpacing = '';
   output.textContent = 'Connecting to session…';
   if (_tmuxWatchInterval) clearInterval(_tmuxWatchInterval);
   const poll = async () => {
@@ -4127,6 +5428,28 @@ function stopTmuxWatch() {
 }
 
 let _taskBoardProjId = null;
+let _taskBoardPollTimer = null;
+
+// M168: keep the task board synced with the live tmux session by polling
+// /task-board every 4s while a detail modal is open. The endpoint parses
+// the pane for the truly-running milestone (◼ M\d+ / "Working on M\d+"), so
+// the UI reflects live work without the user needing to hit the refresh button.
+function startTaskBoardPoll(projId) {
+  if (_taskBoardPollTimer) clearInterval(_taskBoardPollTimer);
+  _taskBoardPollTimer = setInterval(() => {
+    // Stop if the detail modal has closed under us
+    if (!document.querySelector('.detail-overlay.show')) {
+      clearInterval(_taskBoardPollTimer);
+      _taskBoardPollTimer = null;
+      return;
+    }
+    loadTaskBoard(projId);
+  }, 4000);
+}
+function stopTaskBoardPoll() {
+  if (_taskBoardPollTimer) { clearInterval(_taskBoardPollTimer); _taskBoardPollTimer = null; }
+}
+
 async function loadTaskBoard(projId) {
   const board = document.getElementById('dm-task-board');
   if (!board) return;
@@ -4145,8 +5468,9 @@ async function loadTaskBoard(projId) {
         return b.task_id > a.task_id ? 1 : -1;
       });
     if (!jobs.length) { board.innerHTML = ''; return; }
-    // M129/user: when session is idle, "running" tasks are actually paused (session stopped mid-task)
-    const sessIdle = !_sessionStatus[projId] || _sessionStatus[projId] === 'exec-idle' || _sessionStatus[projId] === 'none' || _sessionStatus[projId] === 'dead';
+    // M129/user: when exec session is idle (or absent), "running" tasks are actually paused.
+    // M178: read _execStatus only — PTY state is irrelevant to whether autonomous tasks run.
+    const sessIdle = _execStatus[projId] !== 'running';
     const statusColor = {queued:'var(--text-dim)',running:'var(--accent)',paused:'var(--text-dim)',done:'var(--green)',failed:'var(--red)'}
     // M143: show "N live · M queued" instead of a single count that mirrors queued-stone count
     const runningCount = jobs.filter(j => j.status === 'running').length;
@@ -4199,9 +5523,91 @@ function renderRight(p, topics, docData) {
       : `<button class="dm-btn" style="opacity:.35;pointer-events:none;font-size:10px">no spec</button>`;
     const execBtn = `<button class="dm-btn" id="dm-exec-btn"
       style="background:var(--green-soft);border-color:var(--green);color:var(--green);font-weight:500"
-      onclick="executeProject('${esc(p.id)}',this)" title="Execute: init milestones or process queued work">▶ Execute</button>`;
-    specSlot.innerHTML = `<div style="display:flex;gap:6px;flex-wrap:wrap">${execBtn}${specBtn}</div>
-      <div id="dm-exec-sessions" style="margin-top:5px"></div>`;
+      onclick="executeProject('${esc(p.id)}',this)" title="Dispatch all queued stones at once (or init milestones for empty projects)">→ dispatch-all</button>`;
+    // M214: per-project model selector. Stored in north-star.md frontmatter `model` field;
+    // server splices `--model <value>` into PTY/tmux Claude spawns. Empty = CLI default.
+    const curModel = (p.model || '').trim();
+    const modelOpts = [
+      ['',                            '(default)'],
+      ['haiku',                       'haiku'],
+      ['sonnet',                      'sonnet'],
+      ['opus',                        'opus'],
+      ['claude-haiku-4-5-20251001',   'haiku 4.5'],
+      ['claude-sonnet-4-6',           'sonnet 4.6'],
+      ['claude-opus-4-7',             'opus 4.7'],
+      // OSK route: LiteLLM proxy on 127.0.0.1:4100 maps Anthropic API → OpenAI.
+      // Server detects this value and splices ANTHROPIC_BASE_URL/KEY env vars at spawn.
+      ['gpt-5.4-2026-03-05',          'gpt-5.4 (osk)'],
+      // MiniMax via LiteLLM proxy
+      ['MiniMax-M2.5',                'MiniMax M2.5'],
+      ['MiniMax-M2.7',                'MiniMax M2.7'],
+    ].map(([v,lbl]) => `<option value="${esc(v)}"${v===curModel?' selected':''}
+        style="background:var(--bg-deep);color:var(--text)">${esc(lbl)}</option>`).join('');
+    const modelSel = `<label class="dm-model-pick"
+        title="Model used when this project's PTY/tmux Claude session is spawned. Takes effect on next spawn — restart any live session."
+        style="display:inline-flex;align-items:center;gap:4px;font-family:var(--mono);font-size:10px;color:var(--text-dim);border:1px solid var(--panel-border);border-radius:4px;padding:2px 6px;background:var(--bg-deep)">
+        <span style="opacity:.7">model</span>
+        <select id="dm-model-select" onchange="setProjectModel('${esc(p.id)}',this.value,this)"
+          style="background:var(--bg-deep);border:none;color:var(--text);font-family:var(--mono);font-size:10px;outline:none;cursor:pointer;color-scheme:dark">${modelOpts}</select>
+        <span id="dm-model-status" style="font-size:9px;color:var(--text-dim)" aria-live="polite"></span>
+      </label>`;
+    // M233: spec doc button moves to detail-modal header; model selector moves into the session pane.
+    // M235: model selector slot starts hidden — _refreshExecState decides where to render it
+    //       (inline per-row when sessions exist, body slot when no sessions). Removes the flash.
+    const specHeaderSlot = document.getElementById('dm-spec-header-slot');
+    if (specHeaderSlot) specHeaderSlot.innerHTML = specBtn;
+    specSlot.innerHTML = `<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">${execBtn}</div>
+      <div id="dm-exec-sessions" style="margin-top:5px"></div>
+      <div id="dm-model-slot" style="margin-top:6px;display:none">${modelSel}</div>`;
+    // M214 follow-up: probe OSK proxy and disable gpt-* options when down,
+    // so users don't silently pick a broken model. Also surface upstream
+    // errors (quota/rate-limit/auth/5xx) as a banner so users learn WHY a
+    // gpt session stopped responding instead of guessing.
+    const _applyOskHealth = (d) => {
+      const sel = document.getElementById('dm-model-select');
+      const status = document.getElementById('dm-model-status');
+      const slot = document.getElementById('dm-model-slot') || document.getElementById('dm-spec-slot');
+      if (!sel) return;
+      const oskOpts = sel.querySelectorAll('option[value^="gpt-"]');
+      if (d.ok) {
+        oskOpts.forEach(o => { o.disabled = false; o.textContent = o.textContent.replace(/^⚠ /,''); });
+        if (status && status.textContent.startsWith('⚠ proxy')) status.textContent = '';
+      } else {
+        oskOpts.forEach(o => { o.disabled = true; if (!o.textContent.startsWith('⚠')) o.textContent = '⚠ ' + o.textContent + ' — proxy down'; });
+        if (sel.value && sel.value.startsWith('gpt-')) {
+          if (status) { status.textContent = '⚠ proxy 4100 down'; status.style.color = 'var(--red,#c54)'; }
+        }
+      }
+      // Banner: upstream errors (only show when this project is on a gpt-* model)
+      const banner = document.getElementById('dm-osk-error-banner');
+      const showBanner = sel.value.startsWith('gpt-') && Array.isArray(d.recent_errors) && d.recent_errors.length > 0;
+      if (showBanner) {
+        const top = d.recent_errors[0];
+        const html = `<div id="dm-osk-error-banner" role="alert"
+            style="margin-top:6px;padding:6px 10px;border-radius:4px;
+              background:rgba(192,57,43,.12);border:1px solid rgba(192,57,43,.45);
+              color:var(--red,#c54);font-family:var(--mono);font-size:10px;line-height:1.4">
+            <div style="font-weight:600;letter-spacing:.04em">⚠ GPT NOT REPLYING — ${esc(top.label)}</div>
+            <div style="margin-top:3px;color:var(--text-soft);opacity:.85;font-size:9px;
+                       white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+                 title="${esc(top.excerpt)}">${esc(top.excerpt.slice(0,140))}</div>
+            ${d.recent_errors.length>1 ? `<div style="margin-top:2px;font-size:9px;opacity:.7">+${d.recent_errors.length-1} other error class(es) in last 10 min</div>` : ''}
+          </div>`;
+        if (banner) banner.outerHTML = html;
+        else if (slot) slot.insertAdjacentHTML('beforeend', html);
+      } else if (banner) {
+        banner.remove();
+      }
+    };
+    fetch('/api/osk/health').then(r=>r.json()).then(_applyOskHealth).catch(()=>{});
+    // Re-poll every 30s so a gpt session that DIES mid-execution still surfaces.
+    // Cleared on closeDetail or when this project's card is replaced.
+    clearInterval(window._oskHealthPoll);
+    window._oskHealthPoll = setInterval(() => {
+      const sel = document.getElementById('dm-model-select');
+      if (!sel || !sel.value.startsWith('gpt-')) return;  // only poll when on gpt
+      fetch('/api/osk/health').then(r=>r.json()).then(_applyOskHealth).catch(()=>{});
+    }, 30000);
     // M60+: restore exec button state + show running exec sessions list
     const _refreshExecState = () => {
       fetch('/api/exec-sessions').then(r=>r.json()).then(d=>{
@@ -4216,7 +5622,7 @@ function renderRight(p, topics, docData) {
           b.style.color = isIdle ? 'var(--text-dim)' : '';
           b.title = `Session ${isIdle ? 'idle' : 'live'} since ${(running[0].created||'').slice(11,16)||'?'}`;
         } else if (b) {
-          b.textContent = '▶ Execute';
+          b.textContent = '→ dispatch-all';
           b.style.color = '';
           b.style.borderColor = '';
           b.style.background = '';
@@ -4229,9 +5635,9 @@ function renderRight(p, topics, docData) {
             const newKey = running.map(s=>`${s.session||s.proj_id}:${s.idle?'i':'r'}`).join(',');
             if (info.dataset.sessionKey === newKey) return;
             info.dataset.sessionKey = newKey;
-            // M131: update swimlane card badge immediately when idle state changes
+            // M131/M178: update swimlane card badge — exec state only
             for (const s of running) {
-              _sessionStatus[s.proj_id] = s.idle ? 'exec-idle' : 'exec-running';
+              _execStatus[s.proj_id] = s.idle ? 'idle' : 'running';
             }
             render();
             // Also refresh task board so running→paused transition shows correctly
@@ -4242,6 +5648,9 @@ function renderRight(p, topics, docData) {
               if (overlay && overlay.style.display !== 'none') stopTmuxWatch();
               else startTmuxWatch(pid);
             };
+            // M233: move the model selector inside the session pane (mapped to the live session id).
+            const _modelSlot = document.getElementById('dm-model-slot');
+            const _modelSelEl = _modelSlot?.querySelector('.dm-model-pick');
             info.innerHTML = `<div style="margin-top:6px;border-radius:7px;overflow:hidden;border:1px solid rgba(61,139,94,.22)">` + running.map((s,i) => {
               const sIdle = s.idle;
               const dotColor = sIdle ? 'var(--text-dim)' : 'var(--green)';
@@ -4250,19 +5659,48 @@ function renderRight(p, topics, docData) {
               const labelColor = sIdle ? 'var(--text-dim)' : 'var(--green)';
               const labelBg = sIdle ? 'rgba(0,0,0,.04)' : 'rgba(61,139,94,.12)';
               const labelText = sIdle ? 'idle' : 'live ▸';
+              const sm = s.spawn_mode || '';
+              const sfrom = s.spawn_from || '';
+              const spawnBadge = sm === 'resume'
+                ? `<span style="font-family:var(--mono);font-size:8px;color:var(--green);background:rgba(61,139,94,.10);border:1px solid rgba(61,139,94,.30);border-radius:3px;padding:1px 4px;letter-spacing:.03em" title="Spawned with --resume ${esc(sfrom)} — this live session is continuing the prior stone work.">↻ resumed${sfrom?` ${esc(sfrom.slice(0,8))}`:''}</span>`
+                : sm === 'continue'
+                ? `<span style="font-family:var(--mono);font-size:8px;color:var(--text-dim);background:rgba(0,0,0,.04);border:1px solid var(--panel-border);border-radius:3px;padding:1px 4px;letter-spacing:.03em" title="Spawned with --continue (no specific session id) — Claude picked the most recent jsonl in this cwd.">↻ continue</span>`
+                : sm === 'fresh'
+                ? `<span style="font-family:var(--mono);font-size:8px;color:var(--yellow,#d4a574);background:rgba(212,165,116,.10);border:1px solid rgba(212,165,116,.30);border-radius:3px;padding:1px 4px;letter-spacing:.03em" title="Spawned with no resume flag — fresh session, prior stone work NOT continued.">✦ fresh</span>`
+                : `<span style="font-family:var(--mono);font-size:8px;color:var(--text-dim);opacity:.45" title="Spawn info unavailable (session predates the tracking, or hub was restarted after spawn).">— unknown</span>`;
+              // M233 v2: model selector lives INSIDE each session row (per-session mapping).
+              const _rowModelOpts = [
+                ['',                            '(default)'],
+                ['haiku',                       'haiku'],
+                ['sonnet',                      'sonnet'],
+                ['opus',                        'opus'],
+                ['claude-haiku-4-5-20251001',   'haiku 4.5'],
+                ['claude-sonnet-4-6',           'sonnet 4.6'],
+                ['claude-opus-4-7',             'opus 4.7'],
+                ['gpt-5.4-2026-03-05',          'gpt-5.4 (osk)'],
+              ].map(([v,lbl]) => `<option value="${esc(v)}"${v===(p.model||'').trim()?' selected':''}>${esc(lbl)}</option>`).join('');
+              const _rowModelSel = `<select class="dm-model-select" title="Model for next spawn of this project (shared across sessions)"
+                onchange="event.stopPropagation();setProjectModel('${esc(p.id)}',this.value,this)"
+                onclick="event.stopPropagation()"
+                style="background:var(--bg-deep);border:1px solid var(--panel-border);border-radius:4px;color:var(--text);font-family:var(--mono);font-size:9px;outline:none;cursor:pointer;padding:1px 4px">${_rowModelOpts}</select>`;
               return `<div style="display:flex;align-items:center;gap:8px;padding:6px 10px;background:${rowBg};${i<running.length-1?`border-bottom:1px solid ${borderColor}`:''};cursor:pointer"
                 title="Click to open/close terminal"
                 onclick="_toggleTmux('${esc(p.id)}')">
                 <span style="width:8px;height:8px;border-radius:50%;background:${dotColor};flex-shrink:0;${sIdle?'':'box-shadow:0 0 6px rgba(61,139,94,.5);animation:sess-pulse 1.5s ease-in-out infinite'}"></span>
                 <div style="flex:1;min-width:0">
                   <div style="font-family:var(--mono);font-size:10px;color:${labelColor};overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.session||s.proj_id)}</div>
-                  <div style="font-family:var(--mono);font-size:8px;color:var(--text-dim);margin-top:1px;letter-spacing:.03em">started ${(s.created||'').slice(11,16)}</div>
+                  <div style="font-family:var(--mono);font-size:8px;color:var(--text-dim);margin-top:1px;letter-spacing:.03em;display:flex;align-items:center;gap:6px">started ${(s.created||'').slice(11,16)} ${spawnBadge}</div>
                 </div>
+                ${_rowModelSel}
                 <span style="font-family:var(--mono);font-size:8px;color:${labelColor};background:${labelBg};border-radius:4px;padding:1px 5px;letter-spacing:.04em;text-transform:uppercase">${labelText}</span>
               </div>`;
             }).join('') + `</div>`;
+            // M233 v2: per-row selectors carry the model now; hide the placeholder slot when sessions exist.
+            if (_modelSlot) _modelSlot.style.display = 'none';
           } else {
             info.innerHTML = '';
+            // No active session — surface the model selector in its placeholder slot
+            if (_modelSlot) _modelSlot.style.display = '';
           }
         }
       }).catch(()=>{});
@@ -4618,14 +6056,79 @@ document.getElementById('doc-overlay').addEventListener('click', e => {
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
+// M267: centralized SSE push channel. Subscribe to /api/notifications/stream and
+// render incoming user-originated events as a sticky in-page toast. Claude-originated
+// events are filtered server-side, so anything that arrives is something the user
+// actually wants to see.
+(function _nsPushInit() {
+  // Container for the toast stack.
+  let _toastBox = document.getElementById('ns-push-toasts');
+  if (!_toastBox) {
+    _toastBox = document.createElement('div');
+    _toastBox.id = 'ns-push-toasts';
+    // M267 v2: moved to top-left per user request; sticky until × clicked.
+    _toastBox.style.cssText = 'position:fixed;top:64px;left:14px;z-index:10001;display:flex;flex-direction:column;gap:8px;max-width:340px;pointer-events:none';
+    document.body.appendChild(_toastBox);
+  }
+  // Cross-tab dedup so multiple open tabs only render one toast per event.
+  let _bc = null;
+  try { _bc = new BroadcastChannel('ns-push'); } catch(_) {}
+  const _seen = new Set();
+  function _renderToast(ev) {
+    const dedupKey = `${ev.event}|${ev.proj_id||''}|${ev.mid||''}|${ev.ts||''}`;
+    if (_seen.has(dedupKey)) return;
+    _seen.add(dedupKey);
+    if (_bc) { try { _bc.postMessage(dedupKey); } catch(_) {} }
+    const card = document.createElement('div');
+    card.style.cssText = 'pointer-events:auto;background:var(--panel);border:1px solid var(--accent);border-radius:8px;padding:10px 12px;box-shadow:0 6px 24px rgba(0,0,0,.25);font-family:var(--mono);font-size:11px;color:var(--text);max-width:320px';
+    const title = ev.event === 'stone_created' ? '✦ New stone' : ev.event === 'user_commented' ? '✦ Comment' : '✦ ' + ev.event;
+    card.innerHTML =
+      `<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:4px">
+         <span style="color:var(--accent);font-weight:600;letter-spacing:.04em">${title}</span>
+         <button title="Dismiss" style="background:none;border:1px solid var(--panel-border);border-radius:4px;color:var(--text-dim);cursor:pointer;font-family:var(--mono);font-size:11px;line-height:1;padding:1px 7px">×</button>
+       </div>
+       <div style="font-size:10px;color:var(--text-dim);margin-bottom:3px">${ev.proj_id||''} ${ev.mid?'· '+ev.mid:''}</div>
+       <div style="color:var(--text);line-height:1.45">${(ev.text||'').replace(/[<>&]/g, c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}</div>`;
+    card.querySelector('button').onclick = () => card.remove();
+    _toastBox.appendChild(card);
+    // Sticky — no auto-dismiss. User must click ×.
+  }
+  if (_bc) { _bc.onmessage = e => _seen.add(e.data); }
+  // Open the SSE connection; reconnect with backoff on close.
+  let _backoff = 1000;
+  function _connect() {
+    const es = new EventSource('/api/notifications/stream');
+    es.onopen = () => { _backoff = 1000; };
+    es.addEventListener('hello', () => {});
+    es.addEventListener('stone_created', e => { try { _renderToast(JSON.parse(e.data)); } catch(_){} });
+    es.addEventListener('user_commented', e => { try { _renderToast(JSON.parse(e.data)); } catch(_){} });
+    es.onerror = () => {
+      es.close();
+      setTimeout(_connect, _backoff);
+      _backoff = Math.min(_backoff * 2, 30000);
+    };
+  }
+  _connect();
+})();
+
 loadData();
 // Reactive-only: no auto-refresh polling. ↻ refresh button for manual reload.
-// Session status (PTY + exec sessions) updates every 10s.
+// Session status (PTY + exec sessions) updates every 3s.
+// M155: lowered from 10s → 3s so the >claude button reflects realtime PTY
+// state on the *other* devices (the local tab is updated optimistically via
+// ws.onopen/onclose — see openTerminal). Polling is a cheap GET — two endpoints
+// per project, no DB hit — fine at 3s.
 setInterval(async () => {
   await refreshSessionStatus();
-  const overlay = document.getElementById('detail-overlay');
-  if (!overlay || !overlay.classList.contains('show')) render();
-}, 10000); // exec session sync every 10s
+  // M178: always render — swimlane button/badge must reflect realtime state
+  // even when the detail overlay is open. Render is cheap (~10 dom updates).
+  // M256: but skip render() while user is renaming an ns-node-name (or typing in any
+  // contenteditable inside the swimlane) — the re-render destroys the focused span
+  // before onblur saves, so typed characters get lost.
+  const _ae = document.activeElement;
+  const _editingCard = _ae && _ae.classList && _ae.classList.contains('ns-node-name') && _ae.isContentEditable;
+  if (!_editingCard) render();
+}, 3000);
 
 // Auto-refresh: swimlane every 30s, detail card every 15s
 // Paused while any input/textarea is focused (user is typing)
