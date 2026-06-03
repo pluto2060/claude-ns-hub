@@ -3662,7 +3662,8 @@ function _patchCacheMs(projId, updatedMs) {
 
 function _nodeTouchDrag() {
   const DRAG_THRESHOLD = 8; // px movement before drag activates
-  document.querySelectorAll('.ns-node').forEach(node => {
+  document.querySelectorAll('.ns-node:not([data-touch-bound])').forEach(node => {
+    node.dataset.touchBound = '1';
     let _touchStartX = 0, _touchStartY = 0, _dragActive = false;
 
     node.addEventListener('touchstart', e => {
@@ -6643,7 +6644,8 @@ function render() {
   // Click → open detail (or finish connect if in connect mode)
   // Only re-attach handlers when DOM was actually rebuilt — prevents handler accumulation
   // on every 3s render() tick (which caused exponential slowdown: 200+ handlers/card after 10min)
-  if (_lanesRebuilt) document.querySelectorAll('.ns-node').forEach(node => {
+  if (_lanesRebuilt) document.querySelectorAll('.ns-node:not([data-click-bound])').forEach(node => {
+    node.dataset.clickBound = '1';
     node.addEventListener('click', async e => {
       const name = node.querySelector('.ns-node-name');
       if (name && name.getAttribute('contenteditable') === 'true') return;
@@ -6707,7 +6709,8 @@ function render() {
   if (!window._pendingLayoutByPid) window._pendingLayoutByPid = {};
   // M852 column-mates: list of indices of other cards in same column as current drag source
   let _dragColumnMates = [];
-  if (_lanesRebuilt) document.querySelectorAll('.ns-node').forEach(node => {
+  if (_lanesRebuilt) document.querySelectorAll('.ns-node:not([data-drag-bound])').forEach(node => {
+    node.dataset.dragBound = '1';
     node.addEventListener('dragstart', e => {
       _dragSrc = node; _dragIdx = +node.dataset.idx;
       const rect = node.getBoundingClientRect();
