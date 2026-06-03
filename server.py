@@ -9255,28 +9255,16 @@ def _hub_init(proj_id=None, proj_dir=None):
     print(f"  Project : {pid}")
 
 
-_HUB_HOOKS = ["_ns_utils.py", "northstar-stop-inject.py", "northstar-execute-inject.py", "northstar-session-start.py"]
+_HUB_HOOKS_DIR = Path(__file__).parent / "static" / "hooks"
 _HUB_SETTINGS_HOOKS = {
-    "Stop": [{"type": "command", "command": "python3 $HOME/.claude/hooks/northstar-stop-inject.py"}],
-    "UserPromptSubmit": [{"type": "command", "command": "python3 $HOME/.claude/hooks/northstar-execute-inject.py"}],
-    "SessionStart": [{"type": "command", "command": "python3 $HOME/.claude/hooks/northstar-session-start.py", "timeout": 5}],
+    "Stop": [{"type": "command", "command": "python3 $HOME/.hub/static/hooks/northstar-stop-inject.py"}],
+    "UserPromptSubmit": [{"type": "command", "command": "python3 $HOME/.hub/static/hooks/northstar-execute-inject.py"}],
+    "SessionStart": [{"type": "command", "command": "python3 $HOME/.hub/static/hooks/northstar-session-start.py", "timeout": 5}],
 }
 
 def _hub_deploy_hooks():
-    """M842.4: Copy northstar hook scripts to ~/.claude/hooks/ and register in settings.json."""
-    import shutil, stat
-    hooks_src = Path(__file__).parent / "static" / "hooks"
-    if not hooks_src.exists():
-        return  # hooks not bundled (dev env)
-    hooks_dst = Path.home() / ".claude" / "hooks"
-    hooks_dst.mkdir(parents=True, exist_ok=True)
-    for fname in _HUB_HOOKS:
-        src = hooks_src / fname
-        dst = hooks_dst / fname
-        if src.exists() and not dst.exists():
-            shutil.copy2(src, dst)
-            dst.chmod(dst.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-            print(f"Deployed hook: {dst}")
+    """M842.4: Register hub hook scripts in ~/.claude/settings.json.
+    Points directly to .hub/static/hooks/ — no file copy needed."""
     # Register in settings.json if not already present
     settings_path = Path.home() / ".claude" / "settings.json"
     try:
