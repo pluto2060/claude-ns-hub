@@ -8598,9 +8598,11 @@ function _mmNodeClick(mid, projId, evt) {
 // M204 (restored): sub-stars pane below the star/sentence area
 // M636: fast grouping re-apply — skips full milestone re-render when only substars changed
 // M992: blink window changed — invalidate fingerprint so blink re-check runs even when milestones unchanged
+// M1058 fix: also clear _msRenderFingerprint so 2nd+ changes force full section rebuild
 function _blinkWindowChanged(projId) {
   if (!projId) return;
   delete _groupingFingerprint[projId];
+  delete _msRenderFingerprint[projId];
   _fastReapplyGrouping(projId);
 }
 
