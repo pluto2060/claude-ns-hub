@@ -2672,10 +2672,11 @@ function renderMilestoneCreator(projId, milestones) {
     .nt-text.drag-over { background:var(--accent-soft); border-radius:3px; outline:1px dashed var(--accent); }
     /* M196: paste-as-chip — long pasted content collapses into a Claude-Code-style chip
        inside the .nt-text contenteditable. data-full holds the original text. */
-    .nt-paste-chip { display:inline-block; padding:1px 7px; margin:0 2px; border:1px solid var(--panel-border);
-      border-radius:10px; background:var(--bg-deep); font-family:var(--mono); font-size:10px;
-      color:var(--text-dim); cursor:pointer; user-select:none; vertical-align:middle; line-height:1.4; }
-    .nt-paste-chip:hover { background:var(--panel-soft); color:var(--text); border-color:var(--accent-soft); }
+    .nt-paste-chip { display:inline-flex; align-items:center; gap:4px; padding:2px 6px; margin:0 2px;
+      border:1px solid var(--accent); border-radius:3px; background:var(--accent-soft);
+      font-family:var(--mono); font-size:9px; color:var(--accent);
+      cursor:pointer; user-select:none; vertical-align:middle; line-height:1.4; } /* M1056: match chatbox chip */
+    .nt-paste-chip:hover { background:var(--accent-soft); opacity:.8; }
     /* M840: uploading state for chips */
     .nt-paste-chip.uploading { opacity:.7; cursor:wait; }
     .nt-paste-chip.uploading::after {
