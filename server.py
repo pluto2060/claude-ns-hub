@@ -5810,6 +5810,16 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, md: Path,
                 m["status"] = "pending_confirmation"
                 m["done"] = False
                 m["pending_confirm_at"] = now_iso  # always update for _isLastTurn green border
+                # M1047: evidence_url validation — warn when visual work has no proof attached
+                _ev_url = data.get("evidence_url") or m.get("evidence_url") or ""
+                _stone_txt = (m.get("text") or "").lower()
+                _visual_keywords = ("화면", "ui", "스크린샷", "검수", "screenshot", "visual", "proof", "chart", "table", "증거", "증빙")
+                _is_visual = any(kw in _stone_txt for kw in _visual_keywords)
+                if _is_visual and not _ev_url:
+                    # Flag missing proof — does not block the PATCH
+                    m.setdefault("_proof_warning", "evidence_url missing — proof badge will not be generated; add screenshot/link via PATCH evidence_url")
+                    _server_log_action(proj_id, mid, "warn:evidence_url_missing",
+                                       "pending_confirmation on visual stone without evidence_url — proof badge skipped")
                 if "claude_ack" not in data:
                     m["claude_ack"] = now_iso
                 # M549.1: guard — if conversation has no recent claude message, auto-append fallback.
@@ -6132,7 +6142,11 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, md: Path,
     if new_status:
         _server_log_action(proj_id, mid, f"status→{new_status}", f"prev:{updated_m.get('status','?') if updated_m else '?'}")
     # M515: return updated milestone so client can do cache-only re-render (skips 234KB full fetch)
-    return JSONResponse({"ok": True, "milestone": updated_m})
+    # M1047: include proof_warning in response if evidence_url missing on visual stone
+    _resp: dict = {"ok": True, "milestone": updated_m}
+    if updated_m and updated_m.get("_proof_warning"):
+        _resp["proof_warning"] = updated_m.pop("_proof_warning")
+    return JSONResponse(_resp)
 
 
 @app.delete("/api/northstar/{proj_id}/milestones/{mid}")
