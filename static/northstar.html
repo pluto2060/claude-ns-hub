@@ -3913,11 +3913,11 @@ function _nodeTouchDrag() {
       const t = e.changedTouches[0];
       if (!wasDrag) {
         // Short tap — clear state, let browser's native click fire on the tapped element
-        _nodeTouchSrc = null; _nodeTouchIdx = null;
+        _nodeTouchSrc = null; _nodeTouchIdx = null; _nodeTouchSrcLane = null; // M1035 fix③
         return;
       }
       const pSrc = projects[_nodeTouchIdx];
-      if (!pSrc) { _nodeTouchSrc = null; _nodeTouchIdx = null; return; }
+      if (!pSrc) { _nodeTouchSrc = null; _nodeTouchIdx = null; _nodeTouchSrcLane = null; return; } // M1035 fix③
       // M925/M923: detect target lane dynamically (all lanes, not hardcoded 3)
       let targetLayer = parseInt(pSrc.layer)||0;
       { let l = 0; while (document.getElementById(`lane-nodes-${l}`)) {
@@ -3928,28 +3928,31 @@ function _nodeTouchDrag() {
         }
       }
       const laneEl = document.getElementById(`lane-nodes-${targetLayer}`);
-      if (!laneEl) { _nodeTouchSrc = null; _nodeTouchIdx = null; return; }
+      if (!laneEl) { _nodeTouchSrc = null; _nodeTouchIdx = null; _nodeTouchSrcLane = null; return; } // M1035 fix③
       // M989: swap with target card (or move to empty lane)
       const _touchTgt = window._touchSwapTarget;
       window._touchSwapTarget = null;
       // M1034: block cross-lane touch drag — same guard as desktop _dragSrcLane
       if (targetLayer !== _nodeTouchSrcLane) {
-        _nodeTouchSrc = null; _nodeTouchIdx = null;
+        _nodeTouchSrc = null; _nodeTouchIdx = null; _nodeTouchSrcLane = null; // M1035 fix③
         render(); return;
       }
       if (_touchTgt != null && _touchTgt !== _nodeTouchIdx) {
         _swapDropOrder(_nodeTouchIdx, _touchTgt, targetLayer);
-      } else if (_touchTgt == null) {
-        // Dropped on empty space in same lane — reorder only, no lane change
-        const _tp = projects[_nodeTouchIdx];
-        if (_tp) {
-          render();
-          requestAnimationFrame(() => { if (typeof drawParentLines === 'function') drawParentLines(); });
-        }
       }
-      _nodeTouchSrc = null; _nodeTouchIdx = null;
+      // M1035 fix②: removed redundant inner render() from _touchTgt==null branch
+      _nodeTouchSrc = null; _nodeTouchIdx = null; _nodeTouchSrcLane = null; // M1035 fix③
       render();
       requestAnimationFrame(() => drawParentLines());
+    });
+    // M1035 fix①: touchcancel — mirrors _msTouchCleanup pattern; prevents ghost+opacity+state leak on incoming call/scroll override
+    node.addEventListener('touchcancel', () => {
+      node.style.opacity = '';
+      if (_nodeTouchGhost) { _nodeTouchGhost.remove(); _nodeTouchGhost = null; }
+      document.querySelectorAll('.ns-lane-nodes [data-proj-idx].ns-swap-target').forEach(w => w.classList.remove('ns-swap-target'));
+      _dragActive = false;
+      _nodeTouchSrc = null; _nodeTouchIdx = null; _nodeTouchSrcLane = null;
+      window._touchSwapTarget = null;
     });
   });
 }
