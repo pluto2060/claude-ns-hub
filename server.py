@@ -5577,28 +5577,11 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, md: Path,
                                     f"\"allow_stale\":true in the body to override (M780.2)."
                                 ),
                             }, status_code=422)
-                    # M185: enforce 3-line TL;DR cap on comments. Long replies are
-                    # truncated and a doc-reference suffix is appended per the
-                    # ns-comment-reply-protocol.md (details go in docs/ns-replies/).
+                    # M185/M1064: enforce 3-line cap — clean truncation, no [details:] suffix
                     _text = str(msg.get("text", ""))
                     _lines = _text.split("\n")
                     if len(_lines) > 3:
-                        # Write the full text to docs/ns-replies for the user to find later
-                        try:
-                            _replies_dir = Path.home() / "Project" / "Moat" / "docs" / "ns-replies"
-                            _replies_dir.mkdir(parents=True, exist_ok=True)
-                            _date = _dt.datetime.now().strftime("%Y-%m-%d-%H%M%S")
-                            _full_file = _replies_dir / f"{_date}-{proj_id}-{mid}.md"
-                            _full_file.write_text(
-                                f"# Full reply (truncated in comment thread) — {proj_id} / {mid}\n\n"
-                                f"**Truncated to first 3 lines in the stone pane.**\n"
-                                f"Posted: {msg.get('ts','')}\n\n---\n\n{_text}\n",
-                                encoding="utf-8"
-                            )
-                            _ref = f"docs/ns-replies/{_full_file.name}"
-                        except Exception:
-                            _ref = "docs/ns-replies/<save-failed>"
-                        msg["text"] = "\n".join(_lines[:3]) + f"\n[details: {_ref}]"
+                        msg["text"] = "\n".join(_lines[:3])
                         msg["truncated"] = True
                     msg.setdefault("ts", _dt.datetime.now().isoformat())
                     conv = m.get("conversation") or []
