@@ -5383,27 +5383,14 @@ def _detect_code_change_signals(text: str) -> "dict | None":
 # When the diff touches HTML/CSS/JS that affects the rendered UI, the reviewer MUST run Playwright
 # to verify and attach a screenshot+counted observations as evidence.
 def _build_review_stone_text(mid: str, brief: str) -> str:
+    # M1063: simplified — UI-focused, concise
     return (
-        f"[검수] {mid}: {brief}\n\n"
-        f"[skill:/code-review] 필수 호출(권장 아님) — 호출 결과를 아래 형식으로 종합·재검증.\n\n"
-        f"■ 검수 원칙(반드시 준수)\n"
-        f"- DIFF-GROUNDED: 실제 변경된 코드만 평가, 추측 금지. 모든 지적은 file:line 인용.\n"
-        f"- UI-EVIDENCE (M1022.1): 변경이 HTML/CSS/JS 또는 사용자 가시 UI에 영향을 주면 Playwright로 실제 렌더 확인.\n"
-        f"    필수: ①대상 화면 navigate + 동작 트리거 ②before/after 스크린샷 1쌍 ③DOM 측정(offsetWidth/computed display/색상 등) 숫자 인용.\n"
-        f"    PASS 판정 시 \"UI 실측 N건(녹 22px, fill display:block ...)\"처럼 건수+값 명시. 코드만 봤다면 솔직히 \"UI 실측 0건, 정적 검수만\" 명시.\n"
-        f"- ADVERSARIAL: 각 핵심 변경을 '어떻게 깨지나' 먼저 가정하고 반증 시도.\n"
-        f"- EVIDENCE: 주장마다 근거(코드/실행결과/스크린샷/문서) 명시, 없으면 [UNVERIFIED] 표기.\n"
-        f"- CALIBRATED: 각 지적에 신뢰도(HIGH/MED/LOW) + 심각도×발생가능성.\n\n"
-        f"■ 5영역 평가 (각 0-10 + 근거 file:line + 신뢰도)\n"
-        f"①변경범위/회귀 — diff 정확분석, 영향 모듈, 의도치않은 사이드이펙트, 회귀 시나리오\n"
-        f"②정확성/엣지 — 경계값·null·empty·동시성·오류처리 전수, 실패모드 enumerate\n"
-        f"③보안(OWASP Top-10) — injection·XSS·authn/z·세션·민감데이터·SSRF·역직렬화\n"
-        f"④성능/결합도 — 시간복잡도·N+1·불필요렌더·핫패스 블로킹·모듈결합·확장성\n"
-        f"⑤완성도/UI 실측 — Playwright UI 건수(0이면 페널티), 미구현 경로·커버리지·문서화·롤백.\n\n"
-        f"■ 심층(weakest-2): 가장 취약한 2개 영역을 골라 '왜 실패하는가' 집중 적대 검증.\n\n"
-        f"■ 판정: 총점 → PASS(≥40)/PARTIAL(25-39)/FAIL(<25). 단 CRITICAL 결함 1개라도 있으면 점수 무관 FAIL.\n"
-        f"  UI 변경인데 UI 실측 0건이면 ⑤영역 자동 -3점(완성도 패널티).\n"
-        f"각 영역 1-2문장 근거 필수. 일반론·플레이스홀더 금지 — 구체적 함수/라인/시나리오·DOM 측정값만."
+        f"[검수] {mid}: {brief}\n"
+        f"①변경파일/함수 명시 + 회귀위험(영향 범위)\n"
+        f"②UI 실측 필수(Playwright navigate→동작→DOM 측정·스크린샷) — UI 변경이면 before/after 스크린샷 1쌍\n"
+        f"③의도대로 동작하는지 + 엣지케이스(null/empty/동시성)\n"
+        f"④OWASP 해당 여부(XSS/SQLi/auth 등)\n"
+        f"⑤완성도 0-10점"
     )
 
 
