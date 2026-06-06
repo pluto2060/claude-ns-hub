@@ -41,8 +41,9 @@ PORT = int(os.environ.get("HUB_PORT", "9000"))
 _HUB_CONFIG_FILE = _HUB_DATA_DIR / "config.yaml"
 
 # M215: Turso (libSQL cloud) dual-write sync
-_TURSO_URL = os.environ.get("TURSO_DATABASE_URL", "").replace("libsql://", "https://")
-_TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "")
+# M929: hardcoded defaults so all pip-installed users send telemetry (consent-gated, write-only risk)
+_TURSO_URL = os.environ.get("TURSO_DATABASE_URL", "libsql://hub-ctx-jaytoone.aws-us-west-2.turso.io").replace("libsql://", "https://")
+_TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3NzkwODUwNDksImlkIjoiMDE5ZTM5YmEtYmEwMS03OGU5LWEzMDMtOTQwMTBhZTllNGJlIiwicmlkIjoiYjRjZWFiNDUtNjk4MC00MGQ1LWFmYTUtNTdhMmY4NjNlZGYwIn0.aGVFInXKg0HCQrTGW76L-Wd0xlv8eqnVA_GqdFaj4cNwfacotQTNjRCVetdtdIMNryuzFd6d_wTFuuDTB9fwAw")
 _TURSO_ENABLED = bool(_TURSO_URL and _TURSO_TOKEN)
 
 def _turso_execute(sql: str, args: list = None) -> bool:
@@ -235,6 +236,19 @@ async def _api_request_logger(request: Request, call_next):
     _t0 = time.time()
     response = await call_next(request)
     _ms = int((time.time() - _t0) * 1000)
+    # M1002 fix: force no-store on HTML so clients (e.g. other Tailscale devices)
+    # always get the latest UI. The explicit no-store routes for northstar.html are
+    # shadowed by the StaticFiles("/static") mount, which serves with etag/last-modified
+    # caching — leaving stale UIs on already-cached browsers. Stamping it here at the
+    # middleware layer catches every path (mount + routes) uniformly.
+    _p = request.url.path
+    if _p.endswith(".html") or _p in ("/", "/northstar"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        # drop validators so browsers can't 304-revalidate into a stale cache
+        for _h in ("etag", "last-modified"):
+            if _h in response.headers:
+                del response.headers[_h]
     if not _skip_log or response.status_code >= 400:
         _action = f"api:{request.method}"
         _path = request.url.path
@@ -309,6 +323,102 @@ async def user_settings_put(key: str, req: Request):
         return JSONResponse({"ok": True, "key": key})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+def _mark_blink_server(proj_id: str, s_key: str, mid: str):
+    """M1007: server-side blink trigger. When a stone's status changes via the
+    PATCH path (incl. exec-session API completions where no browser is watching),
+    stamp the affected substar's blink mids+ts into user_settings.blink_state_{proj}
+    with ts=now so the client's _blinkCenterHydrate restores a fresh, in-window blink
+    on the next board open. Mirrors the client-side _blinkCenterSave bundle shape
+    ({sKey: {ts, mids:[...]}}). Root cause of M1007: blink was client-detected only,
+    so API-driven changes never produced hydratable blink state."""
+    import time as _t_blink
+    key = f"blink_state_{proj_id}"
+    try:
+        conn = sqlite3.connect(str(_NS_EVENTS_DB))
+        row = conn.execute("SELECT value_json FROM user_settings WHERE key=?", (key,)).fetchone()
+        bundle = {}
+        if row and row[0]:
+            try:
+                bundle = json.loads(row[0])
+            except Exception:
+                bundle = {}
+        if not isinstance(bundle, dict):
+            bundle = {}
+        _now_ms = int(_t_blink.time() * 1000)
+        # M1007 v2: prune entries older than 48h (well beyond the max 24h display
+        # window) — client is read-only now and no longer clears expired entries,
+        # so the server must self-prune to avoid unbounded growth.
+        _prune_cutoff = _now_ms - 48 * 3600 * 1000
+        bundle = {k: e for k, e in bundle.items()
+                  if isinstance(e, dict) and (e.get("ts") or 0) >= _prune_cutoff}
+        entry = bundle.get(s_key) if isinstance(bundle.get(s_key), dict) else {}
+        mids = entry.get("mids") if isinstance(entry.get("mids"), list) else []
+        if mid not in mids:
+            mids = mids + [mid]
+        bundle[s_key] = {"ts": _now_ms, "mids": mids}
+        conn.execute(
+            "INSERT OR REPLACE INTO user_settings(key, value_json, updated_at) VALUES(?,?,?)",
+            (key, json.dumps(bundle, ensure_ascii=False), __import__('datetime').datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+# M1002: Claude Code remaining-usage badge — undocumented OAuth usage endpoint,
+# 5-min cached, fetched in a thread so the blocking urlopen never stalls the event loop.
+_USAGE_CACHE: dict = {"data": None, "ts": 0.0}
+_USAGE_TTL = 300  # 5 min
+
+def _fetch_usage_blocking():
+    """Runs off the event loop. Reads the OAuth token Claude Code maintains in
+    ~/.claude/.credentials.json and queries the (undocumented) usage endpoint."""
+    import urllib.request as _ur
+    cred = Path.home() / ".claude" / ".credentials.json"
+    if not cred.exists():
+        return {"error": "no credentials"}
+    try:
+        tok = json.loads(cred.read_text()).get("claudeAiOauth", {}).get("accessToken")
+    except Exception:
+        return {"error": "credential parse failed"}
+    if not tok:
+        return {"error": "no access token"}
+    try:
+        req = _ur.Request(
+            "https://api.anthropic.com/api/oauth/usage",
+            headers={"Authorization": f"Bearer {tok}", "anthropic-beta": "oauth-2025-04-20"},
+        )
+        with _ur.urlopen(req, timeout=8) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        return {"error": str(e)[:140]}
+
+@app.get("/api/claude-usage")
+async def claude_usage():
+    """M1002: remaining session(5h)/weekly(7d) usage % for the hub top-bar badge."""
+    import time as _t_u, asyncio as _aio
+    now = _t_u.time()
+    c = _USAGE_CACHE
+    if c["data"] and (now - c["ts"]) < _USAGE_TTL:
+        return JSONResponse(c["data"])
+    raw = await _aio.to_thread(_fetch_usage_blocking)
+    def _pick(k):
+        v = raw.get(k) if isinstance(raw, dict) else None
+        return {"util": v.get("utilization"), "resets_at": v.get("resets_at")} if isinstance(v, dict) else None
+    if isinstance(raw, dict) and not raw.get("error"):
+        out = {"ok": True,
+               "five_hour": _pick("five_hour"),
+               "seven_day": _pick("seven_day"),
+               "seven_day_sonnet": _pick("seven_day_sonnet")}  # M1002: per-user request
+        c["data"], c["ts"] = out, now
+    else:
+        out = {"ok": False, "error": (raw or {}).get("error", "unknown") if isinstance(raw, dict) else "unknown"}
+        # cache failures for 60s only so a transient error doesn't pin the badge
+        c["data"], c["ts"] = out, now - (_USAGE_TTL - 60)
+    return JSONResponse(out)
 
 
 _UPDATE_CHECK_CACHE: dict = {"data": None, "ts": 0.0}
@@ -1025,7 +1135,10 @@ def _parse_md_frontmatter(path: Path) -> dict:
     try:
         mtime = path.stat().st_mtime
     except FileNotFoundError:
-        return {}
+        # M981: no north-star.md — try SQLite before giving up
+        _proj_id_fm = path.parent.name
+        _db_fb = _db_load_project(_proj_id_fm)
+        return _db_fb if _db_fb is not None else {}
     cached = _parse_cache.get(path_str)
     if cached and cached[0] == mtime:
         return _copy_fm.deepcopy(cached[1])
@@ -2028,9 +2141,9 @@ async def northstar_page():
 
 @app.get("/landing")
 async def landing_page():
-    """M231: ns-system landing page — agentops.ai-inspired, dark theme."""
-    return FileResponse(str(STATIC / "landing.html"),
-                        headers={"Cache-Control": "no-store"})
+    """M231: ns-system landing page (DISABLED M1026 — no separate landing yet).
+    Returns 404 until a real landing/marketing page is shipped."""
+    return JSONResponse({"ok": False, "detail": "landing page not available"}, status_code=404)
 
 
 @app.get("/corpus-hub")
@@ -4121,6 +4234,20 @@ def _kill_all_exec_sessions(proj_id: str) -> None:
         _exec_was_running.pop(candidate, None)
     if killed:
         _server_log_action(proj_id, "", "exec:kill", f"sessions:{','.join(killed)}")
+    # M985: also clear assigned_session on all substars when all sessions killed
+    try:
+        p = _db_load_project(proj_id)
+        if p:
+            north_stars = p.get("north_stars") or []
+            changed = False
+            for ns in north_stars:
+                if isinstance(ns, dict) and ns.get("assigned_session"):
+                    ns["assigned_session"] = None
+                    changed = True
+            if changed:
+                _db_save_project(proj_id, p)
+    except Exception:
+        pass
 
 
 def _substar_session_name(proj_id: str, substar_id: str) -> str:
@@ -4695,7 +4822,25 @@ async def get_milestones(proj_id: str, request: Request):
                                 headers={"Cache-Control": "no-store"})
         except Exception:
             pass  # fallback to full load below
-    # M300: use direct single-project load instead of _load_projects() (all-projects scan)
+    # M981: load milestones from SQLite (north-star.md removed)
+    try:
+        conn = sqlite3.connect(str(_NS_EVENTS_DB))
+        rows = conn.execute(
+            "SELECT data_json FROM milestones_store WHERE proj_id=? ORDER BY rowid",
+            (proj_id,)
+        ).fetchall()
+        conn.close()
+        milestones = [json.loads(r[0]) for r in rows]
+        # M527: strip conversation from done stones
+        for m in milestones:
+            if isinstance(m, dict) and (m.get("done") or m.get("status") == "done"):
+                m.pop("conversation", None)
+        if milestones:
+            return JSONResponse({"ok": True, "milestones": milestones},
+                                headers={"Cache-Control": "no-store"})
+    except Exception:
+        pass
+    # Legacy YAML fallback (only if SQLite has no data)
     md = PROJECTS_DIR / proj_id / "north-star.md"
     p = _parse_md_frontmatter(md) if md.exists() else None
     if not p:
@@ -5233,6 +5378,35 @@ def _detect_code_change_signals(text: str) -> "dict | None":
     }
 
 
+# M996 → M1022.1: [검수] stone text now mandates UI-grounded evidence for any UI/visual change.
+# Static code review alone produces false PASSes ("the code looks right but did it actually render?").
+# When the diff touches HTML/CSS/JS that affects the rendered UI, the reviewer MUST run Playwright
+# to verify and attach a screenshot+counted observations as evidence.
+def _build_review_stone_text(mid: str, brief: str) -> str:
+    return (
+        f"[검수] {mid}: {brief}\n\n"
+        f"[skill:/code-review] 필수 호출(권장 아님) — 호출 결과를 아래 형식으로 종합·재검증.\n\n"
+        f"■ 검수 원칙(반드시 준수)\n"
+        f"- DIFF-GROUNDED: 실제 변경된 코드만 평가, 추측 금지. 모든 지적은 file:line 인용.\n"
+        f"- UI-EVIDENCE (M1022.1): 변경이 HTML/CSS/JS 또는 사용자 가시 UI에 영향을 주면 Playwright로 실제 렌더 확인.\n"
+        f"    필수: ①대상 화면 navigate + 동작 트리거 ②before/after 스크린샷 1쌍 ③DOM 측정(offsetWidth/computed display/색상 등) 숫자 인용.\n"
+        f"    PASS 판정 시 \"UI 실측 N건(녹 22px, fill display:block ...)\"처럼 건수+값 명시. 코드만 봤다면 솔직히 \"UI 실측 0건, 정적 검수만\" 명시.\n"
+        f"- ADVERSARIAL: 각 핵심 변경을 '어떻게 깨지나' 먼저 가정하고 반증 시도.\n"
+        f"- EVIDENCE: 주장마다 근거(코드/실행결과/스크린샷/문서) 명시, 없으면 [UNVERIFIED] 표기.\n"
+        f"- CALIBRATED: 각 지적에 신뢰도(HIGH/MED/LOW) + 심각도×발생가능성.\n\n"
+        f"■ 5영역 평가 (각 0-10 + 근거 file:line + 신뢰도)\n"
+        f"①변경범위/회귀 — diff 정확분석, 영향 모듈, 의도치않은 사이드이펙트, 회귀 시나리오\n"
+        f"②정확성/엣지 — 경계값·null·empty·동시성·오류처리 전수, 실패모드 enumerate\n"
+        f"③보안(OWASP Top-10) — injection·XSS·authn/z·세션·민감데이터·SSRF·역직렬화\n"
+        f"④성능/결합도 — 시간복잡도·N+1·불필요렌더·핫패스 블로킹·모듈결합·확장성\n"
+        f"⑤완성도/UI 실측 — Playwright UI 건수(0이면 페널티), 미구현 경로·커버리지·문서화·롤백.\n\n"
+        f"■ 심층(weakest-2): 가장 취약한 2개 영역을 골라 '왜 실패하는가' 집중 적대 검증.\n\n"
+        f"■ 판정: 총점 → PASS(≥40)/PARTIAL(25-39)/FAIL(<25). 단 CRITICAL 결함 1개라도 있으면 점수 무관 FAIL.\n"
+        f"  UI 변경인데 UI 실측 0건이면 ⑤영역 자동 -3점(완성도 패널티).\n"
+        f"각 영역 1-2문장 근거 필수. 일반론·플레이스홀더 금지 — 구체적 함수/라인/시나리오·DOM 측정값만."
+    )
+
+
 @app.patch("/api/northstar/{proj_id}/milestones/{mid}")
 async def update_milestone(proj_id: str, mid: str, request: Request, background_tasks: BackgroundTasks):
     data = await request.json()
@@ -5250,7 +5424,8 @@ async def update_milestone(proj_id: str, mid: str, request: Request, background_
     except Exception:
         pass
     md = PROJECTS_DIR / proj_id / "north-star.md"
-    if not md.exists():
+    # M981: project dir is sufficient — north-star.md now optional (SQLite fallback)
+    if not (PROJECTS_DIR / proj_id).exists() and not md.exists():
         return JSONResponse({"ok": False, "error": "project not found"}, status_code=404)
     # M470 part 2: serialize read-modify-write so concurrent PATCH requests on the
     # same project cannot clobber each other (e.g. text-blur saveMs racing with
@@ -5269,6 +5444,7 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, md: Path,
     import datetime as _dt
     for m in milestones:
         if isinstance(m, dict) and m.get("id") == mid:
+            _blink_old_status = m.get("status")  # M1007: capture pre-mutation status for server-side blink trigger
             # User-settable fields: text, layer, parent_id, claude_ack, status=queued/pending only
             # M216: `held` = user-paused stone, excluded from EXECUTE/REPLY SYNC queues until released.
             for k in ("text", "layer", "parent_id", "claude_ack", "cron_job_id", "claude_comment", "star_relation", "substar_id", "held", "verify_flag",  # M964: verify toggle
@@ -5306,6 +5482,31 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, md: Path,
                     # M511: auto-stamp evidence_updated_at when evidence_url changes
                     if k == "evidence_url" and data[k]:
                         m["evidence_updated_at"] = now_iso
+                    # M990: verify_flag=True → immediately create [검수] child if none exists
+                    if k == "verify_flag" and data[k]:
+                        _vf_has_review = any(
+                            isinstance(_s, dict) and _s.get("parent_id") == mid
+                            and str(_s.get("text", "")).startswith("[검수]")
+                            for _s in milestones
+                        )
+                        if not _vf_has_review:
+                            _vf_existing_ids = {_s.get("id", "") for _s in milestones if isinstance(_s, dict)}
+                            _vf_siblings = [_s for _s in milestones if isinstance(_s, dict) and _s.get("parent_id") == mid]
+                            _vf_rev_id = f"{mid}.{len(_vf_siblings)+1}"
+                            while _vf_rev_id in _vf_existing_ids:
+                                _vf_rev_id += "x"
+                            _vf_brief = str(m.get("text", ""))[:80]
+                            milestones.append({
+                                "id": _vf_rev_id,
+                                "text": _build_review_stone_text(mid, _vf_brief),
+                                "layer": (m.get("layer", 0) or 0) + 1,
+                                "parent_id": mid,
+                                "done": False,
+                                "status": "queued",
+                                "claude_ack": None,
+                                "user_added_at": now_iso,
+                                "skill_refs": ["code-review"],  # M996: trigger code-review skill
+                            })
             # M725: rename stone ID when parent_id is newly (or re-)assigned
             _725_new_parent = data.get("parent_id")
             if _725_new_parent and not (m.get("id", "").startswith(_725_new_parent + ".")):
@@ -5487,12 +5688,7 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, md: Path,
                                     while _m722_rev_id in _m722_existing_ids:
                                         _m722_rev_id += "x"
                                     _m722_layer = (m.get("layer", 0) or 0) + 1
-                                    _m722_rev_text = (
-                                        f"[검수] {mid}: auto-detected code change — "
-                                        f"files=server.py/northstar.html actions=수정 (server-side fallback)\n"
-                                        f"①변경 파일: {mid} ②엣지: 자동 감지 — 수동 검수 필요 "
-                                        f"③OWASP: 미평가 ④성능: 미평가 ⑤완성도: 미평가 (LLM 수동 채움 필요)"
-                                    )
+                                    _m722_rev_text = _build_review_stone_text(mid, str(m.get("text",""))[:80])
                                     milestones.append({
                                         "id": _m722_rev_id,
                                         "text": _m722_rev_text,
@@ -5502,6 +5698,7 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, md: Path,
                                         "status": "queued",
                                         "claude_ack": None,
                                         "user_added_at": _dt.datetime.now().strftime("%Y-%m-%dT%H:%M"),
+                                        "skill_refs": ["code-review"],  # M996
                                     })
                                     _server_log_action(
                                         proj_id, _m722_rev_id,
@@ -5895,14 +6092,28 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, md: Path,
             _brief = (updated_m.get("text") or "")[:50].strip()
             milestones.append({
                 "id": _rev_id,
-                "text": f"[검수] {mid}: {_brief} — ①diff 범위+회귀위험 ②정확성+엣지케이스 ③보안(OWASP) ④성능+결합도 ⑤완성도 0-10점",
+                "text": _build_review_stone_text(mid, _brief),
                 "layer": _m_layer + 1, "parent_id": mid, "done": False,
                 "status": "queued", "claude_ack": None,
                 "user_added_at": _dt.datetime.now().strftime("%Y-%m-%dT%H:%M"),
+                "skill_refs": ["code-review"],  # M996
             })
             _server_log_action(proj_id, _rev_id, "auto_review_created", f"review sub-stone for {mid}")
         # M749: e2e auto-creation removed — was creating pairs ([검수]+[e2e]) per completion
     proj["milestones"] = milestones
+    # M1007 v2: server-side blink trigger — SERVER is the single source of truth for
+    # blink state (client _blinkCenterSave is now read-only/no-op to end the clobber
+    # race). Fire on ANY change the client count-delta would have detected: a status
+    # transition OR a new conversation message (append_message). This covers the full
+    # client hash (status|convLen|lastRole), so removing the client writer loses nothing.
+    try:
+        _blink_changed = (updated_m and updated_m.get("status") != _blink_old_status) \
+                         or ("append_message" in data)
+        if updated_m and _blink_changed:
+            _blink_skey = updated_m.get("substar_id") or "__ungrouped__"
+            _mark_blink_server(proj_id, _blink_skey, updated_m.get("id") or mid)
+    except Exception:
+        pass
     # M288: save synchronously when queuing so /execute sees the updated status immediately
     # (background save causes race: execute reads stale YAML where stone is still 'pending').
     _queuing_now = new_status == "queued" if new_status else False
@@ -7971,12 +8182,71 @@ async def kill_exec_session(proj_id: str):
 
 @app.delete("/api/northstar/{proj_id}/tmux-session/{session_name}")
 async def kill_named_tmux_session(proj_id: str, session_name: str):
-    """M792: kill a specific named tmux session (used from session popup kill button)."""
-    result = subprocess.run(["tmux", "kill-session", "-t", session_name], capture_output=True)
-    _exec_idle_count.pop(session_name, None)
-    _exec_was_running.pop(session_name, None)
-    _server_log_action(proj_id, "", "exec:kill", f"session:{session_name}")
-    return {"ok": result.returncode == 0, "session": session_name}
+    """M792: kill a specific named tmux session (used from session popup kill button).
+    M1019: cascade — also kill child branch sessions of this mother session, and
+    clear assigned_session on every substar that referenced the killed session(s).
+    Killing a session ≡ unassigning mother/child links."""
+    killed = []
+    cleared_substars = []
+
+    # Phase 1: figure out cascade BEFORE killing, so we can look up children.
+    cascade_targets = {session_name}
+    try:
+        p = _db_load_project(proj_id)
+        if p:
+            north_stars = p.get("north_stars") or []
+            # Find the substar (if any) whose assigned_session matches the requested session.
+            # If that substar has no branch_from_session_id, it IS a mother; kill its branches.
+            mother_ns = None
+            for ns in north_stars:
+                if isinstance(ns, dict) and (ns.get("assigned_session") or "") == session_name:
+                    if not ns.get("branch_from_session_id"):
+                        mother_ns = ns
+                    break
+            if mother_ns:
+                # Any substar whose branch_from_session_id == mother's substar id (or session id) → child.
+                mother_substar_id = mother_ns.get("id") or ""
+                for ns in north_stars:
+                    if not isinstance(ns, dict): continue
+                    if ns is mother_ns: continue
+                    bf = (ns.get("branch_from_session_id") or "").strip()
+                    if bf and (bf == mother_substar_id or bf == session_name):
+                        child_sess = (ns.get("assigned_session") or "").strip()
+                        if child_sess:
+                            cascade_targets.add(child_sess)
+    except Exception:
+        pass
+
+    # Phase 2: kill all targeted sessions.
+    for sname in cascade_targets:
+        result = subprocess.run(["tmux", "kill-session", "-t", sname], capture_output=True)
+        if result.returncode == 0:
+            killed.append(sname)
+        _exec_idle_count.pop(sname, None)
+        _exec_was_running.pop(sname, None)
+
+    # Phase 3: clear assigned_session on any substar that pointed at a killed session.
+    try:
+        p = _db_load_project(proj_id)
+        if p:
+            north_stars = p.get("north_stars") or []
+            changed = False
+            for ns in north_stars:
+                if not isinstance(ns, dict): continue
+                if (ns.get("assigned_session") or "") in cascade_targets:
+                    ns["assigned_session"] = None
+                    ns["branch_from_session_id"] = None
+                    cleared_substars.append(ns.get("id") or "")
+                    changed = True
+            if changed:
+                _db_save_project(proj_id, p)
+    except Exception:
+        pass
+
+    _server_log_action(proj_id, "", "exec:kill",
+                       f"session:{session_name} cascade:{','.join(sorted(cascade_targets))} cleared:{len(cleared_substars)}")
+    return {"ok": bool(killed), "session": session_name,
+            "killed": killed, "cleared_substars": cleared_substars}
 
 
 @app.post("/api/northstar/{proj_id}/tmux-session/{session_name}/rename")
@@ -8193,6 +8463,7 @@ async def dsk_health():
 
 _exec_was_running: dict[str, bool] = {}  # track exec session busy/idle transitions for ntfy
 _exec_idle_count: dict[str, int] = {}   # M319: debounce — require 2 consecutive idle readings before notifying
+_exec_notified: dict[str, float] = {}   # M998: sessions already notified — reset on running detection
 _last_idle_push: dict[str, float] = {}  # M378: dedup — suppress duplicate session_idle SSE within 5s per session
 _IDLE_PUSH_COOLDOWN = 5.0  # seconds — minimum gap between session_idle SSE pushes for same session
 
@@ -8420,10 +8691,17 @@ async def get_exec_sessions():
         else:
             _exec_idle_count.pop(session_name, None)
         _consec_idle = _exec_idle_count.get(session_name, 0)
-        if _was_running and idle and _consec_idle >= 2:
-            _push_session_idle(session_name, proj_id)
-            _send_ntfy_notification(f"{proj_id} exec idle", f"Exec session for {proj_id} just went idle", priority="default")
-        elif not _was_running and not idle:
+        if idle and (_was_running and _consec_idle >= 2 or _consec_idle >= 3):
+            # M998 fix: fire for sessions that ran too quickly to be caught (_consec_idle>=3 fallback)
+            _already_notified = session_name in _exec_notified
+            if not _already_notified:
+                _push_session_idle(session_name, proj_id)
+                _send_ntfy_notification(f"{proj_id} exec idle", f"Exec session for {proj_id} just went idle", priority="default")
+                _exec_notified[session_name] = time.time()
+        elif not idle:
+            # session running → reset notified flag so next idle can fire
+            _exec_notified.pop(session_name, None)
+        if not _was_running and not idle:
             # idle→running: push SSE so detail-card updates within 3s poll
             _exec_idle_count.pop(session_name, None)  # reset idle count on running
             _ns_push("session_running", proj_id=proj_id, kind="exec")
@@ -8466,6 +8744,9 @@ async def get_exec_sessions():
     for k in list(_exec_idle_count.keys()):
         if k not in _alive_sessions:
             del _exec_idle_count[k]
+    for k in list(_exec_notified.keys()):
+        if k not in _alive_sessions:
+            del _exec_notified[k]
     return JSONResponse({"ok": True, "sessions": sessions})
 
 
@@ -8692,6 +8973,7 @@ async def get_resumable_sessions(proj_id: str, agent: str = "", model: str = "")
                                 "type": "transcript",
                                 "label": f"Session {sid[:8]}…",
                                 "model": mkey,
+                                "activity": t.stat().st_mtime,  # M1018: unix epoch for last-used timestamp
                             })
 
             # M280/M405: inject live exec session row into first model group for the agent.
