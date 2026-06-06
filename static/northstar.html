@@ -6761,9 +6761,9 @@ function nodeCard(p, idx) {
   </button>`;
   // M232: exec session state → ns-card border color (idle=orange / live=green-blink / none=default).
   const _execClass = _execKey === 'running' ? 'exec-live' : (_execKey === 'idle' ? 'exec-idle' : '');
-  // M685: per-model avatar — reads user-configured mappings from localStorage, falls back to built-ins
-  // M741 final: avatar based solely on _execModel (live tmux session) — p.model not used
-  const _liveModel = ((window._execModel||{})[p.id||p.name]||'');
+  // M685: per-model avatar — reads user-configured mappings, fallback to p.model for immediate post-save display
+  // M1046 fix: include p.model_used/p.model as fallback so avatar updates immediately after save even without live session
+  const _liveModel = ((window._execModel||{})[p.id||p.name]||p.model_used||p.model||'');
   const _modelAvatars = _nsModelAvatars(); // localStorage map: model-key → url
   // M1011: prefer exact match, then longest-substring match. The old
   // .find(k => _liveModel.includes(k)) returned the FIRST key that was a
