@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-ns-hub"
-version = "0.2.25"
+version = "0.2.26"
 description = "Personal AI project management hub — North Star milestone tracking, live Claude sessions, CTX context alignment."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -29,7 +29,6 @@ dependencies = [
   "ptyprocess>=0.7; platform_system != 'Windows'",
   "psutil>=5.9",
   "anthropic>=0.28",
-  "ctx-retriever>=0.3.30",  # CTX context bootstrapper — hooks auto-wire on install
   "python-multipart>=0.0.9",  # required for FastAPI file upload endpoints
 ]
 

@@ -29,13 +29,29 @@ The engineers shipping the most with Claude Code are the ones who can monitor, q
 - `tmux` installed (`brew install tmux` / `apt install tmux`)
 - Tailscale (optional, for remote access)
 
-## Install
+## Install (60 seconds)
 
 ```bash
 pip install claude-ns-hub
+hub                          # starts immediately on http://localhost:9001
+# → All features auto-active: North Star, exec sessions, entity corpus,
+#   Tailscale port-expose, anonymous usage telemetry (opt-out below).
 ```
 
-## Quick start
+That's it — no config file, no env vars, no separate daemon. Open the printed URL in any browser (phone or laptop, via Tailscale) and you're in.
+
+## Telemetry & privacy
+
+The hub sends one anonymized `hub_start` event on startup (fields: `ts`, `event`, `install_id=sha256(hostname)[:16]`, `version`, `os`). **No PII, no code, no stone text** is transmitted. Disable any time:
+
+```bash
+curl -X POST http://localhost:9001/api/hub/consent \
+  -H 'Content-Type: application/json' \
+  -d '{"data_collection": false}'
+```
+
+<a id="quick-start"></a>
+## Quick start (manual install)
 
 ```bash
 # 1. Start the hub

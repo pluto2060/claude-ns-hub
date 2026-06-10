@@ -2104,8 +2104,11 @@ def main():
     _prompt_stripped = prompt.strip()
     _prompt_lower = _prompt_stripped.lower()
     # M59: skip G2 only for known trivial hub-trigger words (exact set match).
-    # Length-based gate removed — "fix it", "debug this" etc. are valid 2-word queries.
-    _skip_g2 = _prompt_lower in _TRIVIAL_PROMPTS
+    # M1181: also treat hub wake-message patterns as trivial so stone text is used as query instead.
+    _HUB_WAKE_PAT = re.compile(
+        r'(tasks?\s+ready|get_pending_task|mcp__ns.hub__get_pending_task)', re.I
+    )
+    _skip_g2 = _prompt_lower in _TRIVIAL_PROMPTS or bool(_HUB_WAKE_PAT.search(_prompt_stripped))
 
     # M59-HUB: when prompt is trivial, fetch current queued hub stone text and use
     # THAT as the G2 query instead of skipping entirely. This makes CTX work correctly

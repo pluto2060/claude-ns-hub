@@ -4213,8 +4213,15 @@ function _pasteChipHtml(raw) {
     const fname = url.split('/').pop().split('?')[0] || 'file';
     const isImg = /\.(png|jpg|jpeg|gif|webp|svg)$/i.test(fname);
     const isVideo = /\.(mp4|webm|mov|avi|mkv|ogg)$/i.test(fname);
+    // M1180: if fname has no extension and URL is external https://, use hostname as label
+    const _hasExt = /\.[a-zA-Z0-9]{2,5}$/.test(fname);
+    const _isExternal = /^https?:\/\//.test(url) && !url.startsWith('/');
+    let _displayName = fname;
+    if (!_hasExt && _isExternal) {
+      try { _displayName = new URL(url).hostname.replace(/^www\./, ''); } catch(_) {}
+    }
     // M949: badge-style display with type icon
-    const shortName = fname.length > 24 ? fname.slice(0,11)+'…'+fname.slice(-9) : fname;
+    const shortName = _displayName.length > 24 ? _displayName.slice(0,11)+'…'+_displayName.slice(-9) : _displayName;
     const label = shortName; // M951: icon removed
     const onclick = `event.stopPropagation();_previewFile('${enc}','${esc(fname)}',${isImg},${isVideo})`;
     const xOnclick = `event.stopPropagation();const c=this.closest('.nt-paste-chip');const nt=c?.closest('.nt-text');c?.remove();if(nt?.isContentEditable)nt.dispatchEvent(new Event('blur'));`;
@@ -4421,26 +4428,6 @@ function _msEvidenceBadgeHtml(m, projId) {
      title="Evidence: ${esc(m.evidence_url)}">result</a>${bang}</div>`;
 }
 
-// M541: star (gap-closer) badge — shown below lock badge in ms-td-msg column
-function _msStarBadgeHtml(m, projId) {
-  return '';  // M1165: gap-closure 점수/배지 비활성화 (사용자 요청). 데이터(star_relation) 자체는 유지.
-  // eslint-disable-next-line no-unreachable
-  if (!m.star_relation) return '';
-  const _p = projects.find(x => (x.id||x.name) === projId);
-  const _curTgt = _p ? (_p.target ?? '') : '';
-  const _snapTgt = m.star_target_at_completion ?? '';
-  const _stale = _snapTgt && _curTgt && String(_snapTgt) !== String(_curTgt);
-  const _staleTitle = _stale ? ` — STALE: recorded against target "${esc(_snapTgt)}", current is "${esc(_curTgt)}"` : '';
-  const _color = _stale ? 'var(--text-dim)' : 'var(--accent)';
-  const _bg = _stale ? 'transparent' : 'var(--accent-soft)';
-  const _bd = _stale ? 'var(--panel-border)' : 'var(--accent-soft)';
-  return `<button class="nt-mid-star" title="Gap closure note (click for detail)${_staleTitle}"
-    style="display:flex;align-items:center;justify-content:center;margin:3px auto 0;
-      width:24px;height:22px;padding:0;border-radius:3px;border:1px solid ${_bd};
-      background:${_bg};color:${_color};cursor:pointer;font-size:13px;line-height:1"
-    onclick="event.stopPropagation();showStarRelModal(event,this.dataset.r,this.dataset.t)"
-    data-r="${esc(m.star_relation)}" data-t="${esc(m.text.slice(0,60))}">★</button>`;
-}
 
 function _msHoldBtnHtml(projId, mid, isHeld) {
   // M459: hold button restored (M453 reversal — was incorrectly removed).
@@ -6429,75 +6416,6 @@ async function deleteMs(projId, mid, btn) {
   } finally { _msSetLoading(mid, false, btn); _dmSpinOff(); }
 }
 
-// M173: Re-skin to match comment popup style (positioned near click, mono font,
-// click-outside closes). Star_relation now represents the post-completion
-// gap-closure note (1-line statement of how the work reduced the star gap).
-function showStarRelModal(event, relation, stoneText) {
-  document.getElementById('star-rel-popup')?.remove();
-  const popup = document.createElement('div');
-  popup.id = 'star-rel-popup';
-  const isMob = window.innerWidth < 600;
-  const BOTTOM_GUTTER = 56;
-  const TOP_GUTTER = 12;
-  const availH = Math.max(120, window.innerHeight - BOTTOM_GUTTER - TOP_GUTTER);
-  const maxH = Math.min(availH, isMob ? Math.round(window.innerHeight * 0.7) : 320);
-  popup.style.cssText = `position:fixed;z-index:9999;background:var(--panel);border:1px solid var(--accent-soft);
-    border-radius:8px;padding:10px 13px;box-shadow:0 6px 24px rgba(0,0,0,.25);
-    font-family:var(--mono);font-size:11px;line-height:1.55;color:var(--text);
-    max-height:${maxH}px;overflow-y:auto;
-    ${isMob ? `left:8px;right:8px;bottom:${BOTTOM_GUTTER}px;max-width:calc(100vw - 16px)` : 'max-width:340px;min-width:240px'}`;
-  if (!isMob && event && typeof event.clientX === 'number') {
-    const x = Math.min(event.clientX, window.innerWidth - 360);
-    const safeBottom = window.innerHeight - BOTTOM_GUTTER;
-    const spaceBelow = safeBottom - (event.clientY + 8);
-    let y;
-    if (spaceBelow >= maxH) {
-      y = event.clientY + 8;
-    } else {
-      y = Math.max(TOP_GUTTER, event.clientY - maxH - 8);
-      if (y + maxH > safeBottom) y = Math.max(TOP_GUTTER, safeBottom - maxH);
-    }
-    popup.style.left = x + 'px';
-    popup.style.top = y + 'px';
-  }
-  popup.innerHTML = `<div style="font-size:9px;color:var(--accent);margin-bottom:6px;letter-spacing:.05em">★ GAP CLOSURE</div>
-    <div style="font-size:10px;color:var(--text-dim);margin-bottom:6px;opacity:.7">${esc(stoneText)}</div>
-    <div style="color:var(--text-soft)">${esc(relation)}</div>`;
-  document.body.appendChild(popup);
-  setTimeout(() => {
-    function _hStar(e) {
-      if (!popup.contains(e.target)) {
-        popup.remove();
-        document.removeEventListener('click', _hStar);
-        document.removeEventListener('touchstart', _hStar);
-      }
-    }
-    document.addEventListener('click', _hStar);
-    document.addEventListener('touchstart', _hStar, {passive: true});
-  }, 100);
-}
-
-// M65/M70: generate star-stone relation + OKR rationale for a milestone
-async function generateStarRelation(projId, msId, btn) {
-  const orig = btn.textContent;
-  btn.textContent = '…'; btn.disabled = true;
-  const r = await fetch(
-    `/api/northstar/${encodeURIComponent(projId)}/milestones/${encodeURIComponent(msId)}/rationale`,
-    { method: 'POST' }
-  ).then(x => x.json()).catch(() => ({ ok: false }));
-  btn.disabled = false; btn.textContent = orig;
-  if (r.ok && r.rationale) {
-    const p = projects.find(x => (x.id||x.name) === projId);
-    if (p) {
-      const ms = (p.milestones || []).find(m => m.id === msId);
-      if (ms) {
-        ms.star_relation = r.rationale;
-        showStarRelModal(r.rationale, ms.text.slice(0, 60));
-      }
-    }
-    await loadMilestones(projId);
-  }
-}
 
 // Reload from API for toggleMs (need current state)
 (async function() {
@@ -9621,12 +9539,17 @@ async function _sbSelect(projId, mid, type, name) {
     const msg = modal.querySelector('#sb-selected-msg');
     if (msg) { msg.textContent = `✓ ${label}`; msg.style.display = ''; }
   }
-  // M258: save to recent when skill/agent selected (not clear)
+  // M258→M1178: save to recent — write-through to server (M955 state centralization)
   if (type !== 'clear' && name) {
     const _r = (() => { try{return JSON.parse(localStorage.getItem('sb-recent')||'[]');}catch{return[];} })();
     const _rFiltered = _r.filter(x=>!(x.type===type&&x.name===name));
     _rFiltered.unshift({type, name});
-    localStorage.setItem('sb-recent', JSON.stringify(_rFiltered.slice(0,10)));
+    const _rNext = _rFiltered.slice(0,10);
+    localStorage.setItem('sb-recent', JSON.stringify(_rNext));
+    fetch('/api/user-settings/sb_recent', {
+      method:'PUT', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({value: _rNext}),
+    }).catch(() => {});
   }
   if (modal && modal._commentMode) {
     if (type === 'clear') { window._commentSkillRefs=[]; window._commentAgentRefs=[]; }
