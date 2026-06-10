@@ -183,37 +183,70 @@ TOOLS = [
 ]
 
 
+def _score_sentence(sent: str, role: str) -> float:
+    """M1193 v2: Non-LLM sentence importance scoring (decision-anchored extractive).
+    Scores by semantic signal density: decisions > code/files > errors > questions > acks."""
+    import re as _re
+    s = sent.strip()
+    if not s:
+        return 0.0
+    score = 1.0
+    # Decision/completion signals — highest value (task outcomes)
+    if _re.search(r'\b(완료|수정|해결|적용|구현|commit|fix[ed]?|done|implemented|added|removed|replaced)\b', s, _re.I):
+        score += 4.0
+    # Code/file references — strong anchors
+    if _re.search(r'(```|\.py|\.ts|\.html|\.md|server\.py|northstar\.html|:\d+|commit [0-9a-f]{5,})', s):
+        score += 3.0
+    # Error/bug/warning signals
+    if _re.search(r'\b(error|bug|fail|warn|exception|traceback|오류|버그|경고|실패)\b', s, _re.I):
+        score += 2.5
+    # Questions (user intent signals)
+    if s.endswith('?') or s.endswith('？') or _re.search(r'\b(왜|어떻게|무엇|어디|언제|why|how|what|where|when)\b', s, _re.I):
+        score += 2.0
+    # Causal/reasoning markers
+    if _re.search(r'\b(원인|이유|because|caused|→|therefore|결론|핵심)\b', s, _re.I):
+        score += 1.5
+    # Short acks/noise — penalize
+    if len(s) < 25:
+        score -= 2.0
+    # Markdown headers often introduce important sections
+    if s.startswith('#') or s.startswith('**') or s.startswith('- '):
+        score += 0.5
+    return max(0.0, score)
+
+
+def _extract_key_sentence(text: str, role: str, max_chars: int = 200) -> str:
+    """M1193 v2: Extract the single most important sentence from a turn using importance scoring.
+    Falls back to first sentence if no scored sentence is found."""
+    import re as _re
+    sentences = [s.strip() for s in _re.split(r'(?<=[.!?。])\s+|\n', str(text or "")) if s.strip()]
+    if not sentences:
+        return (str(text or "").replace("\n", " ").strip())[:max_chars]
+    scored = [(s, _score_sentence(s, role)) for s in sentences if len(s) > 5]
+    if not scored:
+        return sentences[0][:max_chars]
+    best = max(scored, key=lambda x: x[1])
+    return best[0][:max_chars]
+
+
 def _semantic_compress_turns(turns: list) -> str:
-    """M1193: Semantic compression — all user requests + per-claude conclusion lines.
-    Output: U1: <req> | U2: <req> | C1: <conclusion> | C2: <conclusion> ...
-    Each turn trimmed to 180 chars. Claude turns: extract last non-empty paragraph
-    (usually the most conclusive line) rather than raw truncation."""
-    _tr = lambda t, n=180: (str(t or "").replace("\n", " ").strip())[:n]
-
-    def _claude_conclusion(text: str) -> str:
-        """Extract the semantic conclusion from a claude turn: last non-empty paragraph."""
-        paras = [p.strip() for p in str(text or "").split("\n\n") if p.strip()]
-        if not paras:
-            return _tr(text)
-        last_para = paras[-1]
-        lines = [l.strip() for l in last_para.split("\n") if l.strip()]
-        return _tr(lines[-1] if lines else last_para)
-
-    u_idx = 0
-    c_idx = 0
+    """M1193 v2: Decision-anchored extractive compression (non-LLM SOTA).
+    For each turn: score all sentences by signal density (decisions > code > errors > questions),
+    extract the single most important sentence. Output: U1: <key> | C1: <key> | U2: ...
+    Korean/English mixed support via multilingual keyword patterns."""
+    u_idx = c_idx = 0
     parts = []
-    for turn in turns:
+    for turn in (turns or []):
         if not isinstance(turn, dict):
             continue
         role = turn.get("role", "")
         text = turn.get("text") or turn.get("content") or ""
         if role == "user":
             u_idx += 1
-            parts.append(f"U{u_idx}: {_tr(text)}")
+            parts.append(f"U{u_idx}: {_extract_key_sentence(text, role)}")
         elif role == "claude":
             c_idx += 1
-            parts.append(f"C{c_idx}: {_claude_conclusion(text)}")
-
+            parts.append(f"C{c_idx}: {_extract_key_sentence(text, role)}")
     return " | ".join(parts) if parts else f"({len(turns)} turns)"
 
 

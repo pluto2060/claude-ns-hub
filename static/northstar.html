@@ -11165,23 +11165,36 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
       if (_stone?.verify_flag) { _verifyChip.textContent='verify ✓'; _verifyChip.style.color='var(--green,#3d8b5e)'; _verifyChip.style.background='rgba(61,139,94,.15)'; _verifyChip.style.borderColor='rgba(61,139,94,.4)'; }
     }
   }
-  // M1154 v9 / M1193: ∑N badge — semantic compression (all U turns + C conclusions).
-  // Mirrors _semantic_compress_turns() in hub-mcp-server.py and server.py.
+  // M1154 v9 / M1193 v2: ∑N badge — decision-anchored extractive compression (non-LLM SOTA).
+  // Mirrors _score_sentence + _extract_key_sentence + _semantic_compress_turns in server.py.
   { const _conv = (_msConversations[mid]||[]); const _badge = popup.querySelector('#comment-summary-badge'); const _detail = popup.querySelector('#comment-summary-detail');
     if (_badge) {
-      // M1193: semantic compression helper — all user requests + per-claude conclusion line
+      // M1193 v2: sentence importance scoring — decisions > code > errors > questions
+      const _scoreSentence = (s) => {
+        if (!s || s.length < 3) return 0;
+        let sc = 1.0;
+        if (/\b(완료|수정|해결|적용|구현|commit|fix(ed)?|done|implemented|added|removed|replaced)\b/i.test(s)) sc += 4;
+        if (/(```|\.py|\.ts|\.html|\.md|server\.py|northstar\.html|:\d+|commit [0-9a-f]{5,})/.test(s)) sc += 3;
+        if (/\b(error|bug|fail|warn|exception|traceback|오류|버그|경고|실패)\b/i.test(s)) sc += 2.5;
+        if (/[?？]$/.test(s.trim()) || /\b(왜|어떻게|무엇|어디|언제|why|how|what|where|when)\b/i.test(s)) sc += 2;
+        if (/\b(원인|이유|because|caused|→|therefore|결론|핵심)\b/i.test(s)) sc += 1.5;
+        if (s.length < 25) sc -= 2;
+        if (/^[#*-]/.test(s)) sc += 0.5;
+        return Math.max(0, sc);
+      };
+      const _keyLine = (text, n=200) => {
+        const sents = (text||'').split(/(?<=[.!?。])\s+|\n/).map(s=>s.trim()).filter(Boolean);
+        if (!sents.length) return (text||'').replace(/\n/g,' ').trim().slice(0,n);
+        const scored = sents.filter(s=>s.length>5).map(s=>[s,_scoreSentence(s)]);
+        if (!scored.length) return sents[0].slice(0,n);
+        return scored.reduce((a,b)=>b[1]>a[1]?b:a)[0].slice(0,n);
+      };
       const _semCompress = (turns) => {
-        const _tr = (t,n=180) => (t||'').replace(/\n/g,' ').trim().slice(0,n);
-        const _claudeConclusion = (text) => {
-          const paras = (text||'').split(/\n\n+/).map(p=>p.trim()).filter(Boolean);
-          if (!paras.length) return _tr(text);
-          const lines = paras[paras.length-1].split('\n').map(l=>l.trim()).filter(Boolean);
-          return _tr(lines.length ? lines[lines.length-1] : paras[paras.length-1]);
-        };
         let uIdx=0, cIdx=0; const parts=[];
         for (const t of turns) {
-          if (t.role==='user')   { uIdx++; parts.push(`U${uIdx}: ${_tr(t.text||t.content||'')}`); }
-          else if (t.role==='claude') { cIdx++; parts.push(`C${cIdx}: ${_claudeConclusion(t.text||t.content||'')}`); }
+          const txt = t.text||t.content||'';
+          if (t.role==='user')   { uIdx++; parts.push(`U${uIdx}: ${_keyLine(txt)}`); }
+          else if (t.role==='claude') { cIdx++; parts.push(`C${cIdx}: ${_keyLine(txt)}`); }
         }
         return parts.join(' | ') || `(${turns.length} turns)`;
       };

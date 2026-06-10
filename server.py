@@ -4244,23 +4244,47 @@ def _send_exec_wake(session_name: str, proj_id: str | None = None) -> None:
     )
 
 
+def _score_sentence(sent: str, role: str) -> float:
+    """M1193 v2: Non-LLM sentence importance scoring (decision-anchored extractive)."""
+    import re as _re_ss
+    s = sent.strip()
+    if not s:
+        return 0.0
+    score = 1.0
+    if _re_ss.search(r'\b(완료|수정|해결|적용|구현|commit|fix[ed]?|done|implemented|added|removed|replaced)\b', s, _re_ss.I):
+        score += 4.0
+    if _re_ss.search(r'(```|\.py|\.ts|\.html|\.md|server\.py|northstar\.html|:\d+|commit [0-9a-f]{5,})', s):
+        score += 3.0
+    if _re_ss.search(r'\b(error|bug|fail|warn|exception|traceback|오류|버그|경고|실패)\b', s, _re_ss.I):
+        score += 2.5
+    if s.endswith('?') or s.endswith('？') or _re_ss.search(r'\b(왜|어떻게|무엇|어디|언제|why|how|what|where|when)\b', s, _re_ss.I):
+        score += 2.0
+    if _re_ss.search(r'\b(원인|이유|because|caused|→|therefore|결론|핵심)\b', s, _re_ss.I):
+        score += 1.5
+    if len(s) < 25:
+        score -= 2.0
+    if s.startswith('#') or s.startswith('**') or s.startswith('- '):
+        score += 0.5
+    return max(0.0, score)
+
+
+def _extract_key_sentence(text: str, role: str, max_chars: int = 200) -> str:
+    """M1193 v2: Extract the single most important sentence using importance scoring."""
+    import re as _re_eks
+    sentences = [s.strip() for s in _re_eks.split(r'(?<=[.!?。])\s+|\n', str(text or "")) if s.strip()]
+    if not sentences:
+        return (str(text or "").replace("\n", " ").strip())[:max_chars]
+    scored = [(s, _score_sentence(s, role)) for s in sentences if len(s) > 5]
+    if not scored:
+        return sentences[0][:max_chars]
+    return max(scored, key=lambda x: x[1])[0][:max_chars]
+
+
 def _semantic_compress_turns(turns: list) -> str:
-    """M1193: Semantic compression of conversation turns.
-    Includes ALL user requests (U1, U2, ...) and conclusion line from each claude turn.
-    Claude conclusion = last non-empty paragraph's last line (the most conclusive statement).
-    Each segment trimmed to 180 chars. Output: 'U1: req | C1: result | U2: followup | C2: result'"""
-    import re as _re_sc
-
-    def _tr(t: str, n: int = 180) -> str:
-        return (str(t or "").replace("\n", " ").strip())[:n]
-
-    def _claude_conclusion(text: str) -> str:
-        paras = [p.strip() for p in str(text or "").split("\n\n") if p.strip()]
-        if not paras:
-            return _tr(text)
-        lines = [l.strip() for l in paras[-1].split("\n") if l.strip()]
-        return _tr(lines[-1] if lines else paras[-1])
-
+    """M1193 v2: Decision-anchored extractive compression (non-LLM SOTA).
+    Scores every sentence in each turn by signal density (decisions > code > errors > questions),
+    extracts the single most important sentence per turn.
+    Output: 'U1: <key-sentence> | C1: <key-sentence> | ...'"""
     u_idx = c_idx = 0
     parts = []
     for turn in (turns or []):
@@ -4270,10 +4294,10 @@ def _semantic_compress_turns(turns: list) -> str:
         text = turn.get("text") or turn.get("content") or ""
         if role == "user":
             u_idx += 1
-            parts.append(f"U{u_idx}: {_tr(text)}")
+            parts.append(f"U{u_idx}: {_extract_key_sentence(text, role)}")
         elif role == "claude":
             c_idx += 1
-            parts.append(f"C{c_idx}: {_claude_conclusion(text)}")
+            parts.append(f"C{c_idx}: {_extract_key_sentence(text, role)}")
     return " | ".join(parts) if parts else f"({len(turns)} turns)"
 
 
