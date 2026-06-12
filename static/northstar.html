@@ -2963,6 +2963,10 @@ function renderMilestoneCreator(projId, milestones) {
     .ss-mg-header-td:hover { background:var(--panel); }
 
     .ss-mg-header-tbody + tbody.ms-group:first-of-type td { border-top:none; }
+    /* M1227: hide spinner on blink-window-input */
+    #blink-window-input::-webkit-outer-spin-button,
+    #blink-window-input::-webkit-inner-spin-button { -webkit-appearance:none; margin:0; }
+    #blink-window-input { -moz-appearance:textfield; }
     /* M718: blink section bar when all queued work in section is complete */
     @keyframes ss-mg-blink-anim {
       0%, 100% { background: var(--panel-soft); }
@@ -8818,6 +8822,28 @@ function _resetSwimlaneZoom() {
 }
 
 
+// M1227: blink window — user-configurable visibility period (minutes).
+// Server is source-of-truth for blink state (48h prune); this is a client-side display filter.
+window._blinkWindowMin = window._blinkWindowMin || 60;
+function _applyBlinkWindow(n) {
+  if (!n || n < 1 || n > 1440) return;
+  window._blinkWindowMin = n;
+  fetch('/api/user-settings/blink_window_min', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({value:n})}).catch(()=>{});
+  delete _groupingFingerprint[window._openDetailProjId];
+  delete _msRenderFingerprint[window._openDetailProjId];
+  _fastReapplyGrouping(window._openDetailProjId);
+}
+document.addEventListener('DOMContentLoaded', () => {
+  fetch('/api/user-settings/blink_window_min', {cache:'no-store'}).then(r=>r.json()).then(d => {
+    const v = d && d.value ? parseInt(d.value) : null;
+    if (v && v >= 1 && v <= 1440) {
+      window._blinkWindowMin = v;
+      const inp = document.getElementById('blink-window-input');
+      if (inp) inp.value = v;
+    }
+  }).catch(()=>{});
+});
+
 function _fastReapplyGrouping(projId) {
   // M982: guard against stale async from previous card — dm-ms-creator belongs to current project only
   if (_activeDetailProjId && _activeDetailProjId !== projId) return;
@@ -10600,6 +10626,16 @@ function renderHierarchy(p) {
         <span class="dm-layer-title">Milestones</span>
         <span class="dm-layer-count" id="dm-ms-ack-badge"></span>
         <div style="margin-left:auto;display:flex;align-items:center;gap:6px">
+          <!-- M732/M1227: blink window — client-side age filter on server blink_state -->
+          <span style="display:inline-flex;align-items:center;gap:4px;padding:2px 7px 2px 6px;border:1px solid var(--panel-border);border-radius:10px;background:var(--panel-bg);opacity:.8;transition:opacity .15s" onmouseenter="this.style.opacity=1" onmouseleave="this.style.opacity='.8'" title="Blink visibility window (minutes) — blinks older than this are hidden" onclick="event.stopPropagation()">
+            <span style="font-size:9px;color:var(--text-dim);font-family:var(--mono);letter-spacing:.03em">blink</span>
+            <input id="blink-window-input" type="number" min="1" max="1440" step="1" value="60"
+              style="width:36px;font-size:11px;font-weight:600;padding:0;border:none;background:transparent;color:var(--accent);text-align:center;font-family:var(--mono);outline:none;-moz-appearance:textfield;appearance:textfield;-webkit-appearance:none"
+              onkeydown="if(event.key==='ArrowUp'||event.key==='ArrowDown'){event.preventDefault()}if(event.key==='Enter'){event.preventDefault();_applyBlinkWindow(parseInt(this.value));}"
+              onclick="event.stopPropagation()">
+            <button onclick="event.stopPropagation();_applyBlinkWindow(parseInt(document.getElementById('blink-window-input').value));"
+              style="font-size:9px;color:var(--accent);font-family:var(--mono);background:none;border:none;padding:0;cursor:pointer;font-weight:700" title="Apply blink interval">min</button>
+          </span>
           <!-- M658: Compute semantic scores button -->
           <button id="dm-semantic-score-btn" title="Compute semantic proximity scores for each stone (sentence-transformers)" onclick="event.stopPropagation();_triggerSemanticScore()" style="font-size:8px;padding:2px 7px;border-radius:3px;border:1px solid var(--panel-border);background:none;color:var(--text-dim);cursor:pointer;font-family:var(--mono);display:none">⊛ score</button>
         </div>
@@ -13486,13 +13522,16 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
 
     // M1227: simplified blink — server SQLite is single source of truth.
     // Server stamps blink_state on every stone status change; client reads it
-    // each poll cycle (fetched in loadMilestones). No localStorage, no count-delta,
-    // no soft window. Server prunes entries older than 48h.
+    // each poll cycle (fetched in loadMilestones). blink_window_min = user-settable
+    // display filter (default 60min); server prunes entries older than 48h.
     {
       window._ssBlinkMids = window._ssBlinkMids || {};
       const _sKey = ns ? (ns.id || '__ungrouped__') : '__ungrouped__';
       const _serverEntry = (window._blinkState && window._blinkState[_proj] && window._blinkState[_proj][_sKey]);
-      const _blinkMidsArr = (_serverEntry && Array.isArray(_serverEntry.mids)) ? _serverEntry.mids : [];
+      const _winMs = (window._blinkWindowMin || 60) * 60 * 1000;
+      const _entryAge = _serverEntry ? (Date.now() - (_serverEntry.ts || 0)) : Infinity;
+      const _inWindow = _serverEntry && _entryAge < _winMs;
+      const _blinkMidsArr = (_inWindow && Array.isArray(_serverEntry.mids)) ? _serverEntry.mids : [];
       if (_blinkMidsArr.length > 0) {
         hTd.classList.add('ss-mg-blink');
         window._ssBlinkMids[_sKey] = new Set(_blinkMidsArr);
