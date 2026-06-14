@@ -68,3 +68,15 @@ dist/
 # ── Backups ──────────────────────────────────────────────────────────────
 *.bak
 pyproject.toml.bak*
+backup-*/
+backup-nomcp-*/
+backup-terminal-*/
+*.pre-mcp-*
+
+# ── Runtime state ─────────────────────────────────────────────────────────
+.tg-last-sent.json
+ttyd-launch.sh
+ttyd-ports/
+
+# ── Private/internal ──────────────────────────────────────────────────────
+.omc/

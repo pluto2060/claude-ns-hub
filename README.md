@@ -101,6 +101,55 @@ hub install-global
 | **Drag-and-drop comments** | Drop files into stone comments; upload auto-appended as links |
 | **PyPI installable** | `pip install claude-ns-hub && claude-ns-hub` — done |
 
+## Troubleshooting
+
+### tmux not found
+```bash
+# Ubuntu / Debian / WSL
+sudo apt install tmux
+
+# macOS
+brew install tmux
+
+# Verify
+tmux -V
+```
+
+The hub auto-creates a `tmux` session named `claude-exec-<PROJECT>` when you dispatch work. If tmux is missing, exec sessions will fail silently — install it first.
+
+### Claude Code CLI not authenticated
+```bash
+# Check if installed
+claude --version
+
+# If missing, install via npm
+npm install -g @anthropic-ai/claude-code
+
+# Then authenticate
+claude login
+```
+
+The hub reads `claude` from your `PATH`. If you installed it via nvm or a custom path, set it in `~/.hub/config.yaml`:
+```yaml
+defaults:
+  claude_code_path: /full/path/to/claude
+```
+
+### Hub can't find my project
+Add the project manually via the UI (North Star → "+ node" → set `repo_path`) or use:
+```bash
+hub init <PROJECT_ID> --dir /path/to/your/project
+```
+
+### Hooks not firing
+```bash
+# Install hub hooks once per machine
+hub install-global
+
+# Verify hooks are registered in Claude settings
+cat ~/.claude/settings.json | grep hub
+```
+
 ## Metrics endpoint
 
 ```bash

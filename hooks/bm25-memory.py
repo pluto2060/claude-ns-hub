@@ -2110,42 +2110,59 @@ def main():
     )
     _skip_g2 = _prompt_lower in _TRIVIAL_PROMPTS or bool(_HUB_WAKE_PAT.search(_prompt_stripped))
 
-    # M59-HUB: when prompt is trivial, fetch current queued hub stone text and use
-    # THAT as the G2 query instead of skipping entirely. This makes CTX work correctly
-    # in hub-ctx sessions where "go" is the dispatch signal and the real intent is
-    # described in the stone text being worked on.
+    # M59-HUB: when prompt is trivial, use last-stone-query.json (written by
+    # stone-ctx-hook on every get_pending_task call) as G2 query — faster and
+    # more accurate than API call. Falls back to hub API (port 9001) if file
+    # is missing or stale (>300s).
     _hub_stone_query = None
+    _hub_stone_mid = None
     if _skip_g2:
+        # Primary: last-stone-query.json (written by stone-ctx-hook, always fresh)
         try:
-            import urllib.request as _url_req, re as _re_hub
-            # Try to detect hub project from project_dir name
-            _proj_name = os.path.basename(os.path.abspath(project_dir))
-            _hub_resp = _url_req.urlopen(
-                f"http://127.0.0.1:9001/api/northstar/{_proj_name}/milestones",
-                timeout=0.5
-            ).read().decode()
-            _hub_data = json.loads(_hub_resp)
-            _hub_ms = _hub_data.get("milestones", _hub_data) if isinstance(_hub_data, dict) else _hub_data
-            _queued = [m for m in _hub_ms
-                       if not m.get("done") and m.get("status") not in ("done", "pending_confirmation")
-                       and m.get("text", "").strip()
-                       and not m.get("text", "").startswith("[검수]")]
-            if _queued:
-                _stone = _queued[0]
-                _stone_text = _stone.get("text", "")[:200].strip()
-                # Also append latest user message from stone conversation for richer query
-                _stone_conv = _stone.get("conversation", [])
-                _last_user = next(
-                    (c.get("text", "") for c in reversed(_stone_conv)
-                     if c.get("role") == "user" and c.get("text", "").strip()),
-                    ""
-                )
-                if _last_user and _last_user.strip().lower() not in _TRIVIAL_PROMPTS:
-                    _stone_text = _stone_text + " " + _last_user[:100].strip()
-                _hub_stone_query = _stone_text
-                _hub_stone_mid = _stone.get("id", "?")  # track stone ID for display
+            import time as _time_sq
+            _sq_path = os.path.expanduser("~/.claude/last-stone-query.json")
+            if os.path.exists(_sq_path):
+                _sq_age = _time_sq.time() - os.path.getmtime(_sq_path)
+                if _sq_age < 300:  # fresh within 5 minutes
+                    _sq_data = json.loads(open(_sq_path).read())
+                    _sq_text = (_sq_data.get("query") or _sq_data.get("stone_text", "")).strip()
+                    if _sq_text:
+                        _hub_stone_query = _sq_text[:600]
+                        _hub_stone_mid = _sq_data.get("project", "?")
         except Exception:
             pass
+
+        # Fallback: hub API (port 9001) when file missing/stale
+        if not _hub_stone_query:
+            try:
+                import urllib.request as _url_req
+                _proj_name = os.path.basename(os.path.abspath(project_dir))
+                _hub_port = int(os.environ.get("HUB_PORT", "9001"))
+                _hub_resp = _url_req.urlopen(
+                    f"http://127.0.0.1:{_hub_port}/api/northstar/{_proj_name}/milestones",
+                    timeout=0.5
+                ).read().decode()
+                _hub_data = json.loads(_hub_resp)
+                _hub_ms = _hub_data.get("milestones", _hub_data) if isinstance(_hub_data, dict) else _hub_data
+                _queued = [m for m in _hub_ms
+                           if not m.get("done") and m.get("status") not in ("done", "pending_confirmation")
+                           and m.get("text", "").strip()
+                           and not m.get("text", "").startswith("[검수]")]
+                if _queued:
+                    _stone = _queued[0]
+                    _stone_text = _stone.get("text", "").strip()
+                    _stone_conv = _stone.get("conversation", [])
+                    _last_user = next(
+                        (c.get("text", "") for c in reversed(_stone_conv)
+                         if c.get("role") == "user" and c.get("text", "").strip()),
+                        ""
+                    )
+                    if _last_user and _last_user.strip().lower() not in _TRIVIAL_PROMPTS:
+                        _stone_text = _stone_text + " " + _last_user.strip()
+                    _hub_stone_query = _stone_text[:600]
+                    _hub_stone_mid = _stone.get("id", "?")
+            except Exception:
+                pass
     if _hub_stone_query:
         _skip_g2 = False  # don't skip — use stone text as query
     else:

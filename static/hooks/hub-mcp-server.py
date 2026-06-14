@@ -6,7 +6,7 @@ Exposes hub task dispatch/completion tools to Claude Code sessions.
 Usage (all args optional — auto-detected from env/CWD):
   python3 hub-mcp-server.py [--proj PROJ_ID] [--hub-url http://HOST:PORT]
 
-Priority: --arg → NS_HUB_PROJ/NS_HUB_URL env → SQLite repo_path CWD match → CWD basename
+Priority: --arg → NS_HUB_PROJ/NS_HUB_URL env → ~/.hub/config.yaml → default localhost:9001
 """
 import argparse
 import json
@@ -43,7 +43,10 @@ TOOLS = [
         "name": "get_pending_task",
         "description": (
             "Fetch the next queued task for this exec session (returns exactly 1 task). "
-            "Returns: has_task, task_id, text, conversation (compressed), queued_count. "
+            "M1242 Option D: response is structurally separated into 3 layers — "
+            "task = WHAT TO DO NOW (execute this), "
+            "context = conversation history (reference only, do NOT execute), "
+            "original_stone = the stone's original creation text (background only). "
             "has_task=false → idle, nothing to do. "
             "SKILL PROTOCOL: skill_refs non-empty → call Skill(skill=skill_refs[0]) FIRST before any other tool. "
             "_child_stone_required=true → call create_child_stone() for each sub-task FIRST."
@@ -56,10 +59,24 @@ TOOLS = [
             "CLOSE/COMPLETE a task (changes status). "
             "Mark task done and notify user. "
             "LANGUAGE RULE: summary must match the language of the user's stone input (Korean if user wrote Korean, English if English) — it appears as a stone comment. "
+            "DOCUMENT LANGUAGE RULE (ENFORCED): when generating any document (Excel, docx, CSV, report), use the SAME language as the user's stone request. "
+            "Korean stone → Korean headers/column names/content. English stone → English headers/content. "
+            "Technical terms (SHA, API, URL, endpoint names) may remain English. File names stay ASCII. "
             "CHILD STONE PRE-CHECK: decomposition tasks (자녀 스톤/분해/sub-task) → call create_child_stone() for each sub-task FIRST. "
-            "RESULT RULE: produced a file/image/doc/Excel? Upload first: "
-            "rclone copy <file> 'gdrive:claude-shared/<proj>/outbox/' && rclone link → pass URL as evidence_url. "
-            "Omitting evidence_url for result-producing tasks is a failure."
+            "RESULT RULE — If the stone text contains any Layer A keyword, you MUST upload before calling this tool: "
+            "Layer A (server blocks completion — MUST upload): excel/엑셀/pdf/docx/스크린샷/screenshot/보고서/report/chart/이미지/image/분석결과. "
+            "Layer B (warning only, not blocked): 구현/추가/수정/개선/기능. "
+            "UPLOAD STEPS (run in Bash tool, capture output): "
+            "① rclone copy <file> 'gdrive:claude-shared/<proj>/outbox/' "
+            "② GDRIVE_URL=$(rclone lsjson 'gdrive:claude-shared/<proj>/outbox/' --include '<filename>' "
+            "   | python3 -c \"import sys,json;d=json.load(sys.stdin);items=[x for x in d if not x.get('IsDir',False)];print('https://drive.google.com/file/d/'+items[0]['ID']+'/view?usp=sharing') if items else print('')\") "
+            "   echo $GDRIVE_URL "
+            "③ pass the printed URL as evidence_url= in THIS call — NOT in summary text. "
+            "FILENAME RULE: name output files as M{ID}-{suffix}.{ext} where suffix is a short descriptor or date (e.g. -v2, -YYYYMMDD, -review, -draft). "
+            "For updates, delete the old GDrive file (rclone deletefile) then re-upload so a new GDrive ID is always assigned. "
+            "NOTE: rclone link returns open?id= format which may prompt login on some devices. "
+            "The sed conversion to /file/d/.../view?usp=sharing is the universally accessible format. "
+            "If you already called this tool and got requires_evidence=True: re-run steps ①② then call again with evidence_url."
         ),
         "inputSchema": {
             "type": "object",
@@ -67,7 +84,8 @@ TOOLS = [
                 "task_id": {"type": "string"},
                 "summary": {"type": "string", "description": "One-line past-tense summary, max 120 chars — match user's stone input language"},
                 "status": {"type": "string", "enum": ["pending_confirmation", "skipped"], "description": "default: pending_confirmation"},
-                "evidence_url": {"type": "string", "description": "GDrive URL of result artifact — shows as 'result' badge on the stone."},
+                "evidence_url": {"type": "string", "description": "GDrive URL from `rclone link` output — paste here, NOT inside summary text. REQUIRED for Layer A stones; omitting returns ok=False."},
+                "evidence_filename": {"type": "string", "description": "Local filename of the uploaded file (e.g. 'M1234-report.xlsx'). Pass this so the UI shows the real filename instantly without a GDrive API call."},
             },
             "required": ["task_id", "summary"],
         },
@@ -90,6 +108,24 @@ TOOLS = [
         },
     },
     {
+        "name": "compress_summary",
+        "description": (
+            "SUMMARY-ONLY: attach a conversation summary to a stone WITHOUT touching conversation/status. "
+            "Use ONLY for [compress] meta-tasks — read parent stone's full conversation, write a concise summary, "
+            "call with the PARENT stone's task_id (not the meta-task id). "
+            "evidence_url belongs in report_task_complete, not here. "
+            "Updates summary_state.last_compressed_len so compress won't re-fire until conversation grows further."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "summary": {"type": "string", "description": "Concise 3-8 line summary of the conversation's key decisions, constraints, and open items. Required."},
+            },
+            "required": ["task_id", "summary"],
+        },
+    },
+    {
         "name": "get_task_details",
         "description": "Get full details + conversation history for a specific task. Use when more context is needed. Returns error key if task_id not found.",
         "inputSchema": {
@@ -104,7 +140,8 @@ TOOLS = [
             "Register a child sub-stone in the hub. "
             "CALL WHEN: task has 자녀 스톤/분해/sub-task/child stone keywords, or _child_stone_required=true. "
             "CRITICAL: reply_to_stone claiming stones exist ≠ calling this. Only THIS tool creates them. "
-            "N sub-tasks → call N times. WORKFLOW: create_child_stone × N → implement → report_task_complete."
+            "N sub-tasks → call N times. WORKFLOW: create_child_stone × N → implement → report_task_complete. "
+            "EXAMPLE: parent M123 needs 3 substeps → call create_child_stone(parent_id='M123', text='[1/3] DB schema migration', status='queued') × 3 → then implement each → report_task_complete on each child + parent."
         ),
         "inputSchema": {
             "type": "object",
@@ -250,17 +287,30 @@ def handle_get_pending_task(proj_id: str, hub_url: str) -> dict:
         # (UI fetches full history from /api/northstar/{proj}/milestones).
         _full_conv = stone.get("conversation") or []
         _llm_conv = _compress_conv_for_llm(_full_conv, threshold=5, keep_last=4)
+        # M1242 Option D: structural separation — extract last user comment as authoritative task.
+        # _full_conv used (not compressed) so primary task is never lost to compression.
+        _last_user_comment = None
+        for _turn in reversed(_full_conv):
+            if isinstance(_turn, dict) and _turn.get("role") == "user":
+                _last_user_comment = _turn.get("text", "").strip()
+                break
+        _stone_text = stone.get("text", "")
+        # task = last user comment (if present) else original stone text — this is WHAT TO DO NOW
+        _task = _last_user_comment if _last_user_comment else _stone_text
         # M1114: surface skill_refs as a structured field (not buried in text annotations)
         _srefs = stone.get("skill_refs") or ([stone["skill_ref"]] if stone.get("skill_ref") else [])
-        # M1212 P1a: sparse response — drop low-value fields (substar, added_at, conversation_full_count)
-        # to reduce per-call token cost (dominant context cost driver per expert-research plan).
+        # M1242: 3-layer structural response — task/context/original_stone
         result = {
             "has_task": True,
             "task_id": stone.get("id"),
-            "text": stone.get("text", ""),
-            "conversation": _llm_conv,
+            "task": _task,                  # M1242: EXECUTE THIS — last user comment or original stone
+            "context": _llm_conv,           # M1242: reference history only (do not execute)
+            "original_stone": _stone_text,  # M1242: stone creation text (background)
             "queued_count": len(queued),
         }
+        # Backward compat: keep text/conversation for any callers that read them
+        result["text"] = _stone_text
+        result["conversation"] = _llm_conv
         if _srefs:
             result["skill_refs"] = _srefs
             # Compact skill instruction (was ~40 tokens, now ~15)
@@ -299,6 +349,7 @@ def handle_report_task_complete(
     task_id: str, summary: str,
     status: str = "pending_confirmation",
     evidence_url: str = "",
+    evidence_filename: str = "",
 ) -> dict:
     try:
         patch = {
@@ -310,23 +361,45 @@ def handle_report_task_complete(
         # M1133: pass evidence_url so the 'result' badge appears on the stone
         if evidence_url:
             patch["evidence_url"] = evidence_url
+        # M1304: pass local filename so server can cache it — avoids GDrive API call in UI
+        if evidence_filename:
+            patch["evidence_filename"] = evidence_filename
         result = _hub_request(
             f"{hub_url}/api/northstar/{proj_id}/milestones/{task_id}",
             method="PATCH",
             body=patch,
         )
         resp = {"ok": result.get("ok", False), "task_id": task_id, "status": status}
-        # M1145: surface proof_warning from server — exec session must upload evidence_url and retry
-        if result.get("proof_warning"):
+        # M1265: Layer A (artifact noun) → force block; Layer B (action verb) → warning only
+        if result.get("requires_evidence"):
+            # Layer A: artifact keyword detected — must upload before completing
             resp["ok"] = False
             resp["requires_evidence"] = True
+            resp["next_action"] = "UPLOAD_THEN_RETRY"
             resp["error"] = (
-                "evidence_url MISSING — result badge will not appear. "
-                "Upload the result file first: "
-                "rclone copy <file> 'gdrive:claude-shared/<proj>/outbox/' && "
-                "rclone link 'gdrive:claude-shared/<proj>/outbox/<filename>' → "
-                "then call report_task_complete again with evidence_url=<link>."
+                "LAYER_A_BLOCKED: evidence_url is REQUIRED for this stone (artifact keyword detected). "
+                "MANDATORY NEXT STEPS — do NOT skip: "
+                "① rclone copy <your_file> 'gdrive:claude-shared/<proj>/outbox/' "
+                "② RAW=$(rclone link 'gdrive:claude-shared/<proj>/outbox/<filename>') "
+                "   GDRIVE_URL=$(echo $RAW | sed 's|drive\\.google\\.com/open?id=\\(.*\\)|drive.google.com/file/d/\\1/view?usp=sharing|') "
+                "③ call report_task_complete(task_id=..., summary=..., evidence_url=GDRIVE_URL) again. "
+                "Task is NOT completed until evidence_url is provided."
             )
+        elif result.get("output_check"):
+            # M1277: Layer B soft gate — server flagged _output_check.
+            # Prompt Claude to actively confirm whether output was produced.
+            resp["ok"] = True
+            resp["output_check"] = True
+            resp["next_action"] = (
+                "OUTPUT_CHECK: Layer B keyword detected. "
+                "Did this task produce a shareable output (file, chart, table, analysis doc)? "
+                "YES → upload via rclone and call report_task_complete again with evidence_url=<url>. "
+                "NO → task is complete, no further action needed."
+            )
+        elif result.get("proof_warning"):
+            # Layer B fallback warning (no output_check flag set)
+            resp["ok"] = True
+            resp["proof_warning"] = "Layer B: evidence_url missing — result badge will not show. Provide evidence_url if a file was produced."
         return resp
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -347,7 +420,7 @@ def handle_get_session_overview(proj_id: str, hub_url: str) -> dict:
         ]
         pending_replies = [
             m for m in milestones
-            if _awaits_user(m)
+            if _awaits_user(m) and not m.get("done")
         ]
         clarifications = [
             m for m in milestones
@@ -396,6 +469,89 @@ def handle_reply_to_stone(proj_id: str, hub_url: str, task_id: str, message: str
         return {"ok": False, "error": str(e)}
 
 
+def handle_attach_artifact(
+    proj_id: str, hub_url: str, task_id: str,
+    summary: str = ""
+) -> dict:
+    """Summary-only attach for [compress] meta-tasks — no append_message, bypasses M190. evidence_url goes in report_task_complete."""
+    if not summary:
+        return {"ok": False, "error": "summary is required (attach_artifact is summary-only; use report_task_complete for evidence_url)"}
+    patch: dict = {}
+    s_len = len(summary.strip())
+    if s_len < 100:
+        return {"ok": False, "error": f"summary too short ({s_len} chars) — minimum 100 chars required"}
+    if s_len > 8000:
+        return {"ok": False, "error": f"summary too long ({s_len} chars) — maximum 8000 chars; condense further"}
+    try:
+        stone_data = _hub_request(f"{hub_url}/api/northstar/{proj_id}/milestones/{task_id}")
+        conv = stone_data.get("conversation") or []
+        conv_text = " ".join((m.get("text") or "") for m in conv if isinstance(m, dict))
+        if conv_text:
+            max_proportional = max(8000, int(len(conv_text) * 0.4))
+            if s_len > max_proportional:
+                return {"ok": False, "error": (
+                    f"summary too long ({s_len} chars) — exceeds 40% of conversation length "
+                    f"({len(conv_text)} chars). Max allowed: {max_proportional}. Condense further."
+                )}
+    except Exception:
+        pass
+    patch["conversation_summary"] = summary
+    patch["summary_state_bump"] = True
+    try:
+        result = _hub_request(
+            f"{hub_url}/api/northstar/{proj_id}/milestones/{task_id}",
+            method="PATCH",
+            body=patch,
+        )
+        # Auto-close the compress child stone so no separate report_task_complete needed.
+        # Find the queued .cmp* child of this parent and mark it pending_confirmation → server auto-dones it.
+        try:
+            all_data = _hub_request(f"{hub_url}/api/northstar/{proj_id}/milestones")
+            all_stones = all_data if isinstance(all_data, list) else all_data.get("milestones", [])
+            cmp_child = next(
+                (m for m in all_stones
+                 if str(m.get("id", "")).startswith(task_id + ".cmp")
+                 and m.get("status") == "queued"
+                 and not m.get("done")),
+                None,
+            )
+            if cmp_child:
+                # R2 fix: lock parent with held=True before auto-confirming child,
+                # so M194/M479 user-comment reset cannot flip parent back to queued
+                # during the brief window between child PATCH and server auto-done.
+                try:
+                    _hub_request(
+                        f"{hub_url}/api/northstar/{proj_id}/milestones/{task_id}",
+                        method="PATCH",
+                        body={"held": True},
+                    )
+                except Exception:
+                    pass
+                try:
+                    _hub_request(
+                        f"{hub_url}/api/northstar/{proj_id}/milestones/{cmp_child['id']}",
+                        method="PATCH",
+                        body={"status": "pending_confirmation", "model_used": "claude-mcp",
+                              "pending_confirm_at": datetime.datetime.now().isoformat(),
+                              "append_message": {"role": "claude", "text": "압축 완료."}},
+                    )
+                finally:
+                    # Release hold after child PATCH so parent becomes editable again.
+                    try:
+                        _hub_request(
+                            f"{hub_url}/api/northstar/{proj_id}/milestones/{task_id}",
+                            method="PATCH",
+                            body={"held": False},
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return {"ok": result.get("ok", False), "task_id": task_id}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def handle_get_task_details(proj_id: str, hub_url: str, task_id: str) -> dict:
     try:
         data = _hub_request(f"{hub_url}/api/northstar/{proj_id}/milestones")
@@ -437,149 +593,6 @@ def handle_create_child_stone(
         return {"ok": False, "error": str(e)}
 
 
-# M1149 v2: subprocess wrappers exposing CTX memory hooks as PULL-mode MCP tools.
-# Each tool spawns the existing hook script with synthesized stdin JSON and captures
-# its additionalContext output (the same payload it would have PUSH-injected).
-import subprocess
-import os as _os
-
-_HOOKS_DIR = _os.path.dirname(_os.path.abspath(__file__))
-_CHAT_MEMORY = _os.path.join(_HOOKS_DIR, "chat-memory.py")
-_BM25_MEMORY = _os.path.join(_HOOKS_DIR, "bm25-memory.py")
-_PY = "/usr/bin/python3.10"
-
-def _run_hook(script_path: str, stdin_payload: dict, extra_args: list = None, timeout: int = 10) -> dict:
-    """Spawn a hook script, feed it JSON on stdin, capture stdout JSON (additionalContext payload)."""
-    if not _os.path.exists(script_path):
-        return {"ok": False, "error": f"hook not found: {script_path}"}
-    try:
-        cmd = [_PY, script_path] + (extra_args or [])
-        proc = subprocess.run(
-            cmd,
-            input=json.dumps(stdin_payload),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        # Hook protocol: stdout may be empty (no result) or JSON {hookSpecificOutput:{additionalContext:...}}
-        out = (proc.stdout or "").strip()
-        if not out:
-            return {"ok": True, "results": [], "raw": "", "stderr": (proc.stderr or "")[:200]}
-        try:
-            parsed = json.loads(out)
-        except Exception:
-            return {"ok": True, "results": [], "raw": out[:4000]}
-        ctx = (parsed.get("hookSpecificOutput") or {}).get("additionalContext") or ""
-        return {"ok": True, "additionalContext": ctx, "raw_keys": list(parsed.keys())}
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": "hook timeout"}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-def handle_get_recent_chats(proj_id: str, hub_url: str, query: str, limit: int = 5, cwd: str = None) -> dict:
-    """CM: query chat-memory.py for past Claude chat snippets matching the query."""
-    payload = {
-        "prompt": query,
-        "cwd": cwd or _os.getcwd(),
-        "session_id": "mcp-pull",
-    }
-    res = _run_hook(_CHAT_MEMORY, payload, timeout=8)
-    res["tool"] = "get_recent_chats"
-    res["query"] = query
-    return res
-
-
-def handle_search_decision_history(proj_id: str, hub_url: str, query: str, since_days: int = None, cwd: str = None) -> dict:
-    """G1: BM25 search over decisions/commits/world-model via bm25-memory.py."""
-    payload = {
-        "prompt": query,
-        "cwd": cwd or _os.getcwd(),
-        "session_id": "mcp-pull",
-    }
-    if since_days is not None:
-        payload["since_days"] = since_days
-    res = _run_hook(_BM25_MEMORY, payload, extra_args=["--rich"], timeout=12)
-    res["tool"] = "search_decision_history"
-    res["query"] = query
-    return res
-
-
-def handle_search_codespace(proj_id: str, hub_url: str, query: str, limit: int = 5, cwd: str = None) -> dict:
-    """G2: code/space graph search — bm25-memory.py without --rich (graph-only)."""
-    payload = {
-        "prompt": query,
-        "cwd": cwd or _os.getcwd(),
-        "session_id": "mcp-pull",
-    }
-    res = _run_hook(_BM25_MEMORY, payload, timeout=10)
-    res["tool"] = "search_codespace"
-    res["query"] = query
-    return res
-
-
-# M1149 v3: unified search_memory(scope) MCP tool — MECE-correct dispatcher with
-# in-wrapper splitting of bm25-memory output by section markers ("G1" / "G2").
-def _split_g1_g2(additional_context: str) -> dict:
-    """Parse bm25-memory additionalContext and split G1 / G2 / leftover sections."""
-    import re
-    out = {"g1": "", "g2": "", "leftover": ""}
-    if not additional_context:
-        return out
-    lines = additional_context.split("\n")
-    cur = "leftover"
-    buf = {"g1": [], "g2": [], "leftover": []}
-    for line in lines:
-        if re.match(r"^\s*>?\s*\*\*G1\*\*", line):
-            cur = "g1"; buf["g1"].append(line); continue
-        if re.match(r"^\s*>?\s*\*\*G2\*\*", line):
-            cur = "g2"; buf["g2"].append(line); continue
-        if re.match(r"^\s*>?\s*\*\*CM\*\*", line):
-            cur = "leftover"; buf["leftover"].append(line); continue
-        buf[cur].append(line)
-    out["g1"] = "\n".join(buf["g1"]).strip()
-    out["g2"] = "\n".join(buf["g2"]).strip()
-    out["leftover"] = "\n".join(buf["leftover"]).strip()
-    return out
-
-
-def handle_search_memory(proj_id: str, hub_url: str, query: str, scope: str = "all",
-                        limit: int = 5, cwd: str = None) -> dict:
-    """Unified MECE memory search — dispatches by scope.
-    scope='chat' → CM only (chat-memory.py)
-    scope='time' → G1 only (bm25-memory, --rich, G1 section)
-    scope='space' → G2 only (bm25-memory, G2 section)
-    scope='all'   → CM + G1 + G2 combined, sectioned"""
-    scope = (scope or "all").lower().strip()
-    if scope not in ("chat", "time", "space", "all"):
-        scope = "all"
-    payload = {"prompt": query, "cwd": cwd or _os.getcwd(), "session_id": "mcp-pull"}
-    result = {"ok": True, "tool": "search_memory", "scope": scope, "query": query}
-
-    if scope in ("chat", "all"):
-        cm_res = _run_hook(_CHAT_MEMORY, payload, timeout=8)
-        result["chat"] = (cm_res.get("additionalContext") or "").strip()
-        result["chat_ok"] = cm_res.get("ok", False)
-
-    if scope in ("time", "space", "all"):
-        bm_res = _run_hook(_BM25_MEMORY, payload, extra_args=["--rich"], timeout=12)
-        split = _split_g1_g2(bm_res.get("additionalContext") or "")
-        if scope in ("time", "all"):
-            result["time"] = split["g1"]
-        if scope in ("space", "all"):
-            result["space"] = split["g2"]
-        if scope == "all":
-            result["leftover"] = split["leftover"]
-        result["bm25_ok"] = bm_res.get("ok", False)
-
-    # MECE summary
-    result["sections_present"] = sorted([
-        k for k in ("chat", "time", "space")
-        if k in result and result.get(k)
-    ])
-    return result
-
-
 def send(obj: dict):
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
@@ -609,7 +622,17 @@ def main():
     parser.add_argument("--hub-url", default=None)
     args = parser.parse_args()
 
-    hub_url = (args.hub_url or os.environ.get("NS_HUB_URL") or "http://localhost:9001").rstrip("/")
+    # M1236: resolve hub URL — priority: --arg > env > ~/.hub/config.yaml > default
+    def _hub_url_from_config() -> str:
+        try:
+            import yaml
+            cfg_path = Path.home() / ".hub" / "config.yaml"
+            with open(cfg_path) as _f:
+                _cfg = yaml.safe_load(_f) or {}
+            return (_cfg.get("defaults", {}) or {}).get("hub_url") or ""
+        except Exception:
+            return ""
+    hub_url = (args.hub_url or os.environ.get("NS_HUB_URL") or _hub_url_from_config() or "http://localhost:9001").rstrip("/")
     proj_id = args.proj or os.environ.get("NS_HUB_PROJ") or _detect_proj_id()
 
     for raw_line in sys.stdin:
@@ -655,6 +678,11 @@ def main():
                         task_id=tool_args.get("task_id", ""),
                         message=tool_args.get("message", ""),
                     )
+                elif tool_name in ("compress_summary", "attach_artifact"):
+                    result = handle_attach_artifact(proj_id, hub_url,
+                        task_id=tool_args.get("task_id", ""),
+                        summary=tool_args.get("summary", ""),
+                    )
                 elif tool_name == "report_task_complete":
                     # M1115: normalize status — non-Claude models may send "done" or "complete"; map to valid values
                     raw_status = tool_args.get("status", "pending_confirmation")
@@ -667,6 +695,7 @@ def main():
                         summary=tool_args.get("summary", ""),
                         status=raw_status,
                         evidence_url=tool_args.get("evidence_url", ""),
+                        evidence_filename=tool_args.get("evidence_filename", ""),
                     )
                 elif tool_name == "get_task_details":
                     result = handle_get_task_details(proj_id, hub_url, tool_args.get("task_id", ""))

@@ -654,7 +654,16 @@ header {
 @media (max-width: 640px) {
   /* M1106 v7: rolled back v4 D-layer. Option C kept for chat-reply; added font-size:16px
      for stone-text contenteditable (.nt-text) which was also auto-zooming on focus. */
-  input, textarea, select, [contenteditable="true"] {
+  /* M1285: global iOS zoom prevention — font-size>=16px prevents auto-zoom on focus for all inputs */
+  input, textarea {
+    font-size: 16px !important;
+    touch-action: manipulation;
+    -webkit-user-select: text;
+  }
+  select {
+    touch-action: manipulation;
+  }
+  [contenteditable="true"] {
     touch-action: manipulation;
     -webkit-user-select: text;
   }
@@ -666,6 +675,13 @@ header {
     width: 160% !important;
     margin-left: 0;
   }
+  /* M1285: ns-add-input (add stone modal) — scale trick keeps visual 12px while computed=16px. */
+  .ns-add-input {
+    font-size: 16px !important;
+    transform: scale(0.75);
+    transform-origin: left center;
+    width: 133% !important;
+  }
   /* M1168: stone-text contenteditable — option C scale trick same as chat reply.
      Keeps design 12.5px look but computed 16px so iOS doesn't auto-zoom on focus. */
   .nt-text {
@@ -673,6 +689,80 @@ header {
     transform: scale(0.781);  /* 12.5/16 = 0.781 keeps visual 12.5px */
     transform-origin: left top;
     width: 128% !important;   /* compensate scale */
+  }
+  /* M1285 scale trick — restore visual size for all remaining inputs (font-size forced to 16px by global rule above).
+     Formula: scale = original_px / 16, width = 100% / scale (rounded), transform-origin: left center */
+
+  /* 12px inputs: hp-input (hub prompt), ns-ssm-input (add child by stone ID) */
+  #hp-input, #ns-ssm-input {
+    transform: scale(0.75);
+    transform-origin: left center;
+    width: 133% !important;
+  }
+  /* 10px inputs: ss-add-name/metric/target (sub-star add modal), ss-edit-name (sub-star edit) */
+  #ss-add-name, #ss-add-metric, #ss-add-target, #ss-edit-name {
+    transform: scale(0.625);
+    transform-origin: left center;
+    width: 160% !important;
+  }
+  /* 9px inputs: ss-agt-search (agent search), ss-agt-role-input, ss-agt-constraints-input, sb-search (skill browser), sb-flag-input */
+  #ss-agt-search, #ss-agt-role-input, #ss-agt-constraints-input, #sb-search, #sb-flag-input {
+    transform: scale(0.5625);
+    transform-origin: left center;
+    width: 177% !important;
+  }
+  /* 11px: _branch-suffix (branch name — full width modal input) */
+  #_branch-suffix {
+    transform: scale(0.6875);
+    transform-origin: left center;
+    width: 145% !important;
+  }
+  /* 11px: blink-window-input — fixed 36px width, no width expand (would break layout) */
+  #blink-window-input {
+    transform: scale(0.6875);
+    transform-origin: center center;
+  }
+  /* 13px: ns-rename-input — fixed 160px width, no width expand */
+  #ns-rename-input {
+    transform: scale(0.8125);
+    transform-origin: left center;
+    width: 123% !important;
+  }
+  /* 10px: ss-item-inp — dynamic item row inputs in ss-edit modal */
+  .ss-item-inp {
+    transform: scale(0.625);
+    transform-origin: left center;
+    width: 160% !important;
+  }
+  /* 10px: sess-suffix-inp — new session suffix input */
+  .sess-suffix-inp {
+    transform: scale(0.625);
+    transform-origin: left center;
+    width: 160% !important;
+  }
+  /* 11px: sess-name-inp — branch/rename session name inputs */
+  .sess-name-inp {
+    transform: scale(0.6875);
+    transform-origin: left center;
+    width: 145% !important;
+  }
+  /* 10px: model-key-inp — custom avatar model key input */
+  .model-key-inp {
+    transform: scale(0.625);
+    transform-origin: left center;
+    width: 160% !important;
+  }
+  /* 9px: model-url-inp — custom avatar URL inputs, settings generic inputs */
+  .model-url-inp {
+    transform: scale(0.5625);
+    transform-origin: left center;
+    width: 177% !important;
+  }
+  /* 11px: settings-inp — generic settings text inputs */
+  .settings-inp {
+    transform: scale(0.6875);
+    transform-origin: left center;
+    width: 145% !important;
   }
   /* .layout is the scroll container on mobile — same as desktop */
   .layout { display: block; height: 100vh; overflow-y: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; scroll-padding-bottom: 120px; }
@@ -837,21 +927,27 @@ header {
   #dm-xterm .xterm-screen { touch-action: none !important; }
   #dm-xterm canvas { touch-action: none !important; }
   #dm-xterm .xterm-viewport {
-    overflow-y: scroll !important; -webkit-overflow-scrolling: touch !important; touch-action: pan-y !important;
-    /* M107: visible scrollbar on mobile — thick enough to tap, opaque enough to see */
-    scrollbar-width: auto; scrollbar-color: rgba(200,180,160,.75) rgba(40,38,34,.6);
+    /* M1263 v2: hidden on mobile — JS scrollLines() owns all scrolling; native viewport scroll
+       was competing with touchmove handler and blocking at scrollTop limits */
+    overflow-y: hidden !important; touch-action: none !important;
+    scrollbar-width: none;
   }
-  #dm-xterm .xterm-viewport::-webkit-scrollbar { width: 12px; background: rgba(40,38,34,.6); border-radius: 6px; }
-  #dm-xterm .xterm-viewport::-webkit-scrollbar-thumb { background: rgba(200,180,160,.75); border-radius: 6px; border: 2px solid rgba(40,38,34,.6); min-height: 40px; }
-  #dm-xterm .xterm-viewport::-webkit-scrollbar-thumb:active { background: rgba(200,180,160,.95); }
+  #dm-xterm .xterm-viewport::-webkit-scrollbar { display: none !important; }
+  /* M1259 v2: scrollbar rules moved outside @media so desktop also gets the slim 6px style */
   /* Ensure scrollbar space is always reserved so content doesn't jump */
-  #dm-xterm .xterm-viewport { scrollbar-gutter: stable; }
+  /* M1259 v3: scrollbar-gutter removed — was reserving 10px gutter even when our rule says 6px */
   #dm-xterm { touch-action: none !important; }
   /* Text selection */
   #dm-xterm .xterm-rows span { -webkit-user-select: text !important; user-select: text !important; }
   #dm-xterm .xterm-rows { touch-action: none !important; -webkit-user-select: text !important; }
   /* Paste button visible */
   #ns-terminal-drag-hdr { flex-wrap: wrap; gap: 6px; }
+}
+/* M1259 v2: slim xterm scrollbar — desktop only (mobile hides via pointer:coarse block) */
+@media (pointer: fine) {
+  #dm-xterm .xterm-viewport::-webkit-scrollbar { width: 6px; background: rgba(40,38,34,.5); border-radius: 3px; }
+  #dm-xterm .xterm-viewport::-webkit-scrollbar-thumb { background: rgba(200,180,160,.75); border-radius: 3px; border: 0; }
+  #dm-xterm .xterm-viewport::-webkit-scrollbar-thumb:active { background: rgba(200,180,160,.95); }
 }
 /* M1014: special-key buttons for the terminal top bar (mobile keyboards lack ESC/arrows/Tab) */
 .tk-btn { background:none; border:1px solid #555; border-radius:4px; color:#cc785c;
@@ -874,7 +970,8 @@ header {
   min-height:32px; min-width:0; text-align:center;
   overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
   user-select:none; -webkit-tap-highlight-color:transparent;
-  touch-action:manipulation; /* M1065: prevent iOS double-tap zoom, ensure immediate touch response */ }
+  touch-action:manipulation; /* M1065: prevent iOS double-tap zoom, ensure immediate touch response */
+  -webkit-user-select:none; } /* M1283: prevents focus-ring on iOS tap */
 /* Phone widths: shrink font so 12-key rows still legible. */
 @media (max-width: 420px) {
   .vkbd-key { font-size:10px; padding:6px 1px; min-height:28px; }
@@ -1079,13 +1176,6 @@ header {
   animation: sess-pulse 3s ease-in-out infinite; flex-shrink: 0;
 }
 
-/* CTX activity strip */
-.ctx-strip { display: flex; flex-direction: column; gap: 3px; }
-.ctx-item { display: flex; align-items: center; gap: 7px; font-size: 11px;
-  font-family: var(--mono); color: var(--text-dim); padding: 2px 0; }
-.ctx-heat { width: 24px; height: 3px; border-radius: 1px; background: var(--bg-deep); flex-shrink: 0; }
-.ctx-heat-fill { height: 100%; border-radius: 1px; background: var(--accent); }
-.ctx-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* Inline alignment result */
 .align-inline {
@@ -1415,6 +1505,7 @@ header {
         <button class="refresh-btn" id="priority-toggle-btn" onclick="togglePriorityPointer()" style="display:none">+ pointer</button>
         <!-- M789: config moved between avatar and notify(tg) -->
         <button class="refresh-btn" onclick="_showHubConfigModal()" title="Hub settings: CLI paths, default agent/model">config</button>
+
         <!-- M963: Tailscale status button — shows current hub URL / IP -->
         <button class="refresh-btn" id="tailscale-btn" onclick="_showTailscaleInfo()" title="Hub network URL (Tailscale / local)">ts —</button>
         <!-- M261: notify button removed from top bar -->
@@ -1438,6 +1529,20 @@ header {
         </div>
       </div>
       <div id="action-log-body" style="overflow-y:auto;max-height:360px;padding:4px 0"></div>
+    </div>
+    <!-- M1265: rclone onboarding banner — hidden by default, shown if rclone/gdrive not configured -->
+    <div id="rclone-onboard-banner" style="display:none;margin:8px 12px;padding:10px 14px;background:rgba(255,152,0,.1);border:1px solid rgba(255,152,0,.5);border-radius:6px;font-size:12px;color:var(--text)">
+      <span style="font-weight:600;color:#e65100">⚠ rclone not configured</span>
+      — Evidence URL uploads (result badge) require rclone + Google Drive.
+      <span style="margin-left:8px">
+        <a href="https://rclone.org/install.sh" target="_blank" style="color:var(--accent)">Install rclone</a>
+        &nbsp;→&nbsp;
+        <code style="background:var(--input-bg);padding:1px 5px;border-radius:3px;font-size:11px">rclone config</code>
+        &nbsp;→ n → name: <code style="background:var(--input-bg);padding:1px 5px;border-radius:3px;font-size:11px">gdrive</code> → Google Drive → OAuth
+        &nbsp;→&nbsp;
+        <code style="background:var(--input-bg);padding:1px 5px;border-radius:3px;font-size:11px">rclone lsd gdrive:</code> to verify
+      </span>
+      <button onclick="document.getElementById('rclone-onboard-banner').style.display='none'" style="float:right;background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:13px">×</button>
     </div>
     <div class="grid-wrap">
       <div class="ns-swimlane" id="ns-swimlane" style="position:relative">
@@ -1635,7 +1740,7 @@ header {
        M1014 v4: each row sets --vkbd-cols to its own key count so the row evenly
        distributes ALL keys with NO wrap (CSS @media shrinks key padding on phones). -->
   <div id="ns-vkbd">
-    <div class="vkbd-row" style="--vkbd-cols:10">
+    <div class="vkbd-row" style="--vkbd-cols:11">
       <!-- esc/tab restored to nav row (M1228: input bar removed) -->
       <button class="vkbd-key" onclick="_sendKey('\x1b')" title="Escape">esc</button>
       <button class="vkbd-key" onclick="_sendKey('\t')" title="Tab">tab</button>
@@ -1647,6 +1752,8 @@ header {
       <button class="vkbd-key" onclick="_sendKey('\x1b[F')" title="End">end</button>
       <button class="vkbd-key" onclick="_sendKey('\x1b[5~')" title="Page Up">pgup</button>
       <button class="vkbd-key" onclick="_sendKey('\x1b[6~')" title="Page Down">pgdn</button>
+      <!-- M1249: Enter key — most-used key on mobile, was missing -->
+      <button class="vkbd-key" style="background:#3a2a22;border-color:#cc785c;color:#ff9966;font-weight:bold" onclick="_sendKey('\r')" title="Enter">&#9166;</button>
     </div>
     <div class="vkbd-row" style="--vkbd-cols:10">
       <button class="vkbd-key mod danger" onclick="_sendKey('\x03')" title="Ctrl-C (interrupt)">^C</button>
@@ -1789,7 +1896,6 @@ header {
 
 let projects = [];
 let activeIdx = null;
-let ctxTopics = [];
 
 // M140: update the watching pill in the header bar (visible on mobile)
 function _updateWatchPill() {
@@ -1866,7 +1972,6 @@ async function loadData() {
     ]);
     projects = await projRes.json();
     window.projects = projects;  // M1199: expose globally for move-to-project picker
-    ctxTopics = [];
 
     projects.forEach(p => {
       p.milestones = p.milestones || [];
@@ -2972,13 +3077,22 @@ function renderMilestoneCreator(projId, milestones) {
       0%, 100% { background: var(--panel-soft); }
       40%, 60% { background: rgba(123,211,173,.18); }
     }
-    .ss-mg-header-td.ss-mg-blink { animation: ss-mg-blink-anim 3s ease-in-out infinite; }
+    /* M1258: section bar blink disabled — per-count blink (.ss-cnt-blink) replaces it.
+       Class still applied as a marker for row-blink propagation (M782 logic). */
+    .ss-mg-header-td.ss-mg-blink { /* animation disabled — see M1258 */ }
     /* M782: blink stone rows under blinking section bar */
     @keyframes ss-row-blink-anim {
       0%, 100% { background: transparent; }
       40%, 60% { background: rgba(123,211,173,.18); }
     }
     .nt-table tr.ss-row-blink td { animation: ss-row-blink-anim 3s ease-in-out infinite; }
+    /* M1258: per-count blink — replaces full section bar blink. Targets the
+       specific count slot (queued/review/pc/watching) that owns the blinking stones. */
+    @keyframes ss-cnt-blink-anim {
+      0%, 100% { transform: scale(1); filter: brightness(1); }
+      40%, 60% { transform: scale(1.35); filter: brightness(1.6) drop-shadow(0 0 6px currentColor); }
+    }
+    .ss-cnt-blink { display: inline-block; animation: ss-cnt-blink-anim 1.4s ease-in-out infinite; font-weight: bold; }
   </style>
   <div>
     <button class="nt-add" style="margin-bottom:8px;display:block;width:100%;text-align:center"
@@ -3054,7 +3168,7 @@ function renderMilestoneCreator(projId, milestones) {
             ondragleave="_msDragLeave(event)" ondrop="_msDrop(event,'${esc(projId)}')">
             <td class="ms-td-drag"><span class="nt-drag-handle" title="Drag to reorder">⋮⋮</span></td>
             ${_gapCells(m)}
-            <td class="ms-td-id"><div class="nt-id-stack"><span class="nt-id-row"><span class="nt-mid" title="Milestone ID">${esc(m.id)}</span></span>${m.user_added_at ? `<span style="font-family:var(--mono);font-size:9px;color:var(--accent-deep);font-weight:600;letter-spacing:.04em;line-height:1.3" class="nt-time-span" title="Added ${esc(m.user_added_at)}">${esc((m.user_added_at||'').slice(5,10))}<br>${esc((m.user_added_at||'').slice(11,16))}</span>` : ''}${(m.layer||0)===0 ? `<button id="sub-btn-${esc(m.id)}" title="Register as sub-stone of another" style="font-size:8px;padding:3px 6px;background:var(--accent-soft);border:1px solid var(--accent);border-radius:3px;cursor:pointer;color:var(--accent);font-family:var(--mono);line-height:1.4;white-space:nowrap;min-height:22px;margin-top:2px" onclick="event.stopPropagation();showSeqSubstoneModal('${esc(projId)}','${esc(m.id)}','${escJs(m.text.slice(0,40))}')">sub</button>` : ''}</div></td>
+            <td class="ms-td-id"><div class="nt-id-stack"><span class="nt-id-row"><span class="nt-mid" title="Milestone ID">${esc(m.id)}</span></span>${m.user_added_at ? `<span style="font-family:var(--mono);font-size:9px;color:var(--accent-deep);font-weight:600;letter-spacing:.04em;line-height:1.3" class="nt-time-span" title="Added ${esc(m.user_added_at)}">${esc((m.user_added_at||'').slice(5,10))}<br>${esc((m.user_added_at||'').slice(11,16))}</span>` : ''}</div></td>
             <td class="ms-td-text">
               <div class="nt-text" style="color:var(--text)"
                 contenteditable="true" data-ms-id="${esc(m.id)}"
@@ -3105,7 +3219,7 @@ function renderMilestoneCreator(projId, milestones) {
                   const _cEvTs = c.evidence_updated_at || '';
                   const _cShotBangUnseen = _cShotUrl && (() => { const _k=`${projId}_${c.id}`; const _s=_ntProofSeen[_k]||''; return _cEvTs ? (!_s||_s<_cEvTs) : !_s; })();
                   const _cShotBang = _cShotBangUnseen ? `<span class="nt-evidence-bang" title="Evidence recently updated">!</span>` : '';
-                  const _cShotBadge = _cShotUrl ? `<div style="display:flex;align-items:center;gap:2px"><a href="${esc(_cShotUrl)}" target="_blank" rel="noopener" onclick="event.stopPropagation();_ntMarkProofSeen('${esc(projId)}','${esc(c.id)}','${esc(_cEvTs)}')" style="display:inline-flex;align-items:center;margin-top:2px;font-family:var(--mono);font-size:8px;padding:2px 5px;border-radius:3px;border:1px solid var(--green);background:var(--green-soft);color:var(--green);cursor:pointer;white-space:nowrap;text-decoration:none;line-height:1.4">result</a>${_cShotBang}</div>` : '';
+                  const _cShotBadge = _cShotUrl ? `<div style="display:flex;align-items:center;gap:2px"><button onclick="event.stopPropagation();_showEvidencePopup('${esc(projId)}','${esc(c.id)}','${esc(c.evidence_url||_cShotUrl)}','${esc(_cEvTs)}',event)" style="display:inline-flex;align-items:center;margin-top:2px;font-family:var(--mono);font-size:8px;padding:2px 5px;border-radius:3px;border:1px solid var(--green);background:var(--green-soft);color:var(--green);cursor:pointer;white-space:nowrap;line-height:1.4" title="Click to view all evidence">result</button>${_cShotBang}</div>` : '';
                   const _cTokBadge = `<span style="font-family:var(--mono);font-size:8px;padding:1px 4px;border-radius:3px;background:${c.total_tokens?'rgba(61,139,94,.1)':'none'};color:${c.total_tokens?'var(--green,#3d8b5e)':'var(--text-dim)'};border:1px solid ${c.total_tokens?'rgba(61,139,94,.25)':'var(--panel-border)'}" title="${c.total_tokens?'Tokens: '+c.total_tokens.toLocaleString():'No token data'}">${c.total_tokens?(c.total_tokens>=1000?(c.total_tokens/1000).toFixed(1)+'k':c.total_tokens):'—'}</span>`;
                   if (cS === 'pending_confirmation') return `<div style="display:flex;flex-direction:column;gap:2px;margin-top:2px"><button onclick="event.stopPropagation();commitAndConfirmMs('${esc(projId)}','${esc(c.id)}',this)" style="font-size:8px;padding:2px 5px;border-radius:3px;border:1px solid var(--green);background:var(--green-soft);color:var(--green);cursor:pointer;font-family:var(--mono);line-height:1.4">Commit</button><button onclick="event.stopPropagation();reopenMs('${esc(projId)}','${esc(c.id)}',this)" style="font-size:8px;padding:2px 5px;border-radius:3px;border:1px solid var(--red,#c0392b);background:rgba(192,57,43,.08);color:var(--red,#c0392b);cursor:pointer;font-family:var(--mono);line-height:1.4">Reopen</button>${_cShotBadge}</div>${_cTokBadge}`;
                   if (cS !== 'done') return `<span class="${c.claude_ack?'nt-ack-g':'nt-ack-o'}" title="${c.claude_ack?`AI acknowledged (${esc(c.claude_ack)})`:'Not yet reviewed by AI'}">${c.claude_ack?'acked':'review'}</span>${_cTokBadge}`;
@@ -3198,15 +3312,15 @@ function renderMilestoneCreator(projId, milestones) {
           return _shotBangTs ? (!_s || _s < _shotBangTs) : !_s;
         })();
         const _shotBang = _shotBangUnseen ? `<span class="nt-evidence-bang" title="Evidence recently updated">!</span>` : '';
-        const _shotBadge = _shotUrl ? `<div style="display:flex;align-items:center;gap:2px;margin-top:3px"><a href="${esc(_shotUrl)}" target="_blank" rel="noopener" onclick="event.stopPropagation();_ntMarkProofSeen('${esc(projId)}','${esc(m.id)}','${esc(_shotBangTs)}')"
-          style="display:inline-flex;align-items:center;font-family:var(--mono);font-size:8px;padding:3px 6px;border-radius:3px;border:1px solid var(--green);background:var(--green-soft);color:var(--green);cursor:pointer;white-space:nowrap;text-decoration:none;min-height:22px;line-height:1.4">result</a>${_shotBang}</div>` : '';
+        const _shotBadge = _shotUrl ? `<div style="display:flex;align-items:center;gap:2px;margin-top:3px"><button onclick="event.stopPropagation();_showEvidencePopup('${esc(projId)}','${esc(m.id)}','${esc(m.evidence_url||_shotUrl)}','${esc(_shotBangTs)}',event)"
+          style="display:inline-flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:8px;padding:3px 6px;border-radius:3px;border:1px solid var(--green);background:var(--green-soft);color:var(--green);cursor:pointer;white-space:nowrap;min-height:22px;min-width:36px;line-height:1.4" title="Click to view all evidence">evd</button>${_shotBang}</div>` : '';
         const confirmHtml = `
           <tr class="nt-draggable-row" data-mid="${esc(m.id)}" data-status="pending_confirmation" data-held="${m.held?'1':'0'}" data-last-turn="${_isLastTurn(m)?'1':'0'}" data-watching="${m.watching?'1':'0'}" data-pending-confirm-at="${esc(m.pending_confirm_at||'')}" data-child-queued="${milestones.some(c=>(c.layer||0)===1&&c.parent_id===m.id&&c.status==='queued'&&!c.done)?'1':'0'}" draggable="true"
             ondragstart="_msDragStart(event,'${esc(m.id)}')" ondragend="_msDragEnd(event)" ondragover="_msDragOver(event)"
             ondragleave="_msDragLeave(event)" ondrop="_msDrop(event,'${esc(projId)}')">
             <td class="ms-td-drag"><span class="nt-drag-handle" title="Drag to reorder">⋮⋮</span></td>
             ${_gapCells(m)}
-            <td class="ms-td-id"><div class="nt-id-stack"><span class="nt-id-row"><span class="nt-mid" title="Milestone ID">${esc(m.id)}</span></span>${m.user_added_at ? `<span style="font-family:var(--mono);font-size:9px;color:var(--accent-deep);font-weight:600;letter-spacing:.04em;line-height:1.3" class="nt-time-span" title="Added ${esc(m.user_added_at)}">${esc((m.user_added_at||'').slice(5,10))}<br>${esc((m.user_added_at||'').slice(11,16))}</span>` : ''}<div style="display:flex;flex-direction:column;gap:2px;margin-top:2px"><button onclick="event.stopPropagation();commitAndConfirmMs('${esc(projId)}','${esc(m.id)}',this)" style="font-size:8px;padding:3px 6px;border-radius:3px;border:1px solid var(--green);background:var(--green-soft);color:var(--green);cursor:pointer;font-family:var(--mono);line-height:1.4;white-space:nowrap;min-height:22px">Commit</button><button onclick="event.stopPropagation();reopenMs('${esc(projId)}','${esc(m.id)}',this)" style="font-size:8px;padding:3px 6px;border-radius:3px;border:1px solid var(--red,#c0392b);background:rgba(192,57,43,.08);color:var(--red,#c0392b);cursor:pointer;font-family:var(--mono);line-height:1.4;min-height:22px">Reopen</button>${_shotBadge}</div>${(m.layer||0)===0 ? `<button id="sub-btn-${esc(m.id)}" title="Register as sub-stone of another" style="font-size:8px;padding:3px 6px;background:var(--accent-soft);border:1px solid var(--accent);border-radius:3px;cursor:pointer;color:var(--accent);font-family:var(--mono);line-height:1.4;white-space:nowrap;min-height:22px;margin-left:2px" onclick="event.stopPropagation();showSeqSubstoneModal('${esc(projId)}','${esc(m.id)}','${escJs(m.text.slice(0,40))}')">sub</button>` : ''}<span style="font-family:var(--mono);font-size:8px;padding:1px 4px;border-radius:3px;background:${m.total_tokens?'rgba(61,139,94,.1)':'none'};color:${m.total_tokens?'var(--green,#3d8b5e)':'var(--text-dim)'};border:1px solid ${m.total_tokens?'rgba(61,139,94,.25)':'var(--panel-border)'}" title="${m.total_tokens?'Tokens: '+m.total_tokens.toLocaleString()+' (input+cache+output)':'No token data'}">${m.total_tokens?(m.total_tokens>=1000?(m.total_tokens/1000).toFixed(1)+'k':m.total_tokens):'—'}</span></div></td>
+            <td class="ms-td-id"><div class="nt-id-stack"><span class="nt-id-row"><span class="nt-mid" title="Milestone ID">${esc(m.id)}</span></span>${m.user_added_at ? `<span style="font-family:var(--mono);font-size:9px;color:var(--accent-deep);font-weight:600;letter-spacing:.04em;line-height:1.3" class="nt-time-span" title="Added ${esc(m.user_added_at)}">${esc((m.user_added_at||'').slice(5,10))}<br>${esc((m.user_added_at||'').slice(11,16))}</span>` : ''}<div style="display:flex;flex-direction:column;gap:2px;margin-top:2px"><button onclick="event.stopPropagation();commitAndConfirmMs('${esc(projId)}','${esc(m.id)}',this)" style="font-size:8px;padding:3px 6px;border-radius:3px;border:1px solid var(--green);background:var(--green-soft);color:var(--green);cursor:pointer;font-family:var(--mono);line-height:1.4;white-space:nowrap;min-height:22px">Commit</button><button onclick="event.stopPropagation();reopenMs('${esc(projId)}','${esc(m.id)}',this)" style="font-size:8px;padding:3px 6px;border-radius:3px;border:1px solid var(--red,#c0392b);background:rgba(192,57,43,.08);color:var(--red,#c0392b);cursor:pointer;font-family:var(--mono);line-height:1.4;min-height:22px">Reopen</button>${_shotBadge}</div><span style="font-family:var(--mono);font-size:8px;padding:1px 4px;border-radius:3px;background:${m.total_tokens?'rgba(61,139,94,.1)':'none'};color:${m.total_tokens?'var(--green,#3d8b5e)':'var(--text-dim)'};border:1px solid ${m.total_tokens?'rgba(61,139,94,.25)':'var(--panel-border)'}" title="${m.total_tokens?'Tokens: '+m.total_tokens.toLocaleString()+' (input+cache+output)':'No token data'}">${m.total_tokens?(m.total_tokens>=1000?(m.total_tokens/1000).toFixed(1)+'k':m.total_tokens):'—'}</span></div></td>
             <td class="ms-td-text" style="background:rgba(204,120,92,.06);font-size:12px;color:var(--text);overflow-wrap:anywhere">
               <div style="${m.watching?'color:var(--yellow,#d4a017)':''}">${_renderNtTextHtml(m.text)}</div>
               ${/* M376: skill chips on pending_confirmation rows — same as main rows */
@@ -3264,7 +3378,7 @@ function renderMilestoneCreator(projId, milestones) {
                   const _cEvTs = c.evidence_updated_at || '';
                   const _cShotBangUnseen = _cShotUrl && (() => { const _k=`${projId}_${c.id}`; const _s=_ntProofSeen[_k]||''; return _cEvTs ? (!_s||_s<_cEvTs) : !_s; })();
                   const _cShotBang = _cShotBangUnseen ? `<span class="nt-evidence-bang" title="Evidence recently updated">!</span>` : '';
-                  const _cShotBadge = _cShotUrl ? `<div style="display:flex;align-items:center;gap:2px"><a href="${esc(_cShotUrl)}" target="_blank" rel="noopener" onclick="event.stopPropagation();_ntMarkProofSeen('${esc(projId)}','${esc(c.id)}','${esc(_cEvTs)}')" style="display:inline-flex;align-items:center;margin-top:2px;font-family:var(--mono);font-size:8px;padding:2px 5px;border-radius:3px;border:1px solid var(--green);background:var(--green-soft);color:var(--green);cursor:pointer;white-space:nowrap;text-decoration:none;line-height:1.4">result</a>${_cShotBang}</div>` : '';
+                  const _cShotBadge = _cShotUrl ? `<div style="display:flex;align-items:center;gap:2px"><button onclick="event.stopPropagation();_showEvidencePopup('${esc(projId)}','${esc(c.id)}','${esc(c.evidence_url||_cShotUrl)}','${esc(_cEvTs)}',event)" style="display:inline-flex;align-items:center;margin-top:2px;font-family:var(--mono);font-size:8px;padding:2px 5px;border-radius:3px;border:1px solid var(--green);background:var(--green-soft);color:var(--green);cursor:pointer;white-space:nowrap;line-height:1.4" title="Click to view all evidence">result</button>${_cShotBang}</div>` : '';
                   const _cTokBadge = `<span style="font-family:var(--mono);font-size:8px;padding:1px 4px;border-radius:3px;background:${c.total_tokens?'rgba(61,139,94,.1)':'none'};color:${c.total_tokens?'var(--green,#3d8b5e)':'var(--text-dim)'};border:1px solid ${c.total_tokens?'rgba(61,139,94,.25)':'var(--panel-border)'}" title="${c.total_tokens?'Tokens: '+c.total_tokens.toLocaleString():'No token data'}">${c.total_tokens?(c.total_tokens>=1000?(c.total_tokens/1000).toFixed(1)+'k':c.total_tokens):'—'}</span>`;
                   if (cS === 'pending_confirmation') return `<div style="display:flex;flex-direction:column;gap:2px;margin-top:2px"><button onclick="event.stopPropagation();commitAndConfirmMs('${esc(projId)}','${esc(c.id)}',this)" style="font-size:8px;padding:2px 5px;border-radius:3px;border:1px solid var(--green);background:var(--green-soft);color:var(--green);cursor:pointer;font-family:var(--mono);line-height:1.4">Commit</button><button onclick="event.stopPropagation();reopenMs('${esc(projId)}','${esc(c.id)}',this)" style="font-size:8px;padding:2px 5px;border-radius:3px;border:1px solid var(--red,#c0392b);background:rgba(192,57,43,.08);color:var(--red,#c0392b);cursor:pointer;font-family:var(--mono);line-height:1.4">Reopen</button>${_cShotBadge}</div>${_cTokBadge}`;
                   if (cS !== 'done') return `<span class="${c.claude_ack?'nt-ack-g':'nt-ack-o'}" title="${c.claude_ack?`AI acknowledged (${esc(c.claude_ack)})`:'Not yet reviewed by AI'}">${c.claude_ack?'acked':'review'}</span>${_cTokBadge}`;
@@ -3374,9 +3488,7 @@ function renderMilestoneCreator(projId, milestones) {
               ${(m.layer||0)>0 ? `<button title="Unindent"
                 style="font-size:9px;padding:1px 5px;background:var(--accent-soft);border:1px solid var(--accent);border-radius:3px;cursor:pointer;color:var(--accent);font-weight:600;line-height:1.4"
                 onclick="event.stopPropagation();handleMsTabMobile('${esc(projId)}','${esc(m.id)}',true)">◁</button>`
-              : `<button id="sub-btn-${esc(m.id)}" title="Register sub-stone"
-                style="font-size:9px;padding:1px 5px;background:var(--accent-soft);border:1px solid var(--accent);border-radius:3px;cursor:pointer;color:var(--accent);font-weight:600;line-height:1.4"
-                onclick="event.stopPropagation();showSeqSubstoneModal('${esc(projId)}','${esc(m.id)}','${escJs(m.text.slice(0,40))}')">sub</button>`}
+              : ''}
               ${_msEvidenceBadgeHtml(m, projId)}
               <span style="font-family:var(--mono);font-size:8px;padding:1px 4px;border-radius:3px;background:${m.total_tokens?'rgba(61,139,94,.1)':'none'};color:${m.total_tokens?'var(--green,#3d8b5e)':'var(--text-dim)'};border:1px solid ${m.total_tokens?'rgba(61,139,94,.25)':'var(--panel-border)'}" title="${m.total_tokens?'Tokens: '+m.total_tokens.toLocaleString()+' (input+cache+output)':'No token data'}">${m.total_tokens?(m.total_tokens>=1000?(m.total_tokens/1000).toFixed(1)+'k':m.total_tokens):'—'}</span>
             </div>
@@ -3481,7 +3593,7 @@ function renderMilestoneCreator(projId, milestones) {
                   const _cEvTs = c.evidence_updated_at || '';
                   const _cShotBangUnseen = _cShotUrl && (() => { const _k=`${projId}_${c.id}`; const _s=_ntProofSeen[_k]||''; return _cEvTs ? (!_s||_s<_cEvTs) : !_s; })();
                   const _cShotBang = _cShotBangUnseen ? `<span class="nt-evidence-bang" title="Evidence recently updated">!</span>` : '';
-                  const _cShotBadge = _cShotUrl ? `<div style="display:flex;align-items:center;gap:2px"><a href="${esc(_cShotUrl)}" target="_blank" rel="noopener" onclick="event.stopPropagation();_ntMarkProofSeen('${esc(projId)}','${esc(c.id)}','${esc(_cEvTs)}')" style="display:inline-flex;align-items:center;margin-top:2px;font-family:var(--mono);font-size:8px;padding:2px 5px;border-radius:3px;border:1px solid var(--green);background:var(--green-soft);color:var(--green);cursor:pointer;white-space:nowrap;text-decoration:none;line-height:1.4">result</a>${_cShotBang}</div>` : '';
+                  const _cShotBadge = _cShotUrl ? `<div style="display:flex;align-items:center;gap:2px"><button onclick="event.stopPropagation();_showEvidencePopup('${esc(projId)}','${esc(c.id)}','${esc(c.evidence_url||_cShotUrl)}','${esc(_cEvTs)}',event)" style="display:inline-flex;align-items:center;margin-top:2px;font-family:var(--mono);font-size:8px;padding:2px 5px;border-radius:3px;border:1px solid var(--green);background:var(--green-soft);color:var(--green);cursor:pointer;white-space:nowrap;line-height:1.4" title="Click to view all evidence">result</button>${_cShotBang}</div>` : '';
                   const _cTokBadge = `<span style="font-family:var(--mono);font-size:8px;padding:1px 4px;border-radius:3px;background:${c.total_tokens?'rgba(61,139,94,.1)':'none'};color:${c.total_tokens?'var(--green,#3d8b5e)':'var(--text-dim)'};border:1px solid ${c.total_tokens?'rgba(61,139,94,.25)':'var(--panel-border)'}" title="${c.total_tokens?'Tokens: '+c.total_tokens.toLocaleString():'No token data'}">${c.total_tokens?(c.total_tokens>=1000?(c.total_tokens/1000).toFixed(1)+'k':c.total_tokens):'—'}</span>`;
                   if (cS === 'pending_confirmation') return `<div style="display:flex;flex-direction:column;gap:2px;margin-top:2px"><button onclick="event.stopPropagation();commitAndConfirmMs('${esc(projId)}','${esc(c.id)}',this)" style="font-size:8px;padding:2px 5px;border-radius:3px;border:1px solid var(--green);background:var(--green-soft);color:var(--green);cursor:pointer;font-family:var(--mono);line-height:1.4">Commit</button><button onclick="event.stopPropagation();reopenMs('${esc(projId)}','${esc(c.id)}',this)" style="font-size:8px;padding:2px 5px;border-radius:3px;border:1px solid var(--red,#c0392b);background:rgba(192,57,43,.08);color:var(--red,#c0392b);cursor:pointer;font-family:var(--mono);line-height:1.4">Reopen</button>${_cShotBadge}</div>${_cTokBadge}`;
                   if (cS !== 'done') return `<span class="${c.claude_ack?'nt-ack-g':'nt-ack-o'}" title="${c.claude_ack?`AI acknowledged (${esc(c.claude_ack)})`:'Not yet reviewed by AI'}">${c.claude_ack?'acked':'review'}</span>${_cTokBadge}`;
@@ -4229,17 +4341,8 @@ function _previewFile(url, fname, isImg, isVideo) {
   document.body.appendChild(overlay);
 }
 function _renderNtTextHtml(text) {
-  // Render typed text inline; only paste-sentinel segments collapse into chips.
-  // M327: handle both current format (PASTE.../PASTE) and legacy -wrapped format.
+  // Render typed text inline; only PUA-sentinel (...) segments collapse into chips.
   text = text || '';
-  // Normalize legacy PASTE.../PASTE → PASTE.../PASTE
-  // M890 fix: normalize plain PASTE.../PASTE to sentinel format (skip if already sentinel)
-  if (!text.includes(_PASTE_OPEN[0])) {
-    const _PASTE_TMP = '\uFFFE';
-    text = text.replace(/\/PASTE/g, _PASTE_TMP).replace(/PASTE/g, _PASTE_OPEN).replace(new RegExp(_PASTE_TMP, 'g'), _PASTE_CLOSE);
-  } else {
-    text = text.replace(/PASTE/g, _PASTE_OPEN).replace(/\/PASTE/g, _PASTE_CLOSE);
-  }
   if (text.indexOf(_PASTE_OPEN) === -1) {
     // M315: render newlines as <br> so multi-line stone text is preserved on reopen
     return esc(text).replace(/\n/g, '<br>');
@@ -4281,11 +4384,23 @@ function _msBadgeStyle(variant) {
   return base + 'color:var(--text-dim);background:var(--panel-soft);border:1px solid var(--panel-border);';
 }
 
-// M556: localStorage-based seen tracking for msg ! and evidence ! bangs.
+// M1262: server-centralized seen tracking for msg ! and evidence ! bangs (M955).
+// localStorage used only as fast-load cache; server /api/user-settings is source of truth.
 // _ntMsgSeen[projId_mid]   = ISO ts of last claude msg the user has seen (popup opened)
 // _ntProofSeen[projId_mid] = ISO ts of evidence_updated_at user has acknowledged (proof link clicked)
 let _ntMsgSeen   = (() => { try { return JSON.parse(localStorage.getItem('nt-msg-seen')   || '{}'); } catch(_) { return {}; } })();
 let _ntProofSeen = (() => { try { return JSON.parse(localStorage.getItem('nt-proof-seen') || '{}'); } catch(_) { return {}; } })();
+// Load authoritative values from server on startup (async, non-blocking)
+(async () => {
+  try {
+    const [r1, r2] = await Promise.all([
+      fetch('/api/user-settings/nt-msg-seen'),
+      fetch('/api/user-settings/nt-proof-seen'),
+    ]);
+    if (r1.ok) { const d = await r1.json(); if (d.value && typeof d.value === 'object') { _ntMsgSeen = d.value; localStorage.setItem('nt-msg-seen', JSON.stringify(_ntMsgSeen)); } }
+    if (r2.ok) { const d = await r2.json(); if (d.value && typeof d.value === 'object') { _ntProofSeen = d.value; localStorage.setItem('nt-proof-seen', JSON.stringify(_ntProofSeen)); } }
+  } catch(_) {}
+})();
 function _ntMarkMsgSeen(projId, mid) {
   const conv = _msConversations[mid] || [];
   const claudeMsgs = conv.filter(e => e.role === 'claude');
@@ -4294,13 +4409,15 @@ function _ntMarkMsgSeen(projId, mid) {
   if (!lastTs) return;
   const key = `${projId}_${mid}`;
   _ntMsgSeen[key] = lastTs;
-  try { localStorage.setItem('nt-msg-seen', JSON.stringify(_ntMsgSeen)); } catch(_) {}
+  localStorage.setItem('nt-msg-seen', JSON.stringify(_ntMsgSeen));
+  fetch('/api/user-settings/nt-msg-seen', {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({value: _ntMsgSeen})}).catch(()=>{});
 }
 function _ntMarkProofSeen(projId, mid, evidenceTs) {
   if (!evidenceTs) return;
   const key = `${projId}_${mid}`;
   _ntProofSeen[key] = evidenceTs;
-  try { localStorage.setItem('nt-proof-seen', JSON.stringify(_ntProofSeen)); } catch(_) {}
+  localStorage.setItem('nt-proof-seen', JSON.stringify(_ntProofSeen));
+  fetch('/api/user-settings/nt-proof-seen', {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({value: _ntProofSeen})}).catch(()=>{});
   // Immediately hide any visible nt-evidence-bang for this stone in the DOM
   document.querySelectorAll(`tr[data-mid="${CSS.escape(mid)}"] .nt-evidence-bang`).forEach(el => el.remove());
   // Also hide in the id-stack area (left column) where _msEvidenceBadgeHtml renders
@@ -4384,18 +4501,172 @@ function _msBangHtml(mid, projId) {
   return `<span class="nt-msg-bang" title="Awaiting your reply">!</span>`;
 }
 
+// M1295: collect all evidence URLs for a stone (conversation GDrive links + evidence_url field)
+function _collectEvidenceUrls(mid, evidenceUrl) {
+  const conv = _msConversations[mid] || [];
+  const seen = new Set();
+  const urls = [];
+  // Only claude-role messages: GDrive URLs shared by LLM (evidence reports)
+  conv.forEach(msg => {
+    if (msg.role !== 'claude') return;
+    const text = msg.text || '';
+    const gdMatches = text.match(/https?:\/\/(?:[^\s"']*\.)?drive\.google\.com[^\s"')>\]<]*/g) || [];
+    gdMatches.forEach(u => { if (!seen.has(u)) { seen.add(u); urls.push({url:u, ts:msg.ts||'', role:'claude'}); }});
+  });
+  // evidence_url field (latest, explicit) — always shown
+  if (evidenceUrl && !seen.has(evidenceUrl)) {
+    seen.add(evidenceUrl);
+    urls.push({url:evidenceUrl, ts:'', role:'evidence_url'});
+  }
+  return urls;
+}
+
+// M1304: pre-seed GDrive filename cache from evidence_filename field (avoids API call)
+function _evSeedFilenameCache(projId, mid) {
+  const arr = _msCacheByProject[projId];
+  if (!arr) return;
+  const m = arr.find(x => x.id === mid);
+  if (!m || !m.evidence_filename || !m.evidence_url) return;
+  const gdM = m.evidence_url.match(/\/file\/d\/([^/]+)/);
+  if (gdM) _GDRIVE_NAME_CACHE[gdM[1]] = m.evidence_filename;
+}
+
+function _evUrlLabel(url) {
+  // /uploads/ path — extract filename directly
+  const upM = url.match(/\/uploads\/[^/]+\/(.+?)(?:\?.*)?$/);
+  if (upM) return decodeURIComponent(upM[1]);
+  try {
+    const u = new URL(url);
+    // GDrive file: return ID for async resolution; caller uses _evGdriveId()
+    const gdM = u.pathname.match(/\/file\/d\/([^/]+)/);
+    if (gdM) return _GDRIVE_NAME_CACHE[gdM[1]] || ('gdrive:' + gdM[1].slice(0,8) + '…');
+    // GDrive open?id= form
+    const idParam = u.searchParams.get('id');
+    if (idParam) return _GDRIVE_NAME_CACHE[idParam] || ('gdrive:' + idParam.slice(0,8) + '…');
+    // Generic: host + truncated path
+    const path = u.pathname.length > 30 ? u.pathname.slice(0, 28) + '…' : u.pathname;
+    return u.host + path;
+  } catch(_) {
+    return url.length > 50 ? url.slice(0, 47) + '…' : url;
+  }
+}
+
+// M1295: GDrive filename cache — id → filename
+const _GDRIVE_NAME_CACHE = {};
+function _gdriveFetchName(fileId, onResolved) {
+  if (_GDRIVE_NAME_CACHE[fileId]) { onResolved(_GDRIVE_NAME_CACHE[fileId]); return; }
+  fetch('/api/gdrive-filename?id=' + encodeURIComponent(fileId))
+    .then(r => r.ok ? r.json() : null)
+    .then(d => {
+      if (d && d.name) {
+        _GDRIVE_NAME_CACHE[fileId] = d.name;
+        onResolved(d.name);
+      }
+    }).catch(() => {});
+}
+function _evGdriveId(url) {
+  try {
+    const u = new URL(url);
+    const m = u.pathname.match(/\/file\/d\/([^/]+)/);
+    if (m) return m[1];
+    return u.searchParams.get('id') || null;
+  } catch(_) { return null; }
+}
+
+// M1295: show scrollable evidence popup listing all GDrive links for a stone
+function _showEvidencePopup(projId, mid, evidenceUrl, evidenceUpdatedAt, event) {
+  event.stopPropagation();
+  document.getElementById('ev-popup-'+mid)?.remove();
+  document.getElementById('ev-popup-bdrop')?.remove();
+  _ntMarkProofSeen(projId||'', mid, evidenceUpdatedAt||'');
+  // M1304: pre-seed filename cache so _evUrlLabel() shows real name immediately
+  _evSeedFilenameCache(projId, mid);
+  const urls = _collectEvidenceUrls(mid, evidenceUrl);
+  const isMob = window.innerWidth < 600;
+  const BOTTOM_GUTTER = 56;
+  const availH = Math.max(120, window.innerHeight - BOTTOM_GUTTER - 12);
+  const maxH = Math.min(availH, isMob ? Math.round(window.innerHeight * 0.65) : 420);
+
+  const bdrop = document.createElement('div');
+  bdrop.id = 'ev-popup-bdrop';
+  bdrop.style.cssText = 'position:fixed;inset:0;z-index:9998';
+  document.body.appendChild(bdrop);
+
+  const popup = document.createElement('div');
+  popup.id = 'ev-popup-'+mid;
+  popup.style.cssText = `position:fixed;z-index:9999;background:var(--panel);border:1px solid var(--green);
+    border-radius:8px;padding:0;box-shadow:0 6px 24px rgba(0,0,0,.28);
+    font-family:var(--mono);font-size:11px;color:var(--text);
+    max-height:${maxH}px;overflow:hidden;display:flex;flex-direction:column;
+    ${isMob ? `left:8px;right:8px;bottom:${BOTTOM_GUTTER}px;max-width:calc(100vw - 16px)` : 'max-width:360px;min-width:260px'}`;
+  if (!isMob) {
+    const x = Math.min(event.clientX, window.innerWidth - 380);
+    const spaceBelow = window.innerHeight - BOTTOM_GUTTER - (event.clientY + 8);
+    const y = spaceBelow >= maxH ? event.clientY + 8 : Math.max(12, event.clientY - maxH - 8);
+    popup.style.left = x + 'px';
+    popup.style.top = y + 'px';
+  }
+
+  const close = () => { popup.remove(); bdrop.remove(); };
+  bdrop.addEventListener('click', close);
+
+  const header = document.createElement('div');
+  header.style.cssText = 'padding:8px 10px 6px;border-bottom:1px solid var(--panel-border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0';
+  header.innerHTML = `<span style="font-weight:700;font-size:10px;color:var(--green)">evd — ${mid}</span>`
+    + `<button onclick="this.closest('#ev-popup-${mid}').remove();document.getElementById('ev-popup-bdrop')?.remove()" style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:14px;padding:0 2px;line-height:1">✕</button>`;
+  popup.appendChild(header);
+
+  const body = document.createElement('div');
+  body.style.cssText = 'overflow-y:auto;padding:8px 10px;flex:1;display:flex;flex-direction:column;gap:6px';
+
+  if (!urls.length) {
+    body.innerHTML = `<span style="color:var(--text-dim);font-size:10px">evidence 없음</span>`;
+  } else {
+    // latest first: reverse so newest appears at top
+    const orderedUrls = [...urls].reverse();
+    orderedUrls.forEach((item, i) => {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;flex-direction:column;gap:2px;padding-bottom:6px;border-bottom:1px solid var(--panel-border)';
+      const label = item.role === 'evidence_url' ? 'latest' : (item.role === 'claude' ? 'AI' : 'user');
+      const ts = item.ts ? item.ts.slice(5,16).replace('T',' ') : '';
+      const _rawLabel = _evUrlLabel(item.url);
+      const linkId = 'ev-lnk-' + mid + '-' + i;
+      row.innerHTML = `<div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap">
+        <span style="font-size:9px;color:var(--text-dim)">#${i + 1}</span>
+        <span style="font-size:9px;color:var(--accent-deep);font-weight:600">${label}</span>
+        ${ts ? `<span style="font-size:9px;color:var(--text-dim)">${ts}</span>` : ''}
+      </div>
+      <a id="${linkId}" href="${esc(item.url)}" target="_blank" rel="noopener"
+         style="font-size:9px;color:var(--green);word-break:break-word;text-decoration:none;line-height:1.4"
+         onclick="event.stopPropagation()" title="${esc(item.url)}">${esc(_rawLabel)}</a>`;
+      // Async: resolve GDrive filename and update link text
+      const _gid = _evGdriveId(item.url);
+      if (_gid) {
+        _gdriveFetchName(_gid, name => {
+          const el = document.getElementById(linkId);
+          if (el) el.textContent = name;
+        });
+      }
+      body.appendChild(row);
+    });
+  }
+  popup.appendChild(body);
+  document.body.appendChild(popup);
+}
+
 function _msEvidenceBadgeHtml(m, projId) {
   // M528: evidence_url renders as proof badge in the LEFT column (ms-td-id / nt-id-stack).
   // M556: persist evidence ! until user clicks the proof link.
+  // M1295: clicking opens scrollable evidence popup instead of direct link.
   if (!m.evidence_url) return '';
   const _evKey = `${projId||''}_${m.id}`;
   const _evSeenTs = _ntProofSeen[_evKey] || '';
   const showBang = m.evidence_updated_at ? (!_evSeenTs || _evSeenTs < m.evidence_updated_at) : !_evSeenTs;
   const bang = showBang ? `<span class="nt-evidence-bang" title="Evidence recently updated">!</span>` : '';
   const _evProjId = projId || '';
-  return `<div style="display:flex;align-items:center;gap:2px;margin-top:3px"><a href="${esc(m.evidence_url)}" target="_blank" rel="noopener" onclick="event.stopPropagation();_ntMarkProofSeen('${esc(_evProjId)}','${esc(m.id)}','${esc(m.evidence_updated_at||'')}')"
-     style="display:inline-flex;align-items:center;font-family:var(--mono);font-size:8px;padding:3px 6px;border-radius:3px;border:1px solid var(--green);background:var(--green-soft);color:var(--green);cursor:pointer;white-space:nowrap;text-decoration:none;min-height:22px;line-height:1.4"
-     title="Evidence: ${esc(m.evidence_url)}">result</a>${bang}</div>`;
+  return `<div style="display:flex;align-items:center;gap:2px;margin-top:3px"><button onclick="event.stopPropagation();_showEvidencePopup('${esc(_evProjId)}','${esc(m.id)}','${esc(m.evidence_url)}','${esc(m.evidence_updated_at||'')}',event)"
+     style="display:inline-flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:8px;padding:3px 6px;border-radius:3px;border:1px solid var(--green);background:var(--green-soft);color:var(--green);cursor:pointer;white-space:nowrap;min-height:22px;min-width:36px;line-height:1.4"
+     title="Click to view all evidence">evd</button>${bang}</div>`;
 }
 
 
@@ -4781,6 +5052,52 @@ async function toggleHold(projId, mid, newHeld, _ev) {
 }
 
 function _ntPasteHandler(ev) {
+  // M1297: handle image paste from clipboard in stone text field
+  const items = Array.from((ev.clipboardData || window.clipboardData)?.items || []);
+  const imgItem = items.find(it => it.kind === 'file' && it.type.startsWith('image/'));
+  if (imgItem) {
+    ev.preventDefault();
+    const file = imgItem.getAsFile();
+    if (!file) return;
+    const el = ev.target.closest('[data-ms-id]') || ev.target;
+    const mid = el.dataset?.msId;
+    const projId = el.closest('[data-proj-id]')?.dataset?.projId || _msProjectId;
+    const chip = document.createElement('span');
+    chip.className = 'nt-paste-chip uploading';
+    chip.contentEditable = 'false';
+    chip.dataset.full = `[file:${file.name}]`;
+    chip.title = file.name;
+    const labelSpan = document.createElement('span');
+    labelSpan.contentEditable = 'false';
+    labelSpan.textContent = file.name;
+    chip.appendChild(labelSpan);
+    const rmSpan = document.createElement('span');
+    rmSpan.contentEditable = 'false';
+    rmSpan.textContent = '✕';
+    rmSpan.title = 'Remove attachment';
+    rmSpan.style.cssText = 'opacity:.55;cursor:pointer;font-size:8px;line-height:1;padding-left:1px';
+    rmSpan.onclick = (e) => { e.stopPropagation(); chip.remove(); if (el?.isContentEditable) el.dispatchEvent(new Event('blur')); };
+    chip.appendChild(rmSpan);
+    chip.onclick = (e) => { if (e.target.title === 'Remove attachment') return; e.stopPropagation(); const u = chip.dataset.full||''; const fn = u.split('/').pop()||''; _previewFile(u, fn, /\.(png|jpg|jpeg|gif|webp|svg)$/i.test(fn), false); };
+    el.appendChild(chip);
+    if (mid && projId) {
+      const fd = new FormData();
+      fd.append('file', file);
+      fd.append('proj_id', projId || '');
+      fetch('/api/upload-comment-file', {method:'POST', body: fd}).then(r => r.ok ? r.json() : null).then(d => {
+        chip.classList.remove('uploading');
+        if (d) {
+          const url = d.url || d.path || `/uploads/${projId}/${file.name}`;
+          chip.dataset.full = url;
+          chip.title = url;
+          chip.style.color = 'var(--accent)';
+          chip.style.borderColor = 'var(--accent-soft)';
+        }
+        saveMs(projId, mid, _readNtText(el));
+      }).catch(() => { chip.classList.remove('uploading'); });
+    }
+    return;
+  }
   const txt = (ev.clipboardData || window.clipboardData)?.getData('text') || '';
   if (!txt) return;
   const lines = txt.split('\n').length;
@@ -4826,12 +5143,54 @@ function _ntPasteHandler(ev) {
 // push a `PASTE<body>/PASTE` token (which _doCommentReply prepends on send and the thread
 // renders as a chip via _renderNtTextHtml) and show a removable chip in the status bar.
 function _commentPasteHandler(ev) {
+  // M1297: handle image paste from clipboard in comment reply box
+  const clipItems = Array.from((ev.clipboardData || window.clipboardData)?.items || []);
+  const imgItem = clipItems.find(it => it.kind === 'file' && it.type.startsWith('image/'));
+  if (imgItem) {
+    ev.preventDefault();
+    const file = imgItem.getAsFile();
+    if (!file) return;
+    const statusEl = document.getElementById('comment-upload-status');
+    const chip = document.createElement('span');
+    chip.style.cssText = 'display:inline-flex;align-items:center;gap:4px;padding:2px 6px;border-radius:3px;background:var(--panel-soft);border:1px solid var(--accent-soft);color:var(--accent);font-size:9px;font-family:var(--mono);cursor:pointer;margin:2px 2px 0 0';
+    chip.title = file.name;
+    const label = document.createElement('span');
+    label.textContent = file.name + ' (uploading…)';
+    chip.appendChild(label);
+    const rm = document.createElement('span');
+    rm.textContent = '✕';
+    rm.style.cssText = 'cursor:pointer;margin-left:2px;opacity:.6';
+    chip.appendChild(rm);
+    if (statusEl) { statusEl.appendChild(chip); statusEl.classList.add('active'); }
+    // Upload and register as pending attachment
+    const projId = document.getElementById('comment-panel')?.dataset?.projId || _msProjectId;
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('proj_id', projId || '');
+    fetch('/api/upload-comment-file', { method: 'POST', body: fd })
+      .then(r => r.ok ? r.json() : null)
+      .then(d => {
+        if (!d) { chip.remove(); return; }
+        const url = d.url || d.path || `/uploads/${projId}/${file.name}`;
+        label.textContent = file.name;
+        chip.style.borderColor = 'var(--accent)';
+        const token = _PASTE_OPEN + url + _PASTE_CLOSE;
+        window._commentPendingAttachments = window._commentPendingAttachments || [];
+        window._commentPendingAttachments.push(token);
+        rm.onclick = (e) => {
+          e.stopPropagation(); chip.remove();
+          window._commentPendingAttachments = (window._commentPendingAttachments || []).filter(t => t !== token);
+        };
+      })
+      .catch(() => chip.remove());
+    return;
+  }
   const txt = (ev.clipboardData || window.clipboardData)?.getData('text') || '';
   if (!txt) return;
   const lines = txt.split('\n').length;
   if (txt.length < _NT_PASTE_THRESHOLD_CHARS && lines <= _NT_PASTE_THRESHOLD_LINES) return;
   ev.preventDefault();  // keep the raw blob out of the single-line input
-  const pasteToken = `PASTE${txt}/PASTE`;
+  const pasteToken = _PASTE_OPEN + txt + _PASTE_CLOSE;
   window._commentPendingAttachments = window._commentPendingAttachments || [];
   window._commentPendingAttachments.push(pasteToken);
   const statusEl = document.getElementById('comment-upload-status');
@@ -4972,7 +5331,7 @@ async function _commentInputDrop(ev, projId) {
         const d = await r.json();
         const link = d.url || d.path || d.filename || file.name;
         // M579: wrap in PASTE format for rich rendering in comment thread
-        inp.value = (inp.value ? inp.value + ' ' : '') + `PASTE${link}/PASTE`;
+        inp.value = (inp.value ? inp.value + ' ' : '') + _PASTE_OPEN + link + _PASTE_CLOSE;
       } else {
         inp.value = (inp.value ? inp.value + ' ' : '') + `[file:${file.name}]`;
       }
@@ -5119,7 +5478,7 @@ async function _commentFileUpload(ev, projId) {
           const d = await r.json();
           const link = d.url || d.path || d.filename || file.name;
           // M890: show attachment chip in status bar instead of raw text in input
-          const pasteToken = `PASTE${link}/PASTE`;
+          const pasteToken = _PASTE_OPEN + link + _PASTE_CLOSE;
           window._commentPendingAttachments = window._commentPendingAttachments || [];
           window._commentPendingAttachments.push(pasteToken);
           if (statusEl) {
@@ -5130,7 +5489,7 @@ async function _commentFileUpload(ev, projId) {
             chip.style.cssText = 'display:inline-flex;align-items:center;gap:4px;padding:2px 6px;border-radius:3px;background:var(--accent-soft);border:1px solid var(--accent);color:var(--accent);font-size:9px;font-family:var(--mono);cursor:pointer;margin:2px 2px 0 0';
             chip.title = isImg||isVideo ? 'Click to preview' : link;
             chip.onclick = (e) => { if (!e.target.matches('span[data-remove]')) _showAttachmentPreview(link, isImg, isVideo); };
-            chip.innerHTML = `${esc(fname)} <span data-remove="1" onclick="event.stopPropagation();this.parentElement.remove();window._commentPendingAttachments=(window._commentPendingAttachments||[]).filter(t=>t!=='${pasteToken.replace(/'/g,"\\'")}')" style="cursor:pointer;margin-left:2px;opacity:.6">✕</span>`;
+            chip.innerHTML = `${esc(fname)} <span data-remove="1" onclick="event.stopPropagation();this.parentElement.remove();window._commentPendingAttachments=(window._commentPendingAttachments||[]).filter(t=>t!==_PASTE_OPEN+'${link.replace(/'/g,"\\'")}'+_PASTE_CLOSE)" style="cursor:pointer;margin-left:2px;opacity:.6">✕</span>`;
             statusEl.appendChild(chip);
             statusEl.classList.add('active');
           }
@@ -6005,8 +6364,11 @@ async function executeProject(projId, btn) {
                 <div style="font-family:var(--mono);font-size:8px;color:var(--text-dim);margin-top:1px;letter-spacing:.03em;display:flex;align-items:center;gap:6px;flex-wrap:wrap">starting… ${_optChip}</div>
               </div>
               <span class="ns-node-term live" style="font-size:8px;padding:1px 6px;cursor:pointer;flex-shrink:0"
-                title="Attach to live exec session"
+                title="Attach to live exec session (in-page terminal)"
                 onclick="event.stopPropagation();openTerminal('${esc(projId)}',undefined,undefined,'${esc(_optSess)}')">⌨_</span>
+              <span class="ns-node-term live" style="font-size:8px;padding:1px 6px;cursor:pointer;flex-shrink:0"
+                title="Open in browser terminal (ttyd — best on mobile)"
+                onclick="event.stopPropagation();openTtydTerminal('${esc(_optSess)}','${esc(projId)}')">↗_</span>
             </div></div>`;
         }
         // M220: refresh session pane — fast first poll (200ms) then slower follow-ups
@@ -9138,6 +9500,7 @@ function _editSubStar(projId, nsId, curName, curMetric, curTarget, curCurrent, c
     inp.placeholder = 'Item';
     inp.value = val;
     inp.autocomplete = 'off';
+    inp.className = 'ss-item-inp';
     inp.style.cssText = 'flex:1;background:var(--panel-soft);border:1px solid var(--panel-border);border-radius:4px;padding:4px 8px;font-family:var(--mono);font-size:10px;color:var(--text);box-sizing:border-box';
     const delBtn = document.createElement('button');
     delBtn.textContent = '✕';
@@ -9332,12 +9695,20 @@ async function _showSkillBadgeModal(projId, mid, currentSkill, currentAgent, com
     style="font-family:var(--mono);font-size:9px;padding:3px 10px;border-radius:4px;border:1px solid ${active?'var(--accent)':'var(--panel-border)'};background:${active?'var(--accent-soft)':'none'};color:${active?'var(--accent)':'var(--text-dim)'};cursor:pointer">${label}</button>`;
   // M258: item click shows inline flag input below the row
   // M1023: plugin skills get {owner}- prefix in name (server-side), no badge
+  // M1284: add delete button per row (non-plugin only)
   const _row = (name, type, source) => {
+    const isPlugin = (source||'').startsWith('plugin:');
+    const delBtn = !isPlugin ? `<button
+      onclick="event.stopPropagation();_sbDeleteItem('${esc(name)}','${type}',this)"
+      style="margin-left:auto;flex-shrink:0;font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:3px;border:1px solid rgba(192,57,43,.3);background:none;color:var(--red,#c0392b);cursor:pointer;opacity:.5"
+      onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='.5'"
+      title="Delete ${type}">✕</button>` : '';
     return `<div class="sb-row" data-sbname="${esc(name)}" data-sbtype="${type}" data-sbsource="${esc(source||'')}"
       onclick="event.stopPropagation();_sbShowFlagInput(this,'${esc(projId)}','${esc(mid)}','${type}','${esc(name)}')"
       style="padding:5px 8px;border-bottom:1px solid var(--panel-border);cursor:pointer;font-family:var(--mono);font-size:9px;color:var(--text);display:flex;align-items:center"
       onmouseover="this.style.background='var(--accent-soft)'" onmouseout="if(!this.querySelector('.sb-flag-wrap'))this.style.background=''">
-      ${type==='skill'?'⚡':'🤖'} <span style="font-weight:600;margin-left:4px">${esc(name)}</span>
+      <span style="display:flex;align-items:center;flex:1;min-width:0">${type==='skill'?'⚡':'🤖'} <span style="font-weight:600;margin-left:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(name)}</span></span>
+      ${delBtn}
     </div>`;
   };
   // M258 → M1025: server-centralized recent skill/agent (state truth on server,
@@ -9376,7 +9747,7 @@ async function _showSkillBadgeModal(projId, mid, currentSkill, currentAgent, com
       style="width:100%;background:var(--panel-soft);border:1px solid var(--panel-border);border-radius:4px;padding:4px 7px;font-family:var(--mono);font-size:9px;color:var(--text);box-sizing:border-box;margin-bottom:2px">
     <div style="font-family:var(--mono);font-size:8px;color:var(--text-dim);margin-bottom:6px;opacity:.7">Press Enter to use search text as custom invocation with flags</div>
     <div id="sb-list" style="overflow-y:auto;max-height:58vh;border:1px solid var(--panel-border);border-radius:5px">
-      ${topSkills.length ? topSkills.map(s=>`<div class="sb-row" onclick="event.stopPropagation();_sbShowFlagInput(this,'${esc(projId)}','${esc(mid)}','skill','${esc(s.name)}')" style="padding:5px 8px;border-bottom:1px solid var(--panel-border);cursor:pointer;font-family:var(--mono);font-size:9px;color:var(--text)" onmouseover="this.style.background='var(--accent-soft)'" onmouseout="if(!this.querySelector('.sb-flag-wrap'))this.style.background=''">⚡ <span style="font-weight:600">${esc(s.name)}</span><span style="color:var(--text-dim);font-size:8px;margin-left:4px">${s.usage_count}x</span></div>`).join('') : skills.map(s=>_row(s.name,'skill',s.source)).join('')}
+      ${topSkills.length ? topSkills.map(s=>`<div class="sb-row" onclick="event.stopPropagation();_sbShowFlagInput(this,'${esc(projId)}','${esc(mid)}','skill','${esc(s.name)}')" style="padding:5px 8px;border-bottom:1px solid var(--panel-border);cursor:pointer;font-family:var(--mono);font-size:9px;color:var(--text);display:flex;align-items:center" onmouseover="this.style.background='var(--accent-soft)'" onmouseout="if(!this.querySelector('.sb-flag-wrap'))this.style.background=''"><span style="display:flex;align-items:center;flex:1;min-width:0">⚡ <span style="font-weight:600;margin-left:2px">${esc(s.name)}</span><span style="color:var(--text-dim);font-size:8px;margin-left:4px">${s.usage_count}x</span></span><button onclick="event.stopPropagation();_sbDeleteItem('${esc(s.name)}','skill',this)" style="flex-shrink:0;font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:3px;border:1px solid rgba(192,57,43,.3);background:none;color:var(--red,#c0392b);cursor:pointer;opacity:.5" onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='.5'" title="Delete skill">✕</button></div>`).join('') : skills.map(s=>_row(s.name,'skill',s.source)).join('')}
     </div>
     <div id="sb-selected-msg" style="display:none;margin-top:6px;padding:4px 8px;border-radius:4px;background:var(--accent-soft);color:var(--accent);font-family:var(--mono);font-size:9px;text-align:center"></div>
   </div>`;
@@ -9429,6 +9800,30 @@ async function _showSkillBadgeModal(projId, mid, currentSkill, currentAgent, com
     });
   }
 }
+// M1284: delete skill or agent from Assign modal row
+async function _sbDeleteItem(name, type, btn) {
+  if (!confirm(`Delete ${type} "${name}"? (backed up to .md.bak)`)) return;
+  btn.textContent = '…';
+  btn.disabled = true;
+  try {
+    const endpoint = type === 'skill'
+      ? `/api/skill/${encodeURIComponent(name)}`
+      : `/api/agent/${encodeURIComponent(name)}`;
+    const r = await fetch(endpoint, {method:'DELETE'});
+    const d = await r.json().catch(() => ({}));
+    if (d.ok) {
+      btn.closest('.sb-row')?.remove();
+    } else {
+      btn.textContent = '✕';
+      btn.disabled = false;
+      alert(d.error || 'Delete failed');
+    }
+  } catch(e) {
+    btn.textContent = '✕';
+    btn.disabled = false;
+    alert('Delete failed: ' + e.message);
+  }
+}
 // M258: show inline flag input below the clicked skill/agent row
 function _sbShowFlagInput(row, projId, mid, type, name) {
   // Remove any existing flag inputs
@@ -9468,7 +9863,7 @@ function _sbTab(tab) {
   if (tab === 'top') {
     // M1178: top = most-used skills from usage_count (annotated by server from action_log)
     const topItems = (m._skills||[]).filter(s=>s.usage_count>0).sort((a,b)=>b.usage_count-a.usage_count).slice(0,8);
-    list.innerHTML = topItems.length ? topItems.map(s=>`<div class="sb-row" onclick="event.stopPropagation();_sbShowFlagInput(this,'${esc(m._projId)}','${esc(m._mid)}','skill','${esc(s.name)}')" style="padding:5px 8px;border-bottom:1px solid var(--panel-border);cursor:pointer;font-family:var(--mono);font-size:9px;color:var(--text)" onmouseover="this.style.background='var(--accent-soft)'" onmouseout="if(!this.querySelector('.sb-flag-wrap'))this.style.background=''>⚡ <span style="font-weight:600">${esc(s.name)}</span><span style="color:var(--text-dim);font-size:8px;margin-left:4px">${s.usage_count}x</span></div>`).join('') : '<div style="padding:8px;font-family:var(--mono);font-size:9px;color:var(--text-dim)">No usage data yet</div>';
+    list.innerHTML = topItems.length ? topItems.map(s=>`<div class="sb-row" onclick="event.stopPropagation();_sbShowFlagInput(this,'${esc(m._projId)}','${esc(m._mid)}','skill','${esc(s.name)}')" style="padding:5px 8px;border-bottom:1px solid var(--panel-border);cursor:pointer;font-family:var(--mono);font-size:9px;color:var(--text);display:flex;align-items:center" onmouseover="this.style.background='var(--accent-soft)'" onmouseout="if(!this.querySelector('.sb-flag-wrap'))this.style.background=''"><span style="display:flex;align-items:center;flex:1;min-width:0">⚡ <span style="font-weight:600;margin-left:2px">${esc(s.name)}</span><span style="color:var(--text-dim);font-size:8px;margin-left:4px">${s.usage_count}x</span></span><button onclick="event.stopPropagation();_sbDeleteItem('${esc(s.name)}','skill',this)" style="flex-shrink:0;font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:3px;border:1px solid rgba(192,57,43,.3);background:none;color:var(--red,#c0392b);cursor:pointer;opacity:.5" onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='.5'" title="Delete skill">✕</button></div>`).join('') : '<div style="padding:8px;font-family:var(--mono);font-size:9px;color:var(--text-dim)">No usage data yet</div>';
     m.querySelectorAll('[data-tab]').forEach(b=>{const a=b.dataset.tab===tab;b.style.border=`1px solid ${a?'var(--accent)':'var(--panel-border)'}`;b.style.background=a?'var(--accent-soft)':'none';b.style.color=a?'var(--accent)':'var(--text-dim)';});
     return;
   }
@@ -9476,10 +9871,13 @@ function _sbTab(tab) {
   const items = isSkill ? m._skills : m._agents;
   list.innerHTML = items.map(s=>{
     const src = s.source || '';
+    const isPlugin = src.startsWith('plugin:');
+    const delBtn = !isPlugin ? `<button onclick="event.stopPropagation();_sbDeleteItem('${esc(s.name)}','${tab}',this)" style="flex-shrink:0;font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:3px;border:1px solid rgba(192,57,43,.3);background:none;color:var(--red,#c0392b);cursor:pointer;opacity:.5" onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='.5'" title="Delete ${tab}">✕</button>` : '';
     return `<div class="sb-row" data-sbsource="${esc(src)}" onclick="event.stopPropagation();_sbShowFlagInput(this,'${esc(m._projId)}','${esc(m._mid)}','${tab}','${esc(s.name)}')"
       style="padding:5px 8px;border-bottom:1px solid var(--panel-border);cursor:pointer;font-family:var(--mono);font-size:9px;color:var(--text);display:flex;align-items:center"
       onmouseover="this.style.background='var(--accent-soft)'" onmouseout="if(!this.querySelector('.sb-flag-wrap'))this.style.background=''">
-      ${isSkill?'⚡':'🤖'} <span style="font-weight:600;margin-left:4px">${esc(s.name)}</span>
+      <span style="display:flex;align-items:center;flex:1;min-width:0">${isSkill?'⚡':'🤖'} <span style="font-weight:600;margin-left:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.name)}</span></span>
+      ${delBtn}
     </div>`;
   }).join('');
   m.querySelectorAll('[data-tab]').forEach(b => {
@@ -9721,6 +10119,30 @@ async function _branchSession(projId, parentSession) {
   });
 }
 
+// M1244 plan B: open a tmux session in the ttyd web terminal (new tab).
+// ttyd renders a full-fidelity, mobile-reflowing terminal served by a systemd
+// sidecar (ttyd@<session>.service). Falls back to the in-page xterm.js overlay
+// if no ttyd instance is registered for the session.
+async function openTtydTerminal(tmuxSession, projId) {
+  try {
+    const r = await fetch('/api/ttyd/ports');
+    const d = await r.json();
+    const port = d.ports && d.ports[tmuxSession];
+    if (!port) {
+      // No ttyd sidecar for this session — fall back to in-page xterm.js.
+      if (typeof openTerminal === 'function') openTerminal(projId, undefined, undefined, tmuxSession);
+      else alert('ttyd terminal not available for ' + tmuxSession);
+      return;
+    }
+    // M1244 mobile: open the wrapper page (same-origin, soft keyboard bar)
+    // instead of raw ttyd port. Wrapper iframes ttyd and overlays Esc/Tab/Ctrl
+    // keys for mobile use. Raw port still available at http://host:port/.
+    window.open(`/ttyd-wrap?session=${encodeURIComponent(tmuxSession)}`, '_blank', 'noopener');
+  } catch (e) {
+    if (typeof openTerminal === 'function') openTerminal(projId, undefined, undefined, tmuxSession);
+  }
+}
+
 function openTerminal(projId, sessionId, _unused, tmuxSession) {
   // Set loading state
   window._ptyLoading = window._ptyLoading || {};
@@ -9737,10 +10159,10 @@ function openTerminal(projId, sessionId, _unused, tmuxSession) {
   if (bd) bd.style.display = 'block';
   document.getElementById('ns-term-proj').textContent = projId;
   float.style.height = float.dataset.lastH || '680px';
+  const _isMobile = /iPhone|iPad|Android/i.test(navigator.userAgent);
 
   // Init xterm once
   if (!_term) {
-    const _isMobile = /iPhone|iPad|Android/i.test(navigator.userAgent);
     _term = new Terminal({
       cursorBlink: true,
       fontFamily: '"JetBrains Mono", ui-monospace, monospace',
@@ -9753,8 +10175,9 @@ function openTerminal(projId, sessionId, _unused, tmuxSession) {
       convertEol: false,
       // M324: disable auto-scroll-to-bottom on user interaction so drag-select doesn't jump
       scrollOnUserInput: false,
-      // Mobile: DOM renderer enables touch drag-select; desktop: canvas (faster)
-      ..._isMobile ? {rendererType: 'dom'} : {},
+      // M1260: re-enable stdin on mobile per user request — typing works, OS keyboard pops.
+      // Trade-off: viewport scroll can hiccup when keyboard opens; user prefers typing.
+      ..._isMobile ? {disableStdin: false, rendererType: 'dom'} : {},
       theme: {
         background: '#1a1916', foreground: '#d4cfc8', cursor: '#cc785c',
         selectionBackground: '#3d3730',
@@ -9771,6 +10194,20 @@ function openTerminal(projId, sessionId, _unused, tmuxSession) {
     _termFit = new FitAddon.FitAddon();
     _term.loadAddon(_termFit);
     _term.open(document.getElementById('dm-xterm'));
+    // M1259 v5 / M1263 v5: xterm.js forces overflow-y:scroll inline — patch it.
+    // Mobile (coarse pointer): hidden — JS touchmove owns all scrolling, no native scrollbar.
+    // Desktop (fine pointer): auto — native scrollbar for mouse-wheel users.
+    (function _patchXtermViewportOverflow() {
+      const overflowVal = _isMobile ? 'hidden' : 'auto';
+      const apply = (el) => el.style.setProperty('overflow-y', overflowVal, 'important');
+      const vp = document.querySelector('#dm-xterm .xterm-viewport');
+      if (vp) { apply(vp); return; }
+      const obs = new MutationObserver(() => {
+        const el = document.querySelector('#dm-xterm .xterm-viewport');
+        if (el) { apply(el); obs.disconnect(); }
+      });
+      obs.observe(document.getElementById('dm-xterm'), { childList: true, subtree: true });
+    })();
     // M1146: OSC 52 clipboard handler — tmux 'y' copy → browser clipboard on any client (LT-1 etc.)
     // Works on both local and remote browser sessions (no SSH needed, hub-only access).
     if (_term.parser && _term.parser.registerOscHandler) {
@@ -9807,9 +10244,9 @@ function openTerminal(projId, sessionId, _unused, tmuxSession) {
       const patchVP = () => {
         const vp = document.querySelector('#dm-xterm .xterm-viewport');
         if (vp) {
-          vp.style.cssText += ';overflow-y:scroll!important;'
-            + '-webkit-overflow-scrolling:touch!important;'
-            + 'touch-action:pan-y!important;'
+          // M1263 v5: mobile must be hidden — JS touchmove owns scroll; auto causes iOS scrollbar
+          vp.style.cssText += ';overflow-y:hidden!important;'
+            + 'touch-action:none!important;'
             + 'will-change:scroll-position!important;';
         }
         const cv = document.querySelector('#dm-xterm canvas');
@@ -9823,18 +10260,40 @@ function openTerminal(projId, sessionId, _unused, tmuxSession) {
         const host = document.getElementById('dm-xterm');
         if (!vp || !host || host._touchScrollAttached) return;
         host._touchScrollAttached = true;
-        let lastY = 0;
-        host.addEventListener('touchstart', e => { lastY = e.touches[0].clientY; }, { passive: true });
+        let lastY = 0, lastY2 = 0;
+        host.addEventListener('touchstart', e => {
+          lastY = e.touches[0].clientY;
+          lastY2 = e.touches.length >= 2 ? (e.touches[0].clientY + e.touches[1].clientY) / 2 : 0;
+          // M1263 v5: prevent browser pinch-zoom on two-finger start so touchmove captures it
+          if (e.touches.length >= 2) e.preventDefault();
+        }, { passive: false });
         host.addEventListener('touchmove', e => {
           e.preventDefault();
-          const y = e.touches[0].clientY;
-          const dy = lastY - y;
-          lastY = y;
+          const twoFinger = e.touches.length >= 2;
+          let dy;
+          if (twoFinger) {
+            // M1263 v4: two-finger drag = precise wheel-like scroll (half speed, fractional accumulation)
+            const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+            dy = lastY2 - midY;
+            lastY2 = midY;
+            lastY = e.touches[0].clientY; // keep single-finger ref in sync
+          } else {
+            const y = e.touches[0].clientY;
+            dy = lastY - y;
+            lastY = y;
+          }
           if (_term) {
             const lineH = (_term._core?._charSizeService?.height) || 17;
-            const lines = dy / lineH;
+            // two-finger: 0.5x multiplier for wheel-like precision; one-finger: full speed
+            const speed = twoFinger ? 0.5 : 1.0;
+            const lines = (dy / lineH) * speed;
             const stepped = Math.round(lines) || (lines > 0 ? 1 : -1);
             if (Math.abs(lines) >= 0.1) _term.scrollLines(stepped);
+            // M1263: update buf-info on touch scroll
+            const _bufEl = document.getElementById('ns-term-buf-info');
+            if (_bufEl && _term.buffer) {
+              _bufEl.textContent = `${_term.buffer.active.length}/${_term.options.scrollback || 5000}`;
+            }
           } else {
             vp.scrollTop += dy;
           }
@@ -9849,6 +10308,15 @@ function openTerminal(projId, sessionId, _unused, tmuxSession) {
         dmXterm._mobScrollObs.observe(dmXterm, { childList: true, subtree: true });
       }
     };
+    // M1240: click on terminal area refocuses xterm so keyboard input works
+    // M1248: skip focus-on-click on mobile — disableStdin prevents textarea focus but
+    // a click would still trigger the hidden textarea briefly on some browsers.
+    const _xtClickTarget = document.getElementById('dm-xterm');
+    if (_xtClickTarget && !_xtClickTarget._focusClickBound && !_isMobile) {
+      _xtClickTarget._focusClickBound = true;
+      _xtClickTarget.addEventListener('click', () => { try { _term.focus(); } catch(_) {} });
+    }
+
     // Small delay so the container has its final size before fit
     setTimeout(() => {
       _termFit.fit();
@@ -9906,112 +10374,8 @@ function openTerminal(projId, sessionId, _unused, tmuxSession) {
     });
   }
 
-  // M1125 v3: mobile draggable scroll thumb — mimics desktop scrollbar.
-  // iOS hides native scrollbars and synthesized touch can't trigger viewport scroll,
-  // so we render an absolute-positioned thumb on the right edge that user can drag.
-  // Drag delta is converted to lines and passed to _term.scrollLines() directly,
-  // bypassing the iOS touch-on-canvas occlusion problem entirely.
-  if (/iPhone|iPad|Android/i.test(navigator.userAgent)) {
-    const _host = document.getElementById('dm-xterm');
-    if (_host && !_host._mobThumbAttached) {
-      _host._mobThumbAttached = true;
-      // Ensure the host can position the absolute thumb
-      const _hostStyle = window.getComputedStyle(_host);
-      if (_hostStyle.position === 'static') _host.style.position = 'relative';
-      // Create the track + thumb
-      const _track = document.createElement('div');
-      _track.id = 'dm-xterm-mob-track';
-      _track.style.cssText = 'position:absolute;top:0;right:0;width:14px;height:100%;background:rgba(40,38,34,.5);z-index:50;pointer-events:auto;touch-action:none;border-left:1px solid rgba(200,180,160,.18)';
-      const _thumb = document.createElement('div');
-      _thumb.id = 'dm-xterm-mob-thumb';
-      _thumb.style.cssText = 'position:absolute;left:1px;right:1px;background:rgba(200,180,160,.85);border-radius:6px;border:1px solid rgba(120,100,80,.4);min-height:28px;height:28px;top:0;box-shadow:0 1px 3px rgba(0,0,0,.4)';
-      _track.appendChild(_thumb);
-      _host.appendChild(_track);
-
-      const _refreshThumb = () => {
-        if (!_term) return;
-        try {
-          const buf = _term.buffer.active;
-          const total = buf.length;       // total rows in buffer
-          const view  = _term.rows;       // visible rows
-          const top   = buf.viewportY;    // top row index of viewport
-          if (total <= view) {
-            _thumb.style.display = 'none';
-            return;
-          }
-          _thumb.style.display = 'block';
-          const trackH = _track.clientHeight;
-          const thumbH = Math.max(28, Math.round(trackH * view / total));
-          const maxTop = trackH - thumbH;
-          const scrollFrac = top / Math.max(1, total - view);
-          _thumb.style.height = thumbH + 'px';
-          _thumb.style.top = Math.round(maxTop * scrollFrac) + 'px';
-        } catch(_) {}
-      };
-
-      // Update thumb when terminal scrolls (xterm fires onScroll)
-      if (_term && _term.onScroll) {
-        try { _term.onScroll(_refreshThumb); } catch(_) {}
-      }
-      // Update on resize
-      window.addEventListener('resize', _refreshThumb);
-      setTimeout(_refreshThumb, 100);
-      [500, 1500, 3000].forEach(d => setTimeout(_refreshThumb, d));
-
-      // Drag handler — touch start/move on thumb scrolls buffer
-      let _dragY0 = 0, _dragTop0 = 0, _dragging = false;
-      _thumb.addEventListener('touchstart', e => {
-        _dragging = true;
-        _dragY0 = e.touches[0].clientY;
-        _dragTop0 = parseInt(_thumb.style.top || '0', 10);
-        _thumb.style.background = 'rgba(220,200,180,1)';
-        e.preventDefault();
-        e.stopPropagation();
-      }, { passive: false });
-      _thumb.addEventListener('touchmove', e => {
-        if (!_dragging || !_term) return;
-        const y = e.touches[0].clientY;
-        const dy = y - _dragY0;
-        const trackH = _track.clientHeight;
-        const thumbH = _thumb.clientHeight;
-        const maxTop = trackH - thumbH;
-        const newTop = Math.max(0, Math.min(maxTop, _dragTop0 + dy));
-        _thumb.style.top = newTop + 'px';
-        // Map thumb position → buffer scroll line
-        try {
-          const buf = _term.buffer.active;
-          const total = buf.length;
-          const view = _term.rows;
-          const targetTop = Math.round((total - view) * newTop / Math.max(1, maxTop));
-          const curTop = buf.viewportY;
-          _term.scrollLines(targetTop - curTop);
-        } catch(_) {}
-        e.preventDefault();
-        e.stopPropagation();
-      }, { passive: false });
-      const _dragEnd = () => {
-        if (!_dragging) return;
-        _dragging = false;
-        _thumb.style.background = 'rgba(200,180,160,.85)';
-      };
-      _thumb.addEventListener('touchend', _dragEnd, { passive: true });
-      _thumb.addEventListener('touchcancel', _dragEnd, { passive: true });
-
-      // Tap on track (not thumb) → page up/down
-      _track.addEventListener('touchstart', e => {
-        if (e.target === _thumb) return;
-        const rect = _track.getBoundingClientRect();
-        const y = e.touches[0].clientY - rect.top;
-        const thumbTop = parseInt(_thumb.style.top || '0', 10);
-        const thumbH = _thumb.clientHeight;
-        if (_term) {
-          if (y < thumbTop) _term.scrollLines(-_term.rows);  // tap above → page up
-          else if (y > thumbTop + thumbH) _term.scrollLines(_term.rows);  // tap below → page down
-        }
-        e.preventDefault();
-      }, { passive: false });
-    }
-  }
+  // M1263 v3: mobile draggable scroll thumb REMOVED — touchmove handler (above) owns
+  // all scroll; the custom thumb track was rendering a visible scrollbar on mobile.
 
   // Resize handle — bottom-right drag
   const _resizeHandle = document.getElementById('ns-term-resize');
@@ -10087,6 +10451,15 @@ function openTerminal(projId, sessionId, _unused, tmuxSession) {
   // "›_ resume" rather than briefly flash "›_ claude" until the next 3 s poll.
   ws.onopen    = () => {
     _termFit.fit(); _sendResize(ws);
+    // M1263: populate buf-info immediately on connect (mobile sees it even before first ws.onmessage)
+    try { const _b = document.getElementById('ns-term-buf-info');
+      if (_b && _term && _term.buffer) _b.textContent = `${_term.buffer.active.length}/${_term.options.scrollback || 5000}`; } catch(_) {}
+    // M1240: focus xterm so physical keyboard input is immediately captured
+    // M1248: skip on mobile — disableStdin is set, focus would trigger OS keyboard
+    if (!/iPhone|iPad|Android/i.test(navigator.userAgent)) { try { _term.focus(); } catch(_) {} }
+    // M1250: on mobile, force a canvas repaint — iOS Safari sometimes doesn't render
+    // the xterm canvas until an explicit refresh when disableStdin is set.
+    else { try { _term.refresh(0, _term.rows - 1); } catch(_) {} }
     // M178/M163: PTY-only update with agent preservation
     const prevStatus = _ptyStatus[projId];
     let agent = 'claude';  // default
@@ -10153,7 +10526,7 @@ function _setupTermScrollbar() {
   track.id = 'ns-term-sb';
   track.style.cssText = 'position:absolute;right:2px;top:4px;bottom:4px;width:5px;border-radius:3px;z-index:10;pointer-events:none;background:rgba(255,255,255,.07)';
   const thumb = document.createElement('div');
-  thumb.style.cssText = 'position:absolute;width:100%;border-radius:3px;background:rgba(200,180,160,.55);min-height:20px;transition:top .08s,height .08s';
+  thumb.style.cssText = 'position:absolute;width:100%;border-radius:3px;background:rgba(200,180,160,.55);transition:top .08s,height .08s,opacity .08s';
   track.appendChild(thumb);
   if (getComputedStyle(container).position === 'static') container.style.position = 'relative';
   container.appendChild(track);
@@ -10163,8 +10536,10 @@ function _setupTermScrollbar() {
     const buf = _term.buffer.active;
     const total = buf.length;
     const rows = _term.rows;
-    if (total <= rows) { thumb.style.height = '100%'; thumb.style.top = '0'; return; }
-    const thumbPct = Math.max(8, (rows / total) * 100);
+    // M1259: hide thumb when no scrollback; show proportional thumb otherwise
+    if (total <= rows) { thumb.style.height = '0'; thumb.style.opacity = '0'; return; }
+    thumb.style.opacity = '1';
+    const thumbPct = Math.min(40, Math.max(8, (rows / total) * 100)); // cap at 40% max
     const maxScroll = total - rows;
     const scrolledPct = maxScroll > 0 ? (buf.viewportY / maxScroll) * (100 - thumbPct) : 0;
     thumb.style.height = thumbPct + '%';
@@ -10183,6 +10558,32 @@ function _setupTermScrollbar() {
 // text directly into the WebSocket. Bypasses xterm.js onData entirely.
 // Required because mobile keyboards have no paste key + long-press on xterm
 // canvas does not surface the native textarea context menu.
+// M1283: paste-specific prompt using <textarea> with font-size≥16px to prevent iOS auto-zoom.
+// _hubPrompt uses <input type=text font-size:12px> which triggers iOS zoom on focus.
+function _pastePrompt() {
+  return new Promise(resolve => {
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9999;display:flex;align-items:center;justify-content:center';
+    const box = document.createElement('div');
+    box.style.cssText = 'background:var(--panel-bg,var(--panel));border:1px solid var(--panel-border);border-radius:8px;padding:20px;max-width:420px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,.5)';
+    box.innerHTML = `<p style="color:var(--text);margin:0 0 10px;font-size:13px">Paste text:</p>
+      <textarea id="pp-input" rows="4" style="width:100%;box-sizing:border-box;padding:6px 10px;border-radius:4px;border:1px solid var(--panel-border);background:var(--input-bg,rgba(255,255,255,.05));color:var(--text);font-size:16px;font-family:var(--mono);margin-bottom:14px;resize:vertical"></textarea>
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button id="pp-cancel" style="padding:6px 16px;border-radius:4px;border:1px solid var(--panel-border);background:none;color:var(--text-dim);cursor:pointer;font-size:12px">Cancel</button>
+        <button id="pp-ok" style="padding:6px 16px;border-radius:4px;border:none;background:var(--accent);color:#fff;cursor:pointer;font-size:12px;font-weight:600">OK</button>
+      </div>`;
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+    const inp = box.querySelector('#pp-input');
+    inp.focus();
+    const cleanup = (result) => { overlay.remove(); resolve(result); };
+    box.querySelector('#pp-ok').onclick = () => cleanup(inp.value || null);
+    box.querySelector('#pp-cancel').onclick = () => cleanup(null);
+    overlay.onclick = (e) => { if (e.target === overlay) cleanup(null); };
+    inp.addEventListener('keydown', (e) => { if (e.key === 'Escape') cleanup(null); });
+  });
+}
+
 async function pasteToPty() {
   if (!_termWs || _termWs.readyState !== 1) {
     await _hubAlert('Terminal not connected — open a session first.');
@@ -10197,7 +10598,9 @@ async function pasteToPty() {
     // Permission denied or insecure context — fall back to prompt
   }
   if (!txt) {
-    txt = await _hubPrompt('Paste text:') || '';
+    // M1283: use _pastePrompt (textarea + font-size:16px) not _hubPrompt (input + 12px)
+    // to prevent iOS auto-zoom when the input receives focus.
+    txt = await _pastePrompt() || '';
   }
   if (!txt) return;
   _termWs.send(txt);
@@ -10235,9 +10638,20 @@ function _sendKey(seq) {
     return;
   }
   _termWs.send(seq);
-  try { if (_term) _term.focus(); } catch (_) {}
+  // M1283: do NOT call _term.focus() here — on iOS it focuses xterm's hidden textarea
+  // which triggers the native software keyboard. The vkbd panel is the keyboard; native
+  // keyboard is unwanted. Blurring the active element instead keeps iOS keyboard closed.
+  try { if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur(); } catch (_) {}
 }
 
+
+// M1283: prevent focus shift (→ native iOS keyboard) on vkbd key tap.
+// Called on mousedown/pointerdown in capture phase — preventDefault blocks focus before it moves.
+function _vkbdBlockFocus(e) {
+  if (e.target && e.target.classList && e.target.classList.contains('vkbd-key')) {
+    e.preventDefault();
+  }
+}
 
 // M1065 v4: adjust terminal float bottom when iOS keyboard appears/disappears
 function _initVkbdViewportFix() {
@@ -10261,7 +10675,13 @@ function _toggleVkbd() {
   if (btn) btn.classList.toggle('active', open);
   if (open) {
     _initVkbdViewportFix();
+    // M1283: block mousedown/pointerdown on all vkbd keys so iOS never shifts focus
+    // (and thus never opens the native software keyboard) when a key is tapped.
+    panel.addEventListener('mousedown', _vkbdBlockFocus, { capture: true });
+    panel.addEventListener('pointerdown', _vkbdBlockFocus, { capture: true });
   } else {
+    panel.removeEventListener('mousedown', _vkbdBlockFocus, { capture: true });
+    panel.removeEventListener('pointerdown', _vkbdBlockFocus, { capture: true });
     // keyboard closed — restore float position
     const float = document.getElementById('ns-terminal-float');
     if (float) float.style.bottom = '';
@@ -10484,10 +10904,8 @@ async function openDetail(idx) {
   loadMilestones(p.id);
   loadSubStars(p.id);
 
-  ctxTopics = [];
-
   // Render right column then load milestones
-  renderRight(p, []);
+  renderRight(p);
   loadTaskBoard(p.id);
   // M168: poll task-board every 4s so live session work surfaces without manual refresh
   startTaskBoardPoll(p.id);
@@ -11068,56 +11486,67 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
       if (_stone?.verify_flag) { _verifyChip.textContent='verify ✓'; _verifyChip.style.color='var(--green,#3d8b5e)'; _verifyChip.style.background='rgba(61,139,94,.15)'; _verifyChip.style.borderColor='rgba(61,139,94,.4)'; }
     }
   }
-  // M1154 v9 / M1193 v2: ∑N badge — decision-anchored extractive compression (non-LLM SOTA).
-  // Mirrors _score_sentence + _extract_key_sentence + _semantic_compress_turns in server.py.
+  // M1253 v3: AI∑ badge — LLM summary (conversation_summary) takes priority; fallback to extractive ∑N.
   { const _conv = (_msConversations[mid]||[]); const _badge = popup.querySelector('#comment-summary-badge'); const _detail = popup.querySelector('#comment-summary-detail');
     if (_badge) {
-      // M1193 v2: sentence importance scoring — decisions > code > errors > questions
-      const _scoreSentence = (s) => {
-        if (!s || s.length < 3) return 0;
-        let sc = 1.0;
-        if (/\b(완료|수정|해결|적용|구현|commit|fix(ed)?|done|implemented|added|removed|replaced)\b/i.test(s)) sc += 4;
-        if (/(```|\.py|\.ts|\.html|\.md|server\.py|northstar\.html|:\d+|commit [0-9a-f]{5,})/.test(s)) sc += 3;
-        if (/\b(error|bug|fail|warn|exception|traceback|오류|버그|경고|실패)\b/i.test(s)) sc += 2.5;
-        if (/[?？]$/.test(s.trim()) || /\b(왜|어떻게|무엇|어디|언제|why|how|what|where|when)\b/i.test(s)) sc += 2;
-        if (/\b(원인|이유|because|caused|→|therefore|결론|핵심)\b/i.test(s)) sc += 1.5;
-        if (s.length < 25) sc -= 2;
-        if (/^[#*-]/.test(s)) sc += 0.5;
-        return Math.max(0, sc);
-      };
-      const _keyLine = (text, n=200) => {
-        const sents = (text||'').split(/(?<=[.!?。])\s+|\n/).map(s=>s.trim()).filter(Boolean);
-        if (!sents.length) return (text||'').replace(/\n/g,' ').trim().slice(0,n);
-        const scored = sents.filter(s=>s.length>5).map(s=>[s,_scoreSentence(s)]);
-        if (!scored.length) return sents[0].slice(0,n);
-        return scored.reduce((a,b)=>b[1]>a[1]?b:a)[0].slice(0,n);
-      };
-      const _semCompress = (turns) => {
-        let uIdx=0, cIdx=0; const parts=[];
-        for (const t of turns) {
-          const txt = t.text||t.content||'';
-          if (t.role==='user')   { uIdx++; parts.push(`U${uIdx}: ${_keyLine(txt)}`); }
-          else if (t.role==='claude') { cIdx++; parts.push(`C${cIdx}: ${_keyLine(txt)}`); }
+      const _stoneData = Object.values(_msCacheByProject||{}).flatMap(v=>v||[]).find(m=>m.id===mid);
+      const _llmConvSum = _stoneData?.conversation_summary;
+      if (_llmConvSum && _llmConvSum.trim().length > 0) {
+        // Priority 1: LLM-generated summary via attach_summary
+        _badge.textContent = 'AI∑'; _badge.style.display = 'inline';
+        _badge.style.background = 'rgba(74,159,212,.18)'; _badge.style.borderColor = 'rgba(74,159,212,.5)';
+        _badge.style.color = 'var(--accent,#4a9fd4)';
+        _badge.title = 'LLM-compressed summary (attach_summary). Click to show.';
+        if (_detail) { _detail.innerHTML = `<div><span style="font-size:8px;color:var(--accent,#4a9fd4);font-weight:600">AI Summary</span><br>${_renderNtTextHtml(_llmConvSum)}</div>`; }
+      } else {
+        // Fallback: M1154 v9 / M1193 v2 — decision-anchored extractive compression
+        const _scoreSentence = (s) => {
+          if (!s || s.length < 3) return 0;
+          let sc = 1.0;
+          if (/\b(완료|수정|해결|적용|구현|commit|fix(ed)?|done|implemented|added|removed|replaced)\b/i.test(s)) sc += 4;
+          if (/(```|\.py|\.ts|\.html|\.md|server\.py|northstar\.html|:\d+|commit [0-9a-f]{5,})/.test(s)) sc += 3;
+          if (/\b(error|bug|fail|warn|exception|traceback|오류|버그|경고|실패)\b/i.test(s)) sc += 2.5;
+          if (/[?？]$/.test(s.trim()) || /\b(왜|어떻게|무엇|어디|언제|why|how|what|where|when)\b/i.test(s)) sc += 2;
+          if (/\b(원인|이유|because|caused|→|therefore|결론|핵심)\b/i.test(s)) sc += 1.5;
+          if (s.length < 25) sc -= 2;
+          if (/^[#*-]/.test(s)) sc += 0.5;
+          return Math.max(0, sc);
+        };
+        const _keyLine = (text, n=200) => {
+          const sents = (text||'').split(/(?<=[.!?。])\s+|\n/).map(s=>s.trim()).filter(Boolean);
+          if (!sents.length) return (text||'').replace(/\n/g,' ').trim().slice(0,n);
+          const scored = sents.filter(s=>s.length>5).map(s=>[s,_scoreSentence(s)]);
+          if (!scored.length) return sents[0].slice(0,n);
+          return scored.reduce((a,b)=>b[1]>a[1]?b:a)[0].slice(0,n);
+        };
+        const _semCompress = (turns) => {
+          let uIdx=0, cIdx=0; const parts=[];
+          for (const t of turns) {
+            const txt = t.text||t.content||'';
+            if (t.role==='user')   { uIdx++; parts.push(`U${uIdx}: ${_keyLine(txt)}`); }
+            else if (t.role==='claude') { cIdx++; parts.push(`C${cIdx}: ${_keyLine(txt)}`); }
+          }
+          return parts.join(' | ') || `(${turns.length} turns)`;
+        };
+        const _TH=5,_KL=4; const _existSum=_conv.filter(c=>c.role==='summary'); const _raw=_conv.filter(c=>c.role!=='summary');
+        const _hasPrior=_existSum.length>0; let _llmSum=null;
+        if (_hasPrior && _raw.length>_KL+_TH) {
+          const _sq=_raw.slice(0,-_KL);
+          _llmSum=[{role:'summary',text:_semCompress(_sq),ts:_sq[_sq.length-1]?.ts||'',compressed_count:_sq.length}];
+        } else if (_hasPrior && _raw.length<=_KL+_TH) {
+          _llmSum=_existSum;
+        } else if (!_hasPrior && _raw.length>_TH) {
+          const _sq=_raw.slice(0,-_KL);
+          _llmSum=[{role:'summary',text:_semCompress(_sq),ts:_sq[_sq.length-1]?.ts||'',compressed_count:_sq.length}];
         }
-        return parts.join(' | ') || `(${turns.length} turns)`;
-      };
-      const _TH=5,_KL=4; const _existSum=_conv.filter(c=>c.role==='summary'); const _raw=_conv.filter(c=>c.role!=='summary');
-      const _hasPrior=_existSum.length>0; let _llmSum=null;
-      if (_hasPrior && _raw.length>_KL+_TH) { // re-compress
-        const _sq=_raw.slice(0,-_KL);
-        _llmSum=[{role:'summary',text:_semCompress(_sq),ts:_sq[_sq.length-1]?.ts||'',compressed_count:_sq.length}];
-      } else if (_hasPrior && _raw.length<=_KL+_TH) { // between compressions — show existing summary
-        _llmSum=_existSum;
-      } else if (!_hasPrior && _raw.length>_TH) { // first compression
-        const _sq=_raw.slice(0,-_KL);
-        _llmSum=[{role:'summary',text:_semCompress(_sq),ts:_sq[_sq.length-1]?.ts||'',compressed_count:_sq.length}];
+        if (_llmSum && _llmSum.length) {
+          const _cnt=_llmSum.reduce((a,s)=>a+(s.compressed_count||0),0);
+          _badge.textContent='∑ '+(_cnt||_llmSum.length); _badge.style.display='inline';
+          _badge.style.background=''; _badge.style.borderColor=''; _badge.style.color='';
+          _badge.title='LLM receives compressed view — '+(_cnt||'?')+' turns summarized. Click to show.';
+          if (_detail) { _detail.innerHTML=_llmSum.map(s=>`<div style="margin-bottom:4px"><span style="font-size:8px;color:var(--text-dim)">∑ ${s.compressed_count||'?'} turns · ${(s.ts||'').slice(11,16)}</span><br>${_renderNtTextHtml(s.text||'')}</div>`).join('<hr style="border:none;border-top:1px solid var(--panel-border);margin:4px 0">'); }
+        } else { _badge.style.display='none'; if (_detail) _detail.style.display='none'; }
       }
-      if (_llmSum && _llmSum.length) {
-        const _cnt=_llmSum.reduce((a,s)=>a+(s.compressed_count||0),0);
-        _badge.textContent='∑ '+(_cnt||_llmSum.length); _badge.style.display='inline';
-        _badge.title='LLM receives compressed view — '+(_cnt||'?')+' turns summarized. Click to show.';
-        if (_detail) { _detail.innerHTML=_llmSum.map(s=>`<div style="margin-bottom:4px"><span style="font-size:8px;color:var(--text-dim)">∑ ${s.compressed_count||'?'} turns · ${(s.ts||'').slice(11,16)}</span><br>${_renderNtTextHtml(s.text||'')}</div>`).join('<hr style="border:none;border-top:1px solid var(--panel-border);margin:4px 0">'); }
-      } else { _badge.style.display='none'; if (_detail) _detail.style.display='none'; }
     }
   }
   // M263: restore click-outside auto-close (user wants swimlane click to dismiss the
@@ -11244,7 +11673,7 @@ async function _handleCommentDrop(event, projId) {
         const d = await r.json();
         const link = d.url || d.path || d.filename || file.name;
         // M890: show chip in status bar, not raw text in input
-        const pasteToken = `PASTE${link}/PASTE`;
+        const pasteToken = _PASTE_OPEN + link + _PASTE_CLOSE;
         window._commentPendingAttachments = window._commentPendingAttachments || [];
         window._commentPendingAttachments.push(pasteToken);
         const statusEl = document.getElementById('comment-upload-status');
@@ -11256,7 +11685,7 @@ async function _handleCommentDrop(event, projId) {
           chip.style.cssText = 'display:inline-flex;align-items:center;gap:4px;padding:2px 6px;border-radius:3px;background:var(--accent-soft);border:1px solid var(--accent);color:var(--accent);font-size:9px;font-family:var(--mono);cursor:pointer;margin:2px 2px 0 0';
           chip.title = isImg||isVideo ? 'Click to preview' : link;
           chip.onclick = (e) => { if (!e.target.matches('span[data-remove]')) _showAttachmentPreview(link, isImg, isVideo); };
-          chip.innerHTML = `${esc(fname)} <span data-remove="1" onclick="event.stopPropagation();this.parentElement.remove();window._commentPendingAttachments=(window._commentPendingAttachments||[]).filter(t=>t!=='${pasteToken.replace(/'/g,"\\'")}');" style="cursor:pointer;margin-left:2px;opacity:.6">✕</span>`;
+          chip.innerHTML = `${esc(fname)} <span data-remove="1" onclick="event.stopPropagation();this.parentElement.remove();window._commentPendingAttachments=(window._commentPendingAttachments||[]).filter(t=>t!==_PASTE_OPEN+'${link.replace(/'/g,"\\'")}'+_PASTE_CLOSE);" style="cursor:pointer;margin-left:2px;opacity:.6">✕</span>`;
           statusEl.appendChild(chip);
           statusEl.classList.add('active');
         }
@@ -11320,7 +11749,7 @@ async function _doCommentReply(projId, mid, inputEl, currentStatus) {
       ...(entry.agent_refs||[entry.agent_ref]).filter(Boolean).map(a=>`<span style="font-size:8px;padding:1px 4px;border-radius:2px;background:rgba(61,139,94,.12);color:var(--green,#3d8b5e);margin-left:3px">🤖${esc(a)}</span>`),
     ].join('');
     msgDiv.innerHTML = `<div style="font-size:9px;color:var(--text-dim)">you · ${entry.ts.slice(11,16)}${_skillTags}</div>
-      <div style="font-size:11px;color:var(--text);margin-top:1px">${esc(reply)}</div>`;
+      <div style="font-size:11px;color:var(--text);margin-top:1px">${_renderNtTextHtml(reply)}</div>`;
     threadEl.appendChild(msgDiv);
     // M465: scroll the actual scroll container (parent of threadArea), not inner threadEl
     const scrollArea = threadArea.parentElement;
@@ -11662,13 +12091,8 @@ async function loadTaskBoard(projId) {
   } catch(_) {}
 }
 
-function renderRight(p, topics) {
-  const topicsHtml = topics.slice(0, 7).map(t =>
-    `<div class="ctx-item">
-      <div class="ctx-heat"><div class="ctx-heat-fill" style="width:${Math.round(t.heat*100)}%"></div></div>
-      <span class="ctx-label">[${esc(t.type)}] ${esc(t.label)}</span>
-    </div>`
-  ).join('') || `<div style="font-size:11px;color:var(--text-dim);font-family:var(--mono)">CTX offline or no activity</div>`;
+function renderRight(p) {
+  const topicsHtml = '';
 
   // Inject execute buttons into left panel slot
   const specSlot = document.getElementById('dm-spec-slot');
@@ -11983,6 +12407,9 @@ function renderRight(p, topics) {
                 <span class="ns-node-term ${_termClass}" title="${_termTitle}"
                   style="font-size:8px;padding:1px 6px;cursor:pointer;flex-shrink:0"
                   onclick="event.stopPropagation();openTerminal('${esc(p.id)}'${_tmuxArg})">⌨_</span>
+                ${s.session ? `<span class="ns-node-term ${_termClass}" title="Open in browser terminal (ttyd — mobile-friendly with virtual keyboard)"
+                  style="font-size:8px;padding:1px 6px;cursor:pointer;flex-shrink:0;margin-left:3px"
+                  onclick="event.stopPropagation();openTtydTerminal('${esc(s.session)}','${esc(p.id)}')">↗_</span>` : ''}
                 <!-- M883: branch button removed from session row -->
               </div>`;
             }).join('') + `</div>`;
@@ -12163,7 +12590,10 @@ function renderRight(p, topics) {
             const _execRunning = isExecLive && (window._execStatus?.[_projId] === 'running');
             // Terminal button: .live (green pulse) when processing, .idle (orange) when waiting
             const _ptyRowBtn = `<span class="ns-node-term${isExecLive ? (_execRunning ? ' live' : ' idle') : _ptyTermClass}" style="font-size:8px;padding:1px 6px;cursor:pointer;flex-shrink:0"
-              title="${_ptyRowBtnTitle}" onclick="event.stopPropagation();openTerminal('${esc(_projId)}'${_execLiveArg})">${isExecLive ? '⌨_' : _ptyTermLabel}</span>`;
+              title="${_ptyRowBtnTitle}" onclick="event.stopPropagation();openTerminal('${esc(_projId)}'${_execLiveArg})">${isExecLive ? '⌨_' : _ptyTermLabel}</span>`
+              + (isExecLive && _tmuxSession ? `<span class="ns-node-term live" style="font-size:8px;padding:1px 6px;cursor:pointer;flex-shrink:0;margin-left:3px"
+                  title="Open in browser terminal (ttyd — mobile-friendly with virtual keyboard)"
+                  onclick="event.stopPropagation();openTtydTerminal('${esc(_tmuxSession)}','${esc(_projId)}')">↗_</span>` : '');
             // M253: for fresh rows, use current dropdown agent/model so switching to openrouter
             // then clicking "new session" doesn't reset dropdowns back to claude default.
             // M271: fresh rows use dropdown's actual current value to preserve user selection
@@ -12206,25 +12636,6 @@ function renderRight(p, topics) {
   document.getElementById('dm-right').innerHTML = '<div id="dm-align-result"></div><div id="eval-result"></div>';
 }
 
-async function autoRunAlignment(p, topics) {
-  if (!topics.length) {
-    document.getElementById('dm-align-result').innerHTML =
-      '<div style="font-size:11px;color:var(--text-dim)">No CTX activity — start Claude Code to track work</div>';
-    return;
-  }
-  try {
-    const r = await fetch('/api/northstar/align', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ project: p, topics }),
-    });
-    const align = await r.json();
-    if (align.error) throw new Error(align.error);
-    renderAlignResult(align);
-  } catch(e) {
-    const el = document.getElementById('dm-align-result');
-    if (el) el.innerHTML = `<div style="font-size:11px;color:var(--text-dim)">Alignment check unavailable</div>`;
-  }
-}
 
 function renderAlignResult(align) {
   const el = document.getElementById('dm-align-result');
@@ -12255,160 +12666,6 @@ async function refreshAlignment() {
   const el = document.getElementById('dm-align-result');
   if (el) el.innerHTML = '<div style="font-size:11px;color:var(--text-dim)">CTX disabled</div>';
 }
-
-async function renderDrawer_DEPRECATED() {
-  // REMOVED — replaced by openDetail() + renderHierarchy() + renderRight()
-  if (activeIdx === null) return;
-  const p = projects[activeIdx];
-
-  const scroll = document.getElementById('drawer-scroll');
-  scroll.innerHTML = '<div style="padding:20px;color:var(--text-dim);font-family:var(--mono);font-size:12px">Loading…</div>';
-
-  // Fetch spec doc
-  const docData = await fetch(`/api/northstar/${esc(p.id)}/doc`).then(r => r.json()).catch(() => ({ ok: false }));
-
-  const pct = projectPct(p);
-  const color = statusColor(p.status);
-  const statusKey = p.status || 'paused';
-
-  // Large drawer gauge
-  const cx = 110, cy = 105, r = 90;
-  const bgPath = `M ${cx - r} ${cy} A ${r} ${r} 0 0 1 ${cx + r} ${cy}`;
-  const fgPath = gaugePath(pct, cx, cy, r);
-
-  // Milestone list
-  const activeMs = p.milestones.findIndex(m => !m.done);
-  const msHtml = p.milestones.map((m, i) => {
-    const isDone   = m.done;
-    const isActive = i === activeMs;
-    const dotClass = isDone ? 'done' : (isActive ? 'active' : '');
-    const textClass = isDone ? 'done' : (isActive ? 'active' : '');
-    const lineClass = isDone ? 'done' : '';
-    const hasLine = i < p.milestones.length - 1;
-    return `<div class="d-ms-item">
-      <div class="d-ms-indicator">
-        <div class="d-ms-dot ${dotClass}"></div>
-        ${hasLine ? `<div class="d-ms-vline ${lineClass}"></div>` : ''}
-      </div>
-      <div class="d-ms-content">
-        <div class="d-ms-text ${textClass}">${esc(m.text)}</div>
-      </div>
-    </div>`;
-  }).join('') || '<div style="font-size:12px;color:var(--text-dim)">No milestones defined</div>';
-
-  // CTX activity strip
-  const topicsHtml = ctxTopics.slice(0, 6).map(t =>
-    `<div class="ctx-item">
-      <div class="ctx-heat"><div class="ctx-heat-fill" style="width:${Math.round(t.heat * 100)}%"></div></div>
-      <span class="ctx-label">[${esc(t.type)}] ${esc(t.label)}</span>
-    </div>`
-  ).join('') || '<div style="font-size:11px;color:var(--text-dim);font-family:var(--mono)">CTX offline or no activity</div>';
-
-  // Stale warning
-  const staleHtml = p.stale
-    ? `<div class="stale-warn">⚠ Current metrics stale (&gt;14 days) — update north-star.md before alignment check</div>`
-    : '';
-
-  scroll.innerHTML = `
-
-    ${staleHtml}
-
-    <!-- Large gauge -->
-    <div>
-      <div class="d-label">Progress</div>
-      <div class="d-gauge-wrap">
-        <svg width="220" height="118" viewBox="0 0 220 118">
-          <path class="gauge-track" d="${bgPath}" stroke-width="12"/>
-          <path class="gauge-fill" d="${fgPath}" stroke="${color}" stroke-width="12"
-            fill="none" stroke-linecap="round"/>
-          <text x="${cx}" y="${cy - 20}" text-anchor="middle"
-            font-family="Fraunces,Georgia,serif" font-size="22" font-weight="400" fill="${color}">
-            ${Math.round(pct * 100)}%
-          </text>
-          <text x="${cx}" y="${cy - 5}" text-anchor="middle"
-            font-family="JetBrains Mono,monospace" font-size="9" fill="var(--text-dim)">
-            of target
-          </text>
-        </svg>
-      </div>
-      <div class="d-gauge-numbers">
-        <span class="d-current" style="color:${color}">${esc(p.current || '—')}</span>
-        <span class="d-sep">→</span>
-        <span class="d-target">${esc(p.target || '—')}</span>
-      </div>
-      ${p.deadline ? `<div style="text-align:center;font-size:11px;color:var(--text-dim);font-family:var(--mono);margin-top:6px">deadline: ${esc(p.deadline)}</div>` : ''}
-    </div>
-
-    <!-- Status -->
-    <div>
-      <div class="d-label">Status</div>
-      <div class="d-status-row">
-        ${['on-track','behind','achieved','paused'].map(s =>
-          `<span class="d-status-chip ${s} ${s === statusKey ? 'active' : ''}">${STATUS_LABEL[s]}</span>`
-        ).join('')}
-      </div>
-    </div>
-
-    <!-- Note -->
-    ${p.note ? `<div>
-      <div class="d-label">Context</div>
-      <div class="d-note">${esc(p.note)}</div>
-    </div>` : ''}
-
-    <!-- Milestones -->
-    <div>
-      <div class="d-label">Milestones — ${p.milestones.filter(m=>m.done).length}/${p.milestones.length}</div>
-      <div class="d-ms-list">${msHtml}</div>
-    </div>
-
-    <!-- Spec doc -->
-    <div>
-      <div class="d-label">Spec document</div>
-      ${docData.ok
-        ? `<button class="d-doc-btn" onclick="openDoc('${esc(p.id)}','${esc(docData.path)}')">
-            <span class="d-doc-icon">◈</span>
-            <span>north-star.md</span>
-          </button>
-          <div class="d-doc-path">${esc(docData.path)}</div>`
-        : `<div style="font-size:12px;color:var(--text-dim);font-family:var(--mono)">no spec doc found — create ${esc(p.id)}/north-star.md</div>`
-      }
-    </div>
-
-    <!-- CTX activity -->
-    <div>
-      <div class="d-label">Recent work (CTX)</div>
-      <div class="ctx-strip">${topicsHtml}</div>
-    </div>
-
-    <!-- Alignment pulse -->
-    <div>
-      <div class="d-label">Alignment Pulse</div>
-      <button class="d-action-btn pulse-btn" id="pulse-btn" onclick="runPulse()">
-        <span id="pulse-btn-text">◉ Check work alignment</span>
-      </button>
-      <div id="pulse-result"></div>
-    </div>
-
-    <!-- Expert eval -->
-    <div>
-      <div class="d-label">Expert Evaluation</div>
-      <button class="d-action-btn" id="eval-btn" onclick="runEval()">
-        <span id="eval-btn-text">◈ Evaluate north star</span>
-      </button>
-      <div id="eval-result"></div>
-    </div>
-
-  `;
-}
-
-
-// ── Milestone sync (CTX-based auto-detection) ────────────────────────────────
-
-// syncMilestones removed — button removed, Claude manages milestones via Stop hook cron
-
-// (runPulse removed — alignment now auto-runs via autoRunAlignment() on modal open)
-
-// ── Expert Eval ───────────────────────────────────────────────────────────────
 
 async function runEval() {
   if (activeIdx === null) return;
@@ -13062,6 +13319,7 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
               const _binp = document.createElement('input');
               // M831.3: input empty by default; suggested name shown as placeholder only
               _binp.placeholder = _suggested;
+              _binp.className = 'sess-name-inp';
               _binp.style.cssText = 'width:100%;box-sizing:border-box;padding:5px 8px;border:1px solid var(--panel-border);border-radius:4px;background:var(--panel-soft,var(--panel));color:var(--text);font-family:var(--mono);font-size:11px;margin-bottom:10px';
               const _bbr = document.createElement('div');
               _bbr.style.cssText = 'display:flex;gap:8px;justify-content:flex-end';
@@ -13274,6 +13532,7 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
               _rbox.innerHTML = '<div style="margin-bottom:10px;font-weight:600">Rename session</div>';
               const _rinp = document.createElement('input');
               _rinp.value = s.name;
+              _rinp.className = 'sess-name-inp';
               _rinp.style.cssText = 'width:100%;box-sizing:border-box;padding:5px 8px;border:1px solid var(--panel-border);border-radius:4px;background:var(--panel-soft,var(--panel));color:var(--text);font-family:var(--mono);font-size:11px;margin-bottom:10px';
               const _rbr = document.createElement('div');
               _rbr.style.cssText = 'display:flex;gap:8px;justify-content:flex-end';
@@ -13382,6 +13641,7 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
         const _newSessInput = document.createElement('input');
         _newSessInput.value = _sessSuffix;
         _newSessInput.placeholder = 'suffix…';
+        _newSessInput.className = 'sess-suffix-inp';
         // M831.3 + M859: prefix is separate locked span; input holds suffix only
         _newSessInput.style.cssText = 'font-family:var(--mono);font-size:10px;background:var(--panel-soft,var(--panel));border:1px solid var(--panel-border);border-left:none;color:var(--text);padding:2px 6px;border-radius:0 3px 3px 0;flex:1;min-width:40px;outline:none';
         const _newSessBtn = document.createElement('button');
@@ -13499,15 +13759,45 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
     const _watchCnt = _allStones.filter(s => s.watching && !s.held).length;
     {
       const sep = `<span style="color:var(--text-dim)">/</span>`;
-      // M1163 v3: ALWAYS render all 4 slots in order review/queued/pc/watching.
-      // Each slot keeps its own color even when value is 0 (user request — no dim fallback).
-      const parts = [
-        `<span style="color:var(--green,#3d8b5e)" title="${_reviewCnt} review stone(s)">${_reviewCnt}</span>`,
-        `<span style="color:var(--accent)" title="${_qCnt} queued">${_qCnt}</span>`,
-        `<span style="color:#4a9fd4" title="${_pcCnt} pending confirmation">${_pcCnt}</span>`,
-        `<span style="color:#fbbb24" title="${_watchCnt} watching">${_watchCnt}</span>`,
+      const sepPipe = `<span style="color:var(--text-dim)">+</span>`;
+      // M1258: compute which count slot(s) contain a blinking mid so we can
+      // blink only that number instead of the whole section bar.
+      const _bm1258_sKey = ns ? (ns.id || '__ungrouped__') : '__ungrouped__';
+      const _bm1258_entry = (window._blinkState && window._blinkState[_proj] && window._blinkState[_proj][_bm1258_sKey]);
+      const _bm1258_win = (window._blinkWindowMin || 60) * 60 * 1000;
+      const _bm1258_now = Date.now();
+      const _bm1258_map = (_bm1258_entry && _bm1258_entry.mids && typeof _bm1258_entry.mids === 'object' && !Array.isArray(_bm1258_entry.mids))
+        ? _bm1258_entry.mids : {};
+      const _bm1258_set = new Set(Object.entries(_bm1258_map)
+        .filter(([, _ts]) => (_bm1258_now - (_ts || 0)) < _bm1258_win)
+        .map(([_m]) => _m));
+      // M1260: all 4 slots blink when they have active blink stones; pc+watch grouped with border
+      const _blink = {q:false, review:false, pc:false, watch:false};
+      if (_bm1258_set.size > 0) {
+        for (const s of _allStones) {
+          if (!_bm1258_set.has(s.id)) continue;
+          if (s.held) continue;
+          if (s.watching) _blink.watch = true;
+          else if (s.status === 'pending_confirmation' && !s.done) _blink.pc = true;
+          else if (s.status === 'queued' && !s.done) _blink.q = true;
+          else if (s.status === 'review' && !s.done) _blink.review = true;
+        }
+      }
+      const _cls = (k) => _blink[k] ? ' ss-cnt-blink' : '';
+      // M1260: pc+watch grouped with a subtle rounded border to visually distinguish from q/review
+      const _pcWatchGroupStyle = 'display:inline-flex;align-items:center;gap:2px;'
+        + 'border:1px solid rgba(74,159,212,.45);border-radius:4px;padding:0 3px;margin-left:1px;';
+      // M1163 v3: ALWAYS render all 4 slots. M1255: order = queued/review/pc/watching.
+      const slots = [
+        `<span class="ss-cnt-q${_cls('q')}" style="color:var(--accent)" title="${_qCnt} queued">${_qCnt}</span>`,
+        `<span class="ss-cnt-review${_cls('review')}" style="color:var(--green,#3d8b5e)" title="${_reviewCnt} review stone(s)">${_reviewCnt}</span>`,
       ];
-      countSpan.innerHTML = parts.join(sep);
+      const pcWatchGroup = `<span style="${_pcWatchGroupStyle}">`
+        + `<span class="ss-cnt-pc${_cls('pc')}" style="color:#4a9fd4" title="${_pcCnt} pending confirmation">${_pcCnt}</span>`
+        + `<span style="color:rgba(255,255,255,.3);font-size:.8em">|</span>`
+        + `<span class="ss-cnt-watch${_cls('watch')}" style="color:#fbbb24" title="${_watchCnt} watching">${_watchCnt}</span>`
+        + `</span>`;
+      countSpan.innerHTML = slots[0] + sep + slots[1] + sep + pcWatchGroup;
     }
     // M1163: always visible (no auto-hide).
     countSpan.style.display = '';
@@ -13524,14 +13814,20 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
     // Server stamps blink_state on every stone status change; client reads it
     // each poll cycle (fetched in loadMilestones). blink_window_min = user-settable
     // display filter (default 60min); server prunes entries older than 48h.
+    // M1227 v2: schema {sKey:{mids:{mid:ts}}} — per-mid ts so stones in same substar
+    // don't contaminate each other's blink window.
     {
       window._ssBlinkMids = window._ssBlinkMids || {};
       const _sKey = ns ? (ns.id || '__ungrouped__') : '__ungrouped__';
       const _serverEntry = (window._blinkState && window._blinkState[_proj] && window._blinkState[_proj][_sKey]);
       const _winMs = (window._blinkWindowMin || 60) * 60 * 1000;
-      const _entryAge = _serverEntry ? (Date.now() - (_serverEntry.ts || 0)) : Infinity;
-      const _inWindow = _serverEntry && _entryAge < _winMs;
-      const _blinkMidsArr = (_inWindow && Array.isArray(_serverEntry.mids)) ? _serverEntry.mids : [];
+      const _now = Date.now();
+      // Per-mid ts check: each mid must be within window individually
+      const _midTsMap = (_serverEntry && _serverEntry.mids && typeof _serverEntry.mids === 'object' && !Array.isArray(_serverEntry.mids))
+        ? _serverEntry.mids : {};
+      const _blinkMidsArr = Object.entries(_midTsMap)
+        .filter(([, _ts]) => (_now - (_ts || 0)) < _winMs)
+        .map(([_m]) => _m);
       if (_blinkMidsArr.length > 0) {
         hTd.classList.add('ss-mg-blink');
         window._ssBlinkMids[_sKey] = new Set(_blinkMidsArr);
@@ -14045,7 +14341,7 @@ document.addEventListener('DOMContentLoaded', _hubConsentInit);
 // ── end M561 ──────────────────────────────────────────────────────────────────
 
 // ── M1227: blink state — server SQLite is single source of truth ─────────────
-// window._blinkState[projId][sKey] = {ts, mids[]} — populated per poll cycle
+// window._blinkState[projId][sKey] = {mids:{mid:ts}} — per-mid ts (M1227 v2)
 // in loadMilestones(). No localStorage. Server prunes entries older than 48h.
 // _mark_blink_server() on status change stamps; done/skip/pending_confirmation removes.
 window._blinkState = window._blinkState || {};
@@ -14132,6 +14428,7 @@ function _makeCustomAvatarRow(keyVal, urlVal) {
   keyInp.type = 'text';
   keyInp.placeholder = 'model key e.g. owl-alpha';
   keyInp.value = keyVal;
+  keyInp.className = 'model-key-inp';
   keyInp.style.cssText = 'width:100%;font-family:var(--mono);font-size:10px;font-weight:600;padding:3px 6px;background:var(--bg-deep);border:1px solid var(--panel-border);border-radius:4px;color:var(--text);box-sizing:border-box';
 
   const inp = document.createElement('input');
@@ -14139,6 +14436,7 @@ function _makeCustomAvatarRow(keyVal, urlVal) {
   inp.dataset.modelKey = (keyVal || '').trim();
   inp.placeholder = 'Image URL or /uploads/… path';
   inp.value = urlVal;
+  inp.className = 'model-url-inp';
   inp.style.cssText = 'flex:1;font-family:var(--mono);font-size:9px;padding:3px 6px;background:var(--bg-deep);border:1px solid var(--panel-border);border-radius:4px;color:var(--text);box-sizing:border-box;min-width:0';
   inp.oninput = () => _avatarPreviewUpdate(inp);
   // keep data-model-key in sync with the editable key field
@@ -14275,6 +14573,7 @@ function _showModelAvatarSettings() {
     inp.type = 'text';
     inp.placeholder = 'Image URL or /uploads/… path';
     inp.value = url;
+    inp.className = 'model-url-inp';
     inp.style.cssText = 'flex:1;font-family:var(--mono);font-size:9px;padding:3px 6px;background:var(--bg-deep);border:1px solid var(--panel-border);border-radius:4px;color:var(--text);margin-top:3px;box-sizing:border-box;min-width:0';
     inp.oninput = () => _avatarPreviewUpdate(inp);
 
@@ -14387,6 +14686,86 @@ async function _saveModelAvatarSettings() {
 }
 // ── end M685 ──────────────────────────────────────────────────────────────────
 
+// ── M1275: Corpus management modal ───────────────────────────────────────────
+async function _showCorpusModal() {
+  document.getElementById('corpus-modal')?.remove();
+  const data = await fetch('/api/corpus/skills-agents').then(r=>r.json()).catch(()=>({skills:[],agents:[]}));
+  const skills = data.skills || [];
+  const agents = data.agents || [];
+
+  const m = document.createElement('div');
+  m.id = 'corpus-modal';
+  m.style.cssText = 'position:fixed;inset:0;z-index:10500;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.55)';
+
+  const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+  const renderItems = (items, type) => items.map(item => {
+    const isPlugin = (item.source||'').startsWith('plugin:');
+    const key = type === 'skill' ? (item.dir || item.name) : item.name;
+    const delBtn = !isPlugin ? `<button
+      onclick="event.stopPropagation();_corpusDelete('${esc(item.name)}','${type}','${esc(key)}',this)"
+      style="margin-left:auto;flex-shrink:0;font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:3px;border:1px solid rgba(192,57,43,.3);background:none;color:var(--red,#c0392b);cursor:pointer;opacity:.6"
+      onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='.6'">✕</button>` : `<span style="margin-left:auto;font-family:var(--mono);font-size:8px;color:var(--text-dim);opacity:.6">plugin</span>`;
+    return `<div style="display:flex;align-items:center;padding:5px 8px;border-bottom:1px solid var(--panel-border);font-family:var(--mono);font-size:9px;color:var(--text)">
+      ${type==='skill'?'⚡':'🤖'} <span style="margin-left:4px">${esc(item.name)}</span>
+      ${delBtn}
+    </div>`;
+  }).join('') || `<div style="padding:10px;font-family:var(--mono);font-size:9px;color:var(--text-dim);text-align:center">None found</div>`;
+
+  m.innerHTML = `<div style="background:var(--panel);border:1px solid var(--panel-border);border-radius:10px;padding:16px 18px;max-width:380px;width:92%;max-height:85vh;display:flex;flex-direction:column;font-family:var(--mono);box-shadow:0 8px 32px rgba(0,0,0,.45)">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+      <span style="font-size:11px;font-weight:700;color:var(--text)">Corpus</span>
+      <button onclick="document.getElementById('corpus-modal').remove()"
+        style="background:none;border:none;color:var(--text-dim);font-size:15px;cursor:pointer;padding:2px 6px;line-height:1">x</button>
+    </div>
+    <input id="corpus-search" placeholder="Filter…" oninput="_corpusFilter()"
+      style="width:100%;box-sizing:border-box;padding:5px 8px;border-radius:4px;border:1px solid var(--panel-border);background:var(--bg-deep,var(--bg));color:var(--text);font-family:var(--mono);font-size:9px;margin-bottom:8px">
+    <div style="overflow-y:auto;max-height:65vh">
+      <div style="font-family:var(--mono);font-size:8px;font-weight:700;color:var(--text-dim);padding:4px 8px;letter-spacing:.06em">SKILLS (${skills.length})</div>
+      <div id="corpus-skills-list">${renderItems(skills,'skill')}</div>
+      <div style="font-family:var(--mono);font-size:8px;font-weight:700;color:var(--text-dim);padding:8px 8px 4px;letter-spacing:.06em">AGENTS (${agents.length})</div>
+      <div id="corpus-agents-list">${renderItems(agents,'agent')}</div>
+    </div>
+  </div>`;
+
+  m.addEventListener('click', e => { if (e.target === m) m.remove(); });
+  document.body.appendChild(m);
+  setTimeout(() => m.querySelector('#corpus-search')?.focus(), 50);
+}
+
+function _corpusFilter() {
+  const m = document.getElementById('corpus-modal');
+  if (!m) return;
+  const q = (m.querySelector('#corpus-search').value || '').toLowerCase();
+  m.querySelectorAll('#corpus-skills-list > div, #corpus-agents-list > div').forEach(row => {
+    row.style.display = (!q || row.textContent.toLowerCase().includes(q)) ? '' : 'none';
+  });
+}
+
+async function _corpusDelete(name, type, key, btn) {
+  if (!confirm(`Delete ${type} "${name}"? (backed up to .md.bak)`)) return;
+  btn.textContent = '…';
+  btn.disabled = true;
+  try {
+    const endpoint = type === 'skill'
+      ? `/api/skill/${encodeURIComponent(key)}`
+      : `/api/agent/${encodeURIComponent(key)}`;
+    const r = await fetch(endpoint, {method:'DELETE'});
+    const d = await r.json().catch(() => ({}));
+    if (d.ok) {
+      btn.closest('div[style*="display:flex"]')?.remove();
+    } else {
+      btn.textContent = '✕';
+      btn.disabled = false;
+      alert(d.error || 'Delete failed');
+    }
+  } catch(e) {
+    btn.textContent = '✕';
+    btn.disabled = false;
+    alert('Delete failed: ' + e.message);
+  }
+}
+
 // ── M705: Hub Config modal ────────────────────────────────────────────────────
 async function _showHubConfigModal() {
   document.getElementById('ns-hub-config-modal')?.remove();
@@ -14435,6 +14814,7 @@ async function _showHubConfigModal() {
     inp.type = 'text';
     inp.placeholder = placeholder;
     inp.value = value || '';
+    inp.className = 'settings-inp';
     inp.style.cssText = 'width:100%;box-sizing:border-box;padding:6px 10px;border-radius:5px;border:1px solid var(--panel-border);background:var(--bg-deep,var(--bg));color:var(--text);font-family:var(--mono);font-size:11px';
     inp.addEventListener('focus', () => inp.style.borderColor = 'var(--accent)');
     inp.addEventListener('blur',  () => inp.style.borderColor = 'var(--panel-border)');
@@ -14543,6 +14923,19 @@ async function _showHubConfigModal() {
   setTimeout(() => document.getElementById('hcfg-claude-path')?.focus(), 60);
 }
 // ── end M705 config modal ─────────────────────────────────────────────────────
+
+// M1265: rclone onboarding check — show banner if gdrive not configured
+(async function _rcloneOnboardCheck() {
+  try {
+    const r = await fetch('/api/setup/rclone-status', {cache: 'no-store'});
+    if (!r.ok) return;
+    const d = await r.json();
+    if (d.setup_required) {
+      const b = document.getElementById('rclone-onboard-banner');
+      if (b) b.style.display = 'block';
+    }
+  } catch(_) {}
+})();
 </script>
 </body>
 </html>

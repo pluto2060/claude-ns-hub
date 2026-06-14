@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Hub server — unified portal aggregating CTX, Entity Corpus, and North Star.
+Hub server — unified portal aggregating Entity Corpus and North Star.
 North Star is a first-class built-in page (multi-project manager), not an iframe.
 """
 import asyncio
@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -34,7 +35,7 @@ _HUB_DATA_DIR = Path(os.environ.get("HUB_DATA_DIR", str(Path.home() / ".hub")))
 _DEFAULT_PROJECTS_DIR = _HUB_DATA_DIR / "projects"
 PROJECTS_DIR = Path(os.environ.get("HUB_PROJECTS_DIR", str(_DEFAULT_PROJECTS_DIR)))
 
-HOST = os.environ.get("HUB_HOST", "0.0.0.0")
+HOST = os.environ.get("HUB_HOST", "")  # resolved below after _tailscale_interface_ip is defined
 PORT = int(os.environ.get("HUB_PORT", "9000"))
 
 # M705: Per-user config — agent/model defaults that survive hub reinstalls
@@ -48,8 +49,8 @@ _TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "")
 _TURSO_ENABLED = bool(_TURSO_URL and _TURSO_TOKEN)
 
 # Telemetry-only path: hub_usage events sent to central DB (INSERT only, no stone data).
-_HUB_TELEMETRY_URL = "https://hub-ctx-jaytoone.aws-us-west-2.turso.io"
-_HUB_TELEMETRY_TOKEN = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODA0NjkzMjIsImlkIjoiMDE5ZTM5YmEtYmEwMS03OGU5LWEzMDMtOTQwMTBhZTllNGJlIiwicmlkIjoiYjRjZWFiNDUtNjk4MC00MGQ1LWFmYTUtNTdhMmY4NjNlZGYwIn0.HpT87t0CcVeCfwAQJxFEe2ExuuF5boVw7BCuX68s2qzuQABsTI-ixLIg27AEpZSprz-R7LpMr53emQ-SQ3zbAw"
+_HUB_TELEMETRY_URL = os.environ.get("HUB_TELEMETRY_URL", "")
+_HUB_TELEMETRY_TOKEN = os.environ.get("HUB_TELEMETRY_TOKEN", "")
 _TEL_ENABLED = bool(_HUB_TELEMETRY_URL and _HUB_TELEMETRY_TOKEN)
 
 def _turso_execute(sql: str, args: list = None) -> bool:
@@ -163,8 +164,13 @@ def _bound_ip(port: int) -> str:
     return "127.0.0.1"
 
 
+# Resolve HOST: Tailscale IP if available, else 127.0.0.1. Never 0.0.0.0.
+if not HOST:
+    HOST = _tailscale_interface_ip()  # returns 127.0.0.1 if Tailscale not available
+
+
 def _ctx_url() -> str:
-    return "/ctx"
+    return ""  # M1235: CTX disabled
 
 
 def _corpus_url() -> str:
@@ -174,7 +180,6 @@ def _corpus_url() -> str:
 
 
 SERVICES = {
-    "ctx":    {"port": 8787, "label": "CTX",    "url": _ctx_url()},
     "corpus": {"port": 8989, "label": "Corpus", "url": _corpus_url()},
 }
 
@@ -184,25 +189,6 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)  # M515: compress large JS
 # M210 follow-up: when this app is served over plain HTTP, redirect every request to the
 # HTTPS endpoint so the browser unlocks the Notification API. Same uvicorn process can
 # run two instances (HTTP:9000 → redirect, HTTPS:9443 → serve normally); the request.url.scheme
-# is "http" only on the HTTP listener, so this middleware no-ops on the HTTPS listener.
-#
-# DISABLED: Redirect breaks PATCH/POST for users without Tailscale. For new users,
-# HTTP-only mode is sufficient. Re-enable only for Tailscale-enabled deployments.
-from fastapi import Request
-from fastapi.responses import RedirectResponse
-
-_HTTPS_HOST = "desk-1-1.tailb5ab18.ts.net"
-_HTTPS_PORT = 9443
-
-# @app.middleware("http")
-# async def _force_https_redirect(request: Request, call_next):
-#     if request.url.scheme == "http":
-#         target = f"https://{_HTTPS_HOST}:{_HTTPS_PORT}{request.url.path}"
-#         if request.url.query:
-#             target += f"?{request.url.query}"
-#         return RedirectResponse(url=target, status_code=302)
-#     return await call_next(request)
-
 @app.get("/static/northstar.html")
 async def _northstar_static_nocache():
     return FileResponse(str(STATIC / "northstar.html"),
@@ -257,14 +243,11 @@ async def index():
 
 @app.get("/config")
 async def config():
-    ctx_url    = _ctx_url()
     corpus_url = _corpus_url()
     return JSONResponse({
-        "ctx_url":            ctx_url,
         "corpus_url":         corpus_url,
         "northstar_url":      "/northstar",
         "market_signals_url": "/market-signals",
-        "ctx_ip":             ctx_url.split("//")[1].split(":")[0] if "//" in ctx_url else "127.0.0.1",
         "ntfy_topic_set":     bool(_get_telegram_config()[0]),
     })
 
@@ -320,10 +303,10 @@ def _mark_blink_server(proj_id: str, s_key: str, mid: str, remove: bool = False)
     PATCH path (incl. exec-session API completions where no browser is watching),
     stamp the affected substar's blink mids+ts into user_settings.blink_state_{proj}
     with ts=now so the client's _blinkCenterHydrate restores a fresh, in-window blink
-    on the next board open. Mirrors the client-side _blinkCenterSave bundle shape
-    ({sKey: {ts, mids:[...]}}). Root cause of M1007: blink was client-detected only,
-    so API-driven changes never produced hydratable blink state.
-    M1216: remove=True removes mid from blink_state (called on done/skipped transition)."""
+    on the next board open.
+    M1216: remove=True removes mid from blink_state (called on done/skipped transition).
+    M1227: schema changed to {sKey: {mids: {mid: ts}}} — per-mid timestamps so that
+    stones within the same substar do NOT affect each other's blink window."""
     import time as _t_blink
     key = f"blink_state_{proj_id}"
     try:
@@ -338,39 +321,45 @@ def _mark_blink_server(proj_id: str, s_key: str, mid: str, remove: bool = False)
         if not isinstance(bundle, dict):
             bundle = {}
         _now_ms = int(_t_blink.time() * 1000)
-        # M1007 v2: prune entries older than 48h (well beyond the max 24h display
-        # window) — client is read-only now and no longer clears expired entries,
-        # so the server must self-prune to avoid unbounded growth.
         _prune_cutoff = _now_ms - 48 * 3600 * 1000
-        bundle = {k: e for k, e in bundle.items()
-                  if isinstance(e, dict) and (e.get("ts") or 0) >= _prune_cutoff}
+        # M1227: migrate old {sKey:{ts,mids:[]}} shape → new {sKey:{mids:{mid:ts}}} shape
+        _new_bundle = {}
+        for _k, _e in bundle.items():
+            if not isinstance(_e, dict):
+                continue
+            if "mids" in _e and isinstance(_e["mids"], dict):
+                # already new shape — prune per-mid ts
+                _mt = {m: t for m, t in _e["mids"].items() if isinstance(t, (int, float)) and t >= _prune_cutoff}
+                if _mt:
+                    _new_bundle[_k] = {"mids": _mt}
+            elif "mids" in _e and isinstance(_e["mids"], list):
+                # old shape: all mids share sKey-level ts
+                _old_ts = _e.get("ts") or 0
+                if _old_ts >= _prune_cutoff:
+                    _mt = {m: _old_ts for m in _e["mids"] if isinstance(m, str)}
+                    if _mt:
+                        _new_bundle[_k] = {"mids": _mt}
+        bundle = _new_bundle
         entry = bundle.get(s_key) if isinstance(bundle.get(s_key), dict) else {}
-        mids = entry.get("mids") if isinstance(entry.get("mids"), list) else []
-        # M1222: purge done/skipped mids that accumulated before M1216 (or from any race).
-        # On every write, cross-check existing mids against milestones_store and drop
-        # any that are now done/skipped — prevents indefinite blink from stale mids.
+        mid_ts = entry.get("mids") if isinstance(entry.get("mids"), dict) else {}
+        # M1222: purge done/skipped mids on every write; M1241: pending_confirmation stays in blink
         try:
-            _done_st = {"done", "skipped"}
+            _clear_st = {"done", "skipped"}
             _rows_ms = conn.execute(
                 "SELECT stone_id, status FROM milestones_store WHERE proj_id=?", (proj_id,)
             ).fetchall()
             _status_map = {r[0]: (r[1] or "") for r in _rows_ms}
-            # Also remove mids not found in project (deleted/moved stones)
-            _clear_st = _done_st | {"pending_confirmation"}
-            mids = [m for m in mids if m in _status_map and _status_map[m] not in _clear_st]
+            mid_ts = {m: t for m, t in mid_ts.items() if m in _status_map and _status_map[m] not in _clear_st}
         except Exception:
             pass
         if remove:
-            # M1216: stone done/skipped — remove from blink mids; delete entry if empty
-            mids = [m for m in mids if m != mid]
-            if mids:
-                bundle[s_key] = {"ts": entry.get("ts", _now_ms), "mids": mids}
-            elif s_key in bundle:
-                del bundle[s_key]
+            mid_ts.pop(mid, None)
         else:
-            if mid not in mids:
-                mids = mids + [mid]
-            bundle[s_key] = {"ts": _now_ms, "mids": mids}
+            mid_ts[mid] = _now_ms  # only this mid's ts is updated
+        if mid_ts:
+            bundle[s_key] = {"mids": mid_ts}
+        elif s_key in bundle:
+            del bundle[s_key]
         conn.execute(
             "INSERT OR REPLACE INTO user_settings(key, value_json, updated_at) VALUES(?,?,?)",
             (key, json.dumps(bundle, ensure_ascii=False), __import__('datetime').datetime.utcnow().isoformat()),
@@ -387,27 +376,21 @@ _USAGE_CACHE: dict = {"data": None, "ts": 0.0}
 _USAGE_TTL = 300  # 5 min
 
 def _fetch_usage_blocking():
-    """Runs off the event loop. Reads the OAuth token Claude Code maintains in
-    ~/.claude/.credentials.json and queries the (undocumented) usage endpoint."""
-    import urllib.request as _ur
-    cred = Path.home() / ".claude" / ".credentials.json"
-    if not cred.exists():
-        return {"error": "no credentials"}
+    """M1296: OAuth usage endpoint re-enabled — credentials from ~/.claude/.credentials.json."""
+    import json as _j, urllib.request as _ur, pathlib as _pl
     try:
-        tok = json.loads(cred.read_text()).get("claudeAiOauth", {}).get("accessToken")
-    except Exception:
-        return {"error": "credential parse failed"}
-    if not tok:
-        return {"error": "no access token"}
-    try:
+        creds_path = _pl.Path.home() / ".claude" / ".credentials.json"
+        token = _j.loads(creds_path.read_text()).get("claudeAiOauth", {}).get("accessToken", "")
+        if not token:
+            return {"error": "no oauth token"}
         req = _ur.Request(
             "https://api.anthropic.com/api/oauth/usage",
-            headers={"Authorization": f"Bearer {tok}", "anthropic-beta": "oauth-2025-04-20"},
+            headers={"Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20"},
         )
-        with _ur.urlopen(req, timeout=8) as r:
-            return json.loads(r.read().decode())
+        with _ur.urlopen(req, timeout=6) as r:
+            return _j.loads(r.read())
     except Exception as e:
-        return {"error": str(e)[:140]}
+        return {"error": str(e)}
 
 @app.get("/api/claude-usage")
 async def claude_usage():
@@ -1039,7 +1022,8 @@ def _compute_tokens_from_transcript(proj_id: str, t_start: str, t_end: str,
         _key = _raw_dir.replace(os.sep, "-").lstrip("-")
         _tdir = Path.home() / ".claude" / "projects" / f"-{_key}"
     else:
-        _tdir = Path.home() / ".claude" / "projects" / f"-home-desk-1-Project-{proj_id}"
+        _username = Path.home().name
+        _tdir = Path.home() / ".claude" / "projects" / f"-home-{_username}-Project-{proj_id}"
     if not _tdir.exists():
         return None
 
@@ -1297,7 +1281,7 @@ def _load_projects() -> list:
                                 if _candidate.is_dir() and _candidate.name.lower() == _target:
                                     data["repo_path"] = str(_candidate)
                                     break
-                                # Also check nested dirs (e.g., Project/VIDraft/HugwartsBanana)
+                                # Also check nested dirs one level deep
                                 if _candidate.is_dir():
                                     for _nested in _candidate.iterdir():
                                         if _nested.is_dir() and _nested.name.lower() == _target:
@@ -1310,20 +1294,24 @@ def _load_projects() -> list:
                     data["last_updated"] = mtime
                     data["stale"] = (time.time() - mtime) > (14 * 86400)
                     # M1196: project start timestamp (epoch) — used by frontend D+N display.
-                    # Try git first-commit on repo_path (actual project dir), fall back to ctime.
+                    # M1245 v2: git first-commit date (real project start) > hub dir ctime fallback.
+                    # Hub dir ctime is unreliable — recreated on migration/reinstall.
                     _proj_started_ts = None
-                    _git_target = data.get("repo_path") or None
-                    if _git_target and Path(_git_target).is_dir():
+                    _repo = data.get("repo_path") or ""
+                    if _repo:
                         try:
-                            _git_res = subprocess.run(
-                                ["git", "-C", _git_target, "log", "--reverse", "--format=%ct", "--max-count=1"],
-                                capture_output=True, text=True, timeout=2
+                            import subprocess as _sp
+                            _git_out = _sp.run(
+                                ["git", "log", "--format=%ct"],
+                                cwd=_repo, capture_output=True, text=True, timeout=3
                             )
-                            if _git_res.returncode == 0 and _git_res.stdout.strip().isdigit():
-                                _proj_started_ts = int(_git_res.stdout.strip())
+                            # last line = oldest commit (first in history)
+                            _lines = [l.strip() for l in _git_out.stdout.splitlines() if l.strip().isdigit()]
+                            if _lines:
+                                _proj_started_ts = int(_lines[-1])
                         except Exception:
                             pass
-                    if not _proj_started_ts:
+                    if _proj_started_ts is None:
                         try:
                             _proj_started_ts = int(proj_dir.stat().st_ctime)
                         except Exception:
@@ -1634,12 +1622,63 @@ def _ns_primary_init():
             meta_json TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )""")
+        # M1234-D: permanent archive for done milestones — keeps milestones_store lean
+        conn.execute("""CREATE TABLE IF NOT EXISTS milestones_archive (
+            proj_id TEXT NOT NULL,
+            stone_id TEXT NOT NULL,
+            data_json TEXT NOT NULL,
+            archived_at TEXT NOT NULL,
+            PRIMARY KEY (proj_id, stone_id)
+        )""")
         conn.commit()
         conn.close()
     except Exception:
         pass
 
 _ns_primary_init()
+
+
+def _archive_done_milestones():
+    """M1234-D: Move done=1 stones from milestones_store → milestones_archive permanently.
+    Runs in background thread every 6 hours. Reduces milestones_store size so queries stay fast."""
+    import datetime as _dt_arch
+    try:
+        conn = sqlite3.connect(str(_NS_EVENTS_DB))
+        now = _dt_arch.datetime.utcnow().isoformat()
+        # Find all done stones not yet archived
+        rows = conn.execute(
+            "SELECT proj_id, stone_id, data_json FROM milestones_store WHERE done=1"
+        ).fetchall()
+        archived = 0
+        for proj_id, stone_id, data_json in rows:
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO milestones_archive (proj_id, stone_id, data_json, archived_at) VALUES (?,?,?,?)",
+                    (proj_id, stone_id, data_json, now)
+                )
+                conn.execute(
+                    "DELETE FROM milestones_store WHERE proj_id=? AND stone_id=?",
+                    (proj_id, stone_id)
+                )
+                archived += 1
+            except Exception:
+                pass
+        conn.commit()
+        conn.close()
+        if archived:
+            print(f"[M1234-D] Archived {archived} done stones to milestones_archive.", flush=True)
+    except Exception as _e:
+        print(f"[M1234-D] archive error: {_e}", flush=True)
+
+
+def _archive_daemon():
+    """Background thread: archive done milestones every 6 hours."""
+    while True:
+        time.sleep(21600)  # 6 hours
+        _archive_done_milestones()
+
+
+threading.Thread(target=_archive_daemon, daemon=True, name="archive-daemon").start()
 
 
 def _migrate_yaml_to_sqlite():
@@ -2245,6 +2284,248 @@ async def northstar_get():
     return JSONResponse(clean)
 
 
+# M1244 plan B: ttyd web-terminal sidecar registry. Each running ttyd@<session>
+# instance writes its port to ~/.hub/ttyd-ports/<session>. The UI calls this to
+# build a "open in browser" terminal URL without re-deriving the hash in JS.
+@app.get("/api/ttyd/ports")
+async def ttyd_ports(request: Request):
+    reg_dir = Path.home() / ".hub" / "ttyd-ports"
+    out: dict[str, int] = {}
+    try:
+        if reg_dir.is_dir():
+            for f in reg_dir.iterdir():
+                if not f.is_file():
+                    continue
+                try:
+                    out[f.name] = int(f.read_text().strip())
+                except (ValueError, OSError):
+                    continue
+    except OSError:
+        pass
+    # Host the browser should target: reuse the request host (works for both
+    # Tailscale and LAN access) but swap to the ttyd port per session client-side.
+    host = (request.url.hostname or "127.0.0.1")
+    return JSONResponse({"host": host, "ports": out})
+
+
+# M1244 mobile vkey: forward a single keyboard event to a tmux session via
+# `tmux send-keys`. The ttyd sidecar is attached to the same session so the
+# key appears in the user's mobile terminal exactly as if typed locally.
+# Allowlist prevents arbitrary command injection.
+_TMUX_VKEY_ALLOW = {
+    "Escape": "Escape", "Tab": "Tab", "Enter": "Enter", "Space": "Space",
+    "BSpace": "BSpace", "Up": "Up", "Down": "Down", "Left": "Left", "Right": "Right",
+    "Home": "Home", "End": "End", "PageUp": "PageUp", "PageDown": "PageDown",
+    "C-c": "C-c", "C-d": "C-d", "C-z": "C-z", "C-l": "C-l", "C-r": "C-r",
+    "C-a": "C-a", "C-e": "C-e", "C-w": "C-w", "C-u": "C-u", "C-k": "C-k",
+    "C-b": "C-b",  # tmux prefix
+    "M-.": "M-.",  # alt-dot (last arg recall in shell)
+    "/": "/", "|": "|", "\\": "\\", "~": "~", "`": "`",
+    # M1244 scroll: enter tmux copy mode (prefix + [) and exit ('q')
+    "ScrollMode": ["C-b", "["],
+    "q": "q",
+}
+
+@app.post("/api/tmux/send-key")
+async def tmux_send_key(request: Request):
+    body = await request.json()
+    session = (body.get("session") or "").strip()
+    key = body.get("key") or ""
+    if not session or not key:
+        return JSONResponse({"ok": False, "error": "session and key required"}, status_code=400)
+    if key not in _TMUX_VKEY_ALLOW:
+        return JSONResponse({"ok": False, "error": f"key '{key}' not in allowlist"}, status_code=400)
+    # Verify session exists before sending — avoids leaking allowlist for arbitrary sessions.
+    chk = subprocess.run(["tmux", "has-session", "-t", session], capture_output=True)
+    if chk.returncode != 0:
+        return JSONResponse({"ok": False, "error": f"tmux session '{session}' not found"}, status_code=404)
+    spec = _TMUX_VKEY_ALLOW[key]
+    if isinstance(spec, list):
+        # Multi-step: send each key separately to honour tmux prefix sequences.
+        for k in spec:
+            subprocess.run(["tmux", "send-keys", "-t", session, k], capture_output=True, timeout=2)
+    else:
+        subprocess.run(["tmux", "send-keys", "-t", session, spec], capture_output=True, timeout=2)
+    return JSONResponse({"ok": True})
+
+
+@app.get("/ttyd-wrap", response_class=HTMLResponse)
+async def ttyd_wrap(request: Request, session: str = ""):
+    """M1244 mobile: ttyd iframe + soft keyboard bar wrapper for mobile use.
+    The bar POSTs to /api/tmux/send-key which forwards keys via tmux send-keys
+    to the same tmux session ttyd is attached to."""
+    if not session:
+        return HTMLResponse("<p>session query param required</p>", status_code=400)
+    reg = Path.home() / ".hub" / "ttyd-ports" / session
+    if not reg.is_file():
+        return HTMLResponse(f"<p>ttyd not running for session '{session}'</p>", status_code=404)
+    try:
+        port = int(reg.read_text().strip())
+    except (ValueError, OSError):
+        return HTMLResponse("<p>invalid ttyd port registry</p>", status_code=500)
+    host = request.url.hostname or "127.0.0.1"
+    ttyd_url = f"http://{host}:{port}/"
+    html = f"""<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>ttyd: {session}</title>
+<style>
+  html,body{{margin:0;padding:0;height:100%;background:#1a1916;color:#d4cfc8;font:14px system-ui}}
+  #wrap{{display:flex;flex-direction:column;height:100vh}}
+  #termwrap{{flex:1;position:relative;overflow:hidden}}
+  #term{{border:0;width:100%;height:100%;display:block}}
+  /* M1244 scroll (M1259: slimmed from 44px→24px to maximize terminal width) */
+  #sbar{{position:absolute;top:0;right:0;width:24px;height:100%;background:rgba(34,34,34,.55);border-left:1px solid #444;
+        display:flex;flex-direction:column;align-items:center;justify-content:space-between;padding:4px 0;
+        touch-action:none;user-select:none;z-index:5}}
+  #sbar button{{width:20px;height:20px;background:#333;color:#fff;border:1px solid #666;border-radius:3px;
+                font:10px monospace;cursor:pointer;touch-action:manipulation;padding:0;line-height:1}}
+  #sbar button:active{{background:#555}}
+  #sbar #scroll-mode{{background:#4a9fd4;border-color:#4a9fd4;font-size:8px;height:24px}}
+  #sbar #qexit{{background:#c07820;border-color:#c07820;font-size:9px}}
+  #sbar-mid{{flex:1;width:18px;margin:4px 0;background:linear-gradient(180deg,#444,#222);border-radius:9px;
+              position:relative}}
+  #sbar-thumb{{position:absolute;left:1px;right:1px;height:40px;top:0;background:#aaa;border-radius:8px;
+                box-shadow:0 0 6px rgba(0,0,0,.6);cursor:grab;touch-action:none;pointer-events:auto;
+                border:1px solid #ccc}}
+  #bar{{display:flex;flex-wrap:wrap;gap:4px;padding:6px;background:#222;border-top:1px solid #444}}
+  #bar button{{flex:0 0 auto;min-width:44px;height:36px;padding:0 8px;background:#333;color:#d4cfc8;border:1px solid #555;border-radius:4px;font:13px monospace;touch-action:manipulation;-webkit-user-select:none;user-select:none}}
+  #bar button:active{{background:#555}}
+</style></head>
+<body><div id="wrap">
+  <div id="termwrap">
+    <iframe id="term" src="{ttyd_url}" allow="clipboard-read; clipboard-write"></iframe>
+    <div id="sbar">
+      <button tabindex="-1" id="scroll-mode" title="Enter tmux scroll/copy mode (C-b [)">Scroll</button>
+      <button tabindex="-1" data-k="PageUp" title="Page Up">▲▲</button>
+      <button tabindex="-1" data-k="Up" title="Line Up">▲</button>
+      <div id="sbar-mid"><div id="sbar-thumb"></div></div>
+      <button tabindex="-1" data-k="Down" title="Line Down">▼</button>
+      <button tabindex="-1" data-k="PageDown" title="Page Down">▼▼</button>
+      <button tabindex="-1" id="qexit" title="Exit scroll/copy mode (q)">q</button>
+    </div>
+  </div>
+  <div id="bar">
+    <button tabindex="-1" data-k="Escape">Esc</button>
+    <button tabindex="-1" data-k="Tab">Tab</button>
+    <button tabindex="-1" data-k="C-c">^C</button>
+    <button tabindex="-1" data-k="C-d">^D</button>
+    <button tabindex="-1" data-k="C-z">^Z</button>
+    <button tabindex="-1" data-k="C-l">^L</button>
+    <button tabindex="-1" data-k="C-r">^R</button>
+    <button tabindex="-1" data-k="C-a">^A</button>
+    <button tabindex="-1" data-k="C-e">^E</button>
+    <button tabindex="-1" data-k="C-w">^W</button>
+    <button tabindex="-1" data-k="C-u">^U</button>
+    <button tabindex="-1" data-k="Up">↑</button>
+    <button tabindex="-1" data-k="Down">↓</button>
+    <button tabindex="-1" data-k="Left">←</button>
+    <button tabindex="-1" data-k="Right">→</button>
+    <button tabindex="-1" data-k="Home">Home</button>
+    <button tabindex="-1" data-k="End">End</button>
+    <button tabindex="-1" data-k="PageUp">PgUp</button>
+    <button tabindex="-1" data-k="PageDown">PgDn</button>
+    <button tabindex="-1" data-k="ScrollMode" style="background:#4a9fd4;border-color:#4a9fd4;color:#fff">Scroll</button>
+    <button tabindex="-1" data-k="q">q/exit</button>
+    <button tabindex="-1" data-k="C-b">^B</button>
+    <button tabindex="-1" data-k="|">|</button>
+    <button tabindex="-1" data-k="/">/</button>
+    <button tabindex="-1" data-k="\\">\\</button>
+    <button tabindex="-1" data-k="~">~</button>
+  </div>
+</div>
+<script>
+const SESSION = {json.dumps(session)};
+async function sendKey(k) {{
+  try {{
+    await fetch('/api/tmux/send-key', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{session: SESSION, key: k}})
+    }});
+  }} catch (err) {{ console.warn('vkey send failed', err); }}
+}}
+// M1268: touchend+preventDefault prevents iOS soft keyboard from popping up on button tap
+function _barTouch(e) {{
+  const k = e.target && e.target.getAttribute && e.target.getAttribute('data-k');
+  if (!k) return;
+  e.preventDefault(); // blocks focus → no iOS keyboard
+  sendKey(k);
+}}
+const bar = document.getElementById('bar');
+bar.addEventListener('touchend', _barTouch, {{passive: false}});
+bar.addEventListener('click', (e) => {{
+  // mouse/desktop fallback
+  const k = e.target && e.target.getAttribute && e.target.getAttribute('data-k');
+  if (k) sendKey(k);
+}});
+// M1244 scroll: right-side scrollbar controls
+const sbar = document.getElementById('sbar');
+function _sbarKey(e) {{
+  const t = e.target;
+  if (!t) return;
+  if (t.id === 'scroll-mode') {{ e.preventDefault(); sendKey('ScrollMode'); return; }}
+  if (t.id === 'qexit') {{ e.preventDefault(); sendKey('q'); return; }}
+  const k = t.getAttribute && t.getAttribute('data-k');
+  if (k) {{ e.preventDefault(); sendKey(k); }}
+}}
+sbar.addEventListener('touchend', _sbarKey, {{passive: false}});
+sbar.addEventListener('click', (e) => {{
+  const t = e.target;
+  if (!t) return;
+  if (t.id === 'scroll-mode') {{ sendKey('ScrollMode'); return; }}
+  if (t.id === 'qexit') {{ sendKey('q'); return; }}
+  const k = t.getAttribute && t.getAttribute('data-k');
+  if (k) sendKey(k);
+}});
+// M1244 scroll: drag-to-scroll — auto-enters copy-mode on first drag
+const mid = document.getElementById('sbar-mid');
+const thumb = document.getElementById('sbar-thumb');
+let dragLastY = null;
+let inCopyMode = false;
+const STEP = 15; // pixels per scroll line (lowered for sensitivity)
+async function enterCopyModeOnce() {{
+  if (!inCopyMode) {{ inCopyMode = true; await sendKey('ScrollMode'); }}
+}}
+function onDragStart(y) {{
+  dragLastY = y;
+  enterCopyModeOnce(); // auto enter copy-mode when drag starts
+}}
+function onDragMove(y) {{
+  if (dragLastY == null) return;
+  const dy = y - dragLastY;
+  if (Math.abs(dy) < STEP) return;
+  const steps = Math.trunc(dy / STEP);
+  dragLastY = dragLastY + steps * STEP; // accumulate correctly
+  const key = steps > 0 ? 'PageDown' : 'PageUp';
+  for (let i = 0; i < Math.abs(steps); i++) sendKey(key);
+  // visual: move thumb
+  const rect = mid.getBoundingClientRect();
+  const thumbH = thumb.offsetHeight;
+  const rel = Math.max(0, Math.min(rect.height - thumbH, parseFloat(thumb.style.top || '0') + steps * STEP));
+  thumb.style.top = rel + 'px';
+}}
+function onDragEnd() {{ dragLastY = null; }}
+// Reset copy-mode tracking when q is pressed
+document.getElementById('qexit').addEventListener('click', () => {{ inCopyMode = false; }});
+// Touch on thumb itself
+thumb.addEventListener('touchstart', (e) => {{ e.stopPropagation(); e.preventDefault(); onDragStart(e.touches[0].clientY); }}, {{passive:false}});
+thumb.addEventListener('touchmove', (e) => {{ e.stopPropagation(); e.preventDefault(); onDragMove(e.touches[0].clientY); }}, {{passive:false}});
+thumb.addEventListener('touchend', (e) => {{ e.stopPropagation(); onDragEnd(); }}, {{passive:false}});
+// Touch on track (outside thumb)
+mid.addEventListener('touchstart', (e) => {{ e.preventDefault(); onDragStart(e.touches[0].clientY); }}, {{passive:false}});
+mid.addEventListener('touchmove', (e) => {{ e.preventDefault(); onDragMove(e.touches[0].clientY); }}, {{passive:false}});
+mid.addEventListener('touchend', onDragEnd);
+// Mouse fallback
+thumb.addEventListener('mousedown', (e) => {{ e.preventDefault(); onDragStart(e.clientY); }});
+mid.addEventListener('mousedown', (e) => {{ onDragStart(e.clientY); }});
+window.addEventListener('mousemove', (e) => {{ if (dragLastY != null) onDragMove(e.clientY); }});
+window.addEventListener('mouseup', onDragEnd);
+</script>
+</body></html>"""
+    return HTMLResponse(html)
+
+
 @app.post("/api/northstar")
 async def northstar_save(request: Request):
     data = await request.json()
@@ -2281,7 +2562,6 @@ async def sync_milestones(proj_id: str, request: Request):
     """Auto-detect milestone completion from CTX graph + project log using Claude."""
     body = await request.json()
     milestones = body.get("milestones", [])
-    ctx_topics  = body.get("ctx_topics", [])   # hot nodes from CTX
     log_entries = body.get("log", [])           # project progress log
 
     if not milestones:
@@ -2289,8 +2569,6 @@ async def sync_milestones(proj_id: str, request: Request):
 
     ms_text = "\n".join(f"{i+1}. [{('DONE' if m.get('done') else 'pending')}] {m.get('text','')}"
                         for i, m in enumerate(milestones))
-    ctx_text = "\n".join(f"  [{t.get('type','?')}] {t.get('label','')} (heat={t.get('heat',0)})"
-                         for t in ctx_topics[:15]) or "  (no CTX activity)"
     log_text = "\n".join(f"  {l.get('date','')} — {l.get('text','')}"
                          for l in log_entries[-10:]) or "  (no log entries)"
 
@@ -2300,9 +2578,6 @@ PROJECT: {proj_id}
 
 MILESTONES (current state):
 {ms_text}
-
-RECENT WORK (CTX memory — git decisions, hot nodes):
-{ctx_text}
 
 PROGRESS LOG:
 {log_text}
@@ -2932,16 +3207,6 @@ def _fetch_channel(ch: dict) -> dict:
             mail.select("INBOX")
             _, unseen = mail.search(None, "UNSEEN")
             result["unread"] = len(unseen[0].split()) if unseen[0] else 0
-            # Search for CTX-related subjects
-            ctx_subjects = []
-            for keyword in [b"CTX", b"GitHub", b"GeekNews"]:
-                try:
-                    _, ids = mail.search(None, "UNSEEN", f"SUBJECT \"{keyword.decode()}\"".encode())
-                    if ids[0]:
-                        ctx_subjects.append(f"{keyword.decode()}:{len(ids[0].split())}")
-                except Exception:
-                    pass
-            result["ctx_unread"] = " ".join(ctx_subjects) if ctx_subjects else "0"
             mail.logout()
         except Exception as exc2:
             result["error"] = str(exc2)[:60]
@@ -3174,6 +3439,13 @@ async def _seed_sqlite_from_yaml():
 async def _startup_telemetry():
     """M929: Record startup event for usage analytics (consent-gated, no PII)."""
     _record_usage_event("hub_start")
+    import asyncio, threading
+    def _hub_active_loop():
+        import time
+        while True:
+            time.sleep(86400)  # 24h — DAU tracking
+            _record_usage_event("hub_active")
+    threading.Thread(target=_hub_active_loop, daemon=True).start()
 
 @app.on_event("startup")
 async def _expose_ports_to_tailscale():
@@ -3357,7 +3629,7 @@ async def _start_milestone_watcher():
                                     f"     Prefer silence over unnecessary questions (token waste).\n\n"
                                     f"  7. LANGUAGE: reply in the same language as the stone text.\n"
                                     f"     Korean stone → Korean reply. English stone → English reply.\n\n"
-                                    f"ACTION: GET http://100.119.82.4:9000/api/northstar/{proj_id}/milestones,\n"
+                                    f"ACTION: GET http://127.0.0.1:{PORT}/api/northstar/{proj_id}/milestones,\n"
                                     f"  for each stone above, read its last user message, then\n"
                                     f"  PATCH milestones/<MID> with append_message {{role:'claude', text:'<≤3 lines>'}}.\n"
                                     f"Mandatory — do it now before any other work."
@@ -3429,49 +3701,10 @@ async def _start_event_cleanup():
     asyncio.create_task(_delayed_start())
 
 
-def _spawn_ctx_dashboard() -> "subprocess.Popen | None":
-    """M55: auto-start ctx-dashboard (port 8787) alongside hub.
-    Set CTX_DASHBOARD_DISABLED=1 to skip.
-    """
-    if os.environ.get("CTX_DASHBOARD_DISABLED", "").strip() in ("1", "true", "yes"):
-        return None
-    # Check if already running on 8787
-    try:
-        import socket as _sock
-        s = _sock.socket()
-        s.settimeout(0.5)
-        r = s.connect_ex(("127.0.0.1", 8787))
-        s.close()
-        if r == 0:
-            return None  # already running
-    except Exception:
-        pass
-    # Path resolution: ~/.hub/ctx-dashboard (hub-native location) first, then fallbacks
-    candidates = [
-        str(Path.home() / ".hub" / "ctx-dashboard" / "server.py"),
-        str(Path.home() / ".claude" / "hooks" / "ctx-dashboard" / "server.py"),
-        str(Path("/home/desk-1/Project/CTX/src/dashboard/server.py")),
-    ]
-    server_path = next((p for p in candidates if Path(p).exists()), None)
-    if not server_path:
-        return None
-    # Bind to 0.0.0.0 so LT-1 and other Tailscale peers can reach port 8787 directly
-    try:
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", "server:app",
-             "--host", "0.0.0.0", "--port", "8787", "--app-dir", str(Path(server_path).parent)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        return proc
-    except Exception:
-        return None
-
-
 @app.on_event("startup")
 async def _auto_start_ctx_dashboard():
-    """M60: CTX dashboard is now mounted directly — no subprocess needed."""
-    print("[hub] CTX dashboard: fully integrated via app.mount('/ctx') — no separate process", file=sys.stderr)
+    """M1235: CTX disabled — no-op."""
+    pass
 
 
 @app.api_route("/ctx/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"])
@@ -3929,7 +4162,14 @@ def _hub_config_get(proj_id: str | None, key: str) -> str:
         v = cfg.get("projects", {}).get(proj_id, {}).get(key)
         if v:
             return str(v).strip()
-    return str(cfg.get("defaults", {}).get(key, "")).strip()
+    v = str(cfg.get("defaults", {}).get(key, "")).strip()
+    # A-4/A-5: if a path key is set but the file no longer exists, auto-detect
+    if key in ("claude_code_path", "codex_path") and v and not Path(v).exists():
+        v = ""
+    if not v and key == "claude_code_path":
+        import shutil as _sh
+        v = _sh.which("claude") or str(Path.home() / ".local" / "bin" / "claude")
+    return v
 # ── end M705 ───────────────────────────────────────────────────────────────────
 
 
@@ -4174,8 +4414,10 @@ def _transcript_too_large(proj_id: str) -> bool:
         if not _cfg_dir:
             _cfg_dir = _get_project_dir(proj_id) or ""
         if not _cfg_dir:
-            # Case-insensitive fallback — scan common bases
-            for _base in [Path.home() / "Project", Path.home() / "Project" / "VIDraft"]:
+            # Case-insensitive fallback — scan common project bases (no hardcoded usernames)
+            _proj_base = Path.home() / "Project"
+            _scan_bases = [_proj_base] + ([d for d in _proj_base.iterdir() if d.is_dir()] if _proj_base.exists() else [])
+            for _base in _scan_bases:
                 if _base.exists():
                     _match = next((str(c) for c in _base.iterdir() if c.name.lower() == proj_id.lower() and c.is_dir()), None)
                     if _match:
@@ -5698,12 +5940,30 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, md: Path,
                       "goal_tree_snapshot",      # JSON snapshot of parent+siblings status
                       "prompt_provenance",       # "PARENT_MID:short-reason" string
                       "confounder",              # JSON: session_start_ts, git_hash, model, exec_duration_sec
-                      "counterfactual_pair_id"):  # peer child stone ID at branch points
+                      "counterfactual_pair_id",  # peer child stone ID at branch points
+                      "conversation_summary",     # M1253: LLM-generated stone-conversation summary
+                      "summary_state",           # M1253: {last_compressed_len, last_compressed_at, version}
+                      "evidence_filename"):       # M1304: local filename hint — avoids GDrive API lookup
                 if k in data:
                     m[k] = data[k] if data[k] is not None else None
                     # M511: auto-stamp evidence_updated_at when evidence_url changes
                     if k == "evidence_url" and data[k]:
                         m["evidence_updated_at"] = now_iso
+                        # M1304: auto-seed filename cache from evidence_filename hint
+                        _ev_fname = (data.get("evidence_filename") or "").strip()
+                        if _ev_fname:
+                            import re as _re
+                            _fid_m = _re.search(r"/file/d/([^/]+)", data[k])
+                            if _fid_m:
+                                _gdrive_name_cache[_fid_m.group(1)] = _ev_fname
+                    # M1253: bump summary_state when conversation_summary is replaced.
+                    if k == "conversation_summary" and data[k] and data.get("summary_state_bump"):
+                        _conv_len_now = len(m.get("conversation") or [])
+                        m["summary_state"] = {
+                            "last_compressed_len": _conv_len_now,
+                            "last_compressed_at": now_iso,
+                            "version": (m.get("summary_state", {}) or {}).get("version", 0) + 1,
+                        }
                     # M1059: verify_flag child creation moved to queued-time (not flag-set-time)
                     # Previously: M990 created [검수] child immediately when flag toggled ON
                     # Now: flag just marks the stone; child created only when stone is queued
@@ -5733,6 +5993,11 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, md: Path,
             # conversation: accumulated chat thread — allow empty list (don't coerce to None)
             if "conversation" in data:
                 m["conversation"] = data["conversation"]
+            # M1238: treat top-level "comment" key as append_message alias (plain text, claude role)
+            if "comment" in data and "append_message" not in data:
+                _comment_text = data["comment"]
+                if isinstance(_comment_text, str) and _comment_text.strip():
+                    data = dict(data, append_message={"role": "claude", "text": _comment_text.strip()})
             # append_message: single {role,text} dict — appended to conversation (easier for Claude)
             # M643: accept both 'text' and 'content' keys — Claude sometimes sends 'content' by mistake
             if "append_message" in data:
@@ -5813,9 +6078,9 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, md: Path,
                                 ),
                             }, status_code=422)
                     # M185/M1064 v2: line-summary — extract key lines, skip blanks
-                    # M1161 v2: per user clarification — 3-line strict cap removed. Hard cap raised
-                    # from 3 to 12 so faithful answers aren't truncated; only excessively long
-                    # replies (>12 non-empty lines) are Q-anchor-reduced to the most relevant 12.
+                    # M1161 v3: first-line bias raised 1→8 so the direct answer (line 0) survives
+                    # compression. Faithfulness gate ensures line 0 is always kept when no Q-token
+                    # appears in any chosen line. Last-line bias stays 1 (summary/next-action).
                     _MAX_LINES = 12
                     _text = str(msg.get("text", ""))
                     _all_lines = _text.split("\n")
@@ -5836,14 +6101,22 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, md: Path,
                                     return set(t for t in _re_qa.findall(r"[\w가-힣]+", (s or "").lower()) if len(t) > 1)
                                 _q_tokens = _toks(_q_text)
                                 if _q_tokens:
+                                    _n_lines = len(_non_empty)
                                     _scored = []
                                     for _idx, _ln in enumerate(_non_empty):
                                         _ov = len(_q_tokens & _toks(_ln))
-                                        _bias = (1 if _idx == 0 else 0) + (1 if _idx == len(_non_empty) - 1 else 0)
+                                        # M1161 v3: first-line bias 1→8 so direct answer survives
+                                        _bias = (8 if _idx == 0 else 0) + (1 if _idx == _n_lines - 1 else 0)
                                         _scored.append((_idx, _ln, _ov * 10 + _bias))
                                     _top = sorted(_scored, key=lambda x: -x[2])[:_MAX_LINES]
                                     _top_ordered = sorted(_top, key=lambda x: x[0])
                                     _chosen = [t[1] for t in _top_ordered]
+                                    # Faithfulness gate: if line 0 was dropped and no Q-token
+                                    # in any chosen line, prepend line 0 as direct-answer anchor.
+                                    _chosen_set = set(t[0] for t in _top)
+                                    _has_q_hit = any(len(_q_tokens & _toks(_ln)) > 0 for _ln in _chosen)
+                                    if 0 not in _chosen_set and not _has_q_hit:
+                                        _chosen = [_non_empty[0]] + _chosen[:_MAX_LINES - 1]
                         if _chosen is None:
                             # Fallback: head + tail (preserve flow when no Q-anchor)
                             _chosen = _non_empty[: _MAX_LINES // 2] + _non_empty[-(_MAX_LINES - _MAX_LINES // 2):]
@@ -5853,7 +6126,8 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, md: Path,
                         # ≤MAX_LINES — keep as-is but strip pure-blank lines for cleanliness
                         if len(_all_lines) != len(_non_empty):
                             msg["text"] = "\n".join(_non_empty)
-                    msg.setdefault("ts", _dt.datetime.now().isoformat())
+                    # M1257: force server time on every append_message so user (browser TZ/UTC ISO) and claude (server local) timestamps line up in the chatbox.
+                    msg["ts"] = _dt.datetime.now().isoformat()
                     conv = m.get("conversation") or []
                     conv.append(msg)
                     m["conversation"] = conv
@@ -5913,6 +6187,13 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, md: Path,
                     # M535: log server-side comment event
                     _server_log_action(proj_id, mid, f"comment:{msg.get('role','?')}",
                                        (msg.get("text",""))[:120])
+                    # M1227: any comment (user or claude) on a stone → blink so participant sees new reply
+                    if msg.get("role") in ("user", "claude"):
+                        try:
+                            _comment_skey = m.get("substar_id") or "__ungrouped__"
+                            _mark_blink_server(proj_id, _comment_skey, m.get("id") or mid)
+                        except Exception:
+                            pass
                     # M222: claude completing work on a queued stone → pending_confirmation.
                     # M247 fix: only promote from queued→pending_confirmation, NOT pending→pending_confirmation.
                     # Promoting pending (review) stones caused auto-queue chain:
@@ -5926,6 +6207,8 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, md: Path,
                             m["done"] = False
                             m["pending_confirm_at"] = now_iso  # always update so _isLastTurn detects re-completions
                             m.setdefault("claude_ack", now_iso)
+                            # M1253: schedule conversation-summary task if conversation grew too long.
+                            _maybe_queue_compress(proj_id, m, milestones)
                     # M722: server-side keyword-detection fallback for [검수] auto-trigger.
                     # Fires on claude append_message when status was NOT "queued" before this PATCH
                     # (queued→pending_confirmation path already handled by exec-agent's M767 inline
@@ -5991,6 +6274,10 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, md: Path,
                         if _cur_s in ("pending_confirmation", "pending", "needs_clarification"):
                             m["status"] = "queued"
                             m["done"] = False
+                    # M1253: on any append_message, immediately check compress threshold (no 30-min wait).
+                    # Only queue a [compress] child when conv_len >= 10 (same logic as _compress_trigger_reason).
+                    if not m.get("held") and not m.get("done") and (m.get("layer", 0) or 0) == 0:
+                        _maybe_queue_compress(proj_id, m, milestones)
                     # M225: skip REPLY SYNC dispatch if stone is held (zero claude token spend on held).
                     if msg.get("role") == "user" and not m.get("done") and not m.get("held"):
                         session_name = _live_exec_session_name(proj_id)
@@ -6023,7 +6310,7 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, md: Path,
                                 f"  1. Read the user comment above carefully.\n"
                                 f"  1b. M246: If [skill:/name] or [agent:name] annotated: invoke it, then reply with 1-line result.\n"
                                 f"  2. ANSWER the question OR acknowledge the instruction in ≤3 lines via PATCH "
-                                f"http://100.119.82.4:9000/api/northstar/{proj_id}/milestones/{mid} "
+                                f"http://127.0.0.1:{PORT}/api/northstar/{proj_id}/milestones/{mid} "
                                 f"with body append_message {{role:'claude', text:'<≤3 lines>'}}.\n"
                                 f"  3. ONLY if user explicitly says 're-do', 'fix', 'redo', '다시', '수정해' → also re-implement.\n"
                                 f"  4. DO NOT change status — this reply does NOT advance the stone lifecycle.\n"
@@ -6102,47 +6389,89 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, md: Path,
                     m["clarification_answer"] = data["clarification_answer"]
                     m["clarification_answered_at"] = now_iso
             elif new_status == "pending_confirmation":
-                # Stop hook: waiting for user to confirm within 24h
-                m["status"] = "pending_confirmation"
-                m["done"] = False
-                m["pending_confirm_at"] = now_iso  # always update for _isLastTurn green border
-                # M1047/M1145: evidence_url validation — warn when result-producing work has no proof attached
-                _ev_url = data.get("evidence_url") or m.get("evidence_url") or ""
-                # Strip PASTE attachment paths before keyword check — filenames like
-                # "스크린샷_....png" inside PASTE/.../PASTE blocks would falsely trigger.
-                import re as _re_ev
-                _stone_txt = _re_ev.sub(r'PASTE/\S+/PASTE', '', (m.get("text") or "")).lower()
-                # M1145: expanded keyword set — catches docs, Excel, analysis, code, UI, screenshots
-                _result_keywords = (
-                    "화면", "ui", "스크린샷", "검수", "screenshot", "visual", "proof", "chart", "table",
-                    "증거", "증빙", "문서", "docx", "excel", "엑셀", "pdf", "분석", "analysis",
-                    "리서치", "research", "보고서", "report", "정리", "결과물", "산출물",
-                    "구현", "기능", "추가", "수정", "개선", "만들", "작성", "생성",
-                    "implement", "create", "build", "design", "develop",
-                )
-                _is_result = any(kw in _stone_txt for kw in _result_keywords)
-                if _is_result and not _ev_url:
-                    # Flag missing proof — does not block the PATCH
-                    m.setdefault("_proof_warning", "evidence_url missing — result badge will not be generated; add screenshot/link via PATCH evidence_url")
-                    _server_log_action(proj_id, mid, "warn:evidence_url_missing",
-                                       "pending_confirmation on result stone without evidence_url — proof badge skipped")
-                if "claude_ack" not in data:
-                    m["claude_ack"] = now_iso
-                # M549.1: guard — if conversation has no recent claude message, auto-append fallback.
-                # Claude sometimes PATCHes status=pending_confirmation without append_message,
-                # leaving the stone with no visible completion reply.
-                _conv_for_guard = m.get("conversation") or []
-                _last_msg_role = _conv_for_guard[-1].get("role") if _conv_for_guard else None
-                if _last_msg_role != "claude" and not data.get("append_message"):
-                    # Build fallback text from stone context
-                    _stone_text = (m.get("text") or m.get("content") or "")[:60].strip()
-                    _fallback_text = f"완료. ({_stone_text})" if _stone_text else "완료."
-                    _fb_msg = {"role": "claude", "text": _fallback_text,
-                               "ts": _dt.datetime.now().isoformat(),
-                               "_auto_fallback": True}
-                    _conv_for_guard.append(_fb_msg)
-                    m["conversation"] = _conv_for_guard
-                    _server_log_action(proj_id, mid, "comment:claude(auto-fallback)", _fallback_text)
+                # M1253 auto-confirm: compress meta-stones need no user review — mark done immediately
+                if str(m.get("category") or "").startswith("meta/compress"):
+                    m["status"] = "done"
+                    m["done"] = True
+                    m["done_at"] = now_iso
+                    m.setdefault("completion_status", "success")
+                    m.setdefault("claude_ack", now_iso)
+                    _server_log_action(proj_id, mid, "auto_done:compress",
+                                       "meta/compress child auto-confirmed on pending_confirmation")
+                    # M1269: update parent summary_state so compress doesn't re-trigger immediately.
+                    # Without this, parent conv_len still > last_compressed_len → infinite child creation.
+                    _par_id = m.get("parent_id")
+                    if _par_id:
+                        _par = next((x for x in milestones if isinstance(x, dict) and x.get("id") == _par_id), None)
+                        if _par is None:
+                            _par = _db_get_milestone(proj_id, _par_id)
+                        if _par:
+                            _par_conv_len = len(_par.get("conversation") or [])
+                            _par["summary_state"] = {
+                                **((_par.get("summary_state") or {})),
+                                "last_compressed_len": _par_conv_len,
+                                "last_compressed_at": now_iso,
+                            }
+                            _server_log_action(proj_id, _par_id, "compress_state_updated",
+                                               f"summary_state.last_compressed_len={_par_conv_len} (M1269 auto-done guard)")
+                if not str(m.get("category") or "").startswith("meta/compress"):
+                    # Stop hook: waiting for user to confirm within 24h
+                    m["status"] = "pending_confirmation"
+                    m["done"] = False
+                    m["pending_confirm_at"] = now_iso  # always update for _isLastTurn green border
+                    # M1047/M1145: evidence_url validation — warn when result-producing work has no proof attached
+                    _ev_url = data.get("evidence_url") or m.get("evidence_url") or ""
+                    # Strip PASTE attachment paths before keyword check — filenames like
+                    # "스크린샷_....png" inside PASTE/.../PASTE blocks would falsely trigger.
+                    import re as _re_ev
+                    _stone_txt = _re_ev.sub(r'PASTE/\S+/PASTE', '', (m.get("text") or "")).lower()
+                    # M1265: Layer A (artifact nouns) → force required; Layer B (action verbs) → warning only
+                    # 결과물/산출물 → Layer B: generic output nouns, not file-specific; false positives too high
+                    _layer_a_keywords = (
+                        "스크린샷", "screenshot", "excel", "엑셀", "pdf", "docx",
+                        "보고서", "report", "chart", "이미지", "image", "분석결과",
+                    )
+                    _layer_b_keywords = (
+                        "화면", "ui", "검수", "visual", "proof", "table",
+                        "증거", "증빙", "문서", "분석", "analysis",
+                        "리서치", "research", "정리",
+                        "구현", "기능", "추가", "수정", "개선", "만들", "작성", "생성",
+                        "implement", "create", "build", "design", "develop",
+                        "결과물", "산출물",
+                    )
+                    _is_layer_a = any(kw in _stone_txt for kw in _layer_a_keywords)
+                    _is_layer_b = not _is_layer_a and any(kw in _stone_txt for kw in _layer_b_keywords)
+                    if _is_layer_a and not _ev_url:
+                        # Layer A: artifact noun detected — evidence_url REQUIRED (force)
+                        m.setdefault("_proof_warning", "LAYER_A:evidence_url missing — artifact stone requires evidence_url; upload via rclone and retry")
+                        m["_layer_a_required"] = True
+                        _server_log_action(proj_id, mid, "warn:layer_a_evidence_missing",
+                                           "Layer A artifact keyword detected — evidence_url required but missing")
+                    elif _is_layer_b and not _ev_url:
+                        # Layer B (M1277): action verb — soft gate. Set _output_check flag so MCP
+                        # surfaces a structured prompt to Claude: "did you produce output? if yes, upload."
+                        # This converts passive warning → active confirmation, improving evidence rate.
+                        m.setdefault("_proof_warning", "evidence_url missing — result badge will not be generated; add screenshot/link via PATCH evidence_url")
+                        m["_output_check"] = True
+                        _server_log_action(proj_id, mid, "warn:layer_b_evidence_missing",
+                                           "Layer B action keyword — evidence_url missing, output_check flagged")
+                    if "claude_ack" not in data:
+                        m["claude_ack"] = now_iso
+                    # M549.1: guard — if conversation has no recent claude message, auto-append fallback.
+                    # Claude sometimes PATCHes status=pending_confirmation without append_message,
+                    # leaving the stone with no visible completion reply.
+                    _conv_for_guard = m.get("conversation") or []
+                    _last_msg_role = _conv_for_guard[-1].get("role") if _conv_for_guard else None
+                    if _last_msg_role != "claude" and not data.get("append_message"):
+                        # Build fallback text from stone context
+                        _stone_text = (m.get("text") or m.get("content") or "")[:60].strip()
+                        _fallback_text = f"완료. ({_stone_text})" if _stone_text else "완료."
+                        _fb_msg = {"role": "claude", "text": _fallback_text,
+                                   "ts": _dt.datetime.now().isoformat(),
+                                   "_auto_fallback": True}
+                        _conv_for_guard.append(_fb_msg)
+                        m["conversation"] = _conv_for_guard
+                        _server_log_action(proj_id, mid, "comment:claude(auto-fallback)", _fallback_text)
                 # M550: sequential child cascade — when a child stone completes, auto-queue
                 # the next unprocessed sibling so the dispatch system picks it up.
                 # Without this, siblings with status=None are invisible to dispatch.
@@ -6209,6 +6538,18 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, md: Path,
                     _cost = (_inp * _ip + _out * _op + _ccr * _ccp + _crd * _crp) / 1_000_000
                     if _cost > 0:
                         m["cost_usd"] = round(_cost, 6)
+                # M929: stone_complete telemetry — after token computation so model_used/tokens are populated
+                _record_usage_event("stone_complete", {
+                    "proj_id": proj_id,
+                    "stone_id": mid,
+                    "model_used": m.get("model_used") or None,
+                    "total_tokens": m.get("total_tokens") or None,
+                    "input_tokens": m.get("input_tokens") or None,
+                    "output_tokens": m.get("output_tokens") or None,
+                    "cost_usd": m.get("cost_usd") or None,
+                    "exec_start": m.get("exec_start") or None,
+                    "exec_end": m.get("exec_end") or None,
+                })
                 # M562: auto-export to .omc/milestone-decisions.md for CTX/G2 retrieval
                 _export_milestone_decision(proj_id, m)
                 # M54.7: extract structured Knowledge Object → .omc/facts.jsonl (ADR format)
@@ -6420,7 +6761,7 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, md: Path,
     # M1216: done/skipped transitions REMOVE the mid from blink_state (not add) so
     # section bars don't blink indefinitely after all stones are completed.
     try:
-        _BLINK_DONE_ST = {"done", "skipped", "pending_confirmation"}  # M1222: pending_confirmation = Claude finished, no blink needed
+        _BLINK_DONE_ST = {"done", "skipped"}  # M1241: pending_confirmation → blink ON (user needs to review); M1222 was wrong
         _new_status = updated_m.get("status") if updated_m else None
         _blink_changed = (updated_m and _new_status != _blink_old_status)
         if updated_m and _blink_changed:
@@ -6435,12 +6776,14 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, md: Path,
     if _queuing_now:
         _save_project(proj_id, proj)
     else:
-        # M698: single-stone update (~1ms) instead of full 764-stone rewrite (~112ms)
+        # M698/M1234: single-stone update (~1ms); skip full background rewrite (was 100~244ms for 1330 stones)
+        _parse_cache.pop(str(md), None)
         if updated_m:
             _db_save_single_milestone(proj_id, updated_m)
-        _parse_cache.pop(str(md), None)
-        import copy as _c278
-        background_tasks.add_task(_save_project, proj_id, _c278.deepcopy(proj))
+            # M1234: no background _save_project — single-stone write is sufficient for PATCH
+        else:
+            import copy as _c278
+            background_tasks.add_task(_save_project, proj_id, _c278.deepcopy(proj))
     # M495: push SSE so open detail card reloads immediately (<100ms) without polling wait
     _ns_push("milestone_updated", proj_id=proj_id, mid=mid)
     # M535: log status change server-side
@@ -6451,6 +6794,10 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, md: Path,
     _resp: dict = {"ok": True, "milestone": updated_m}
     if updated_m and updated_m.get("_proof_warning"):
         _resp["proof_warning"] = updated_m.pop("_proof_warning")
+    if updated_m and updated_m.pop("_layer_a_required", False):
+        _resp["requires_evidence"] = True  # M1265: Layer A force — MCP surfaces this to Claude
+    if updated_m and updated_m.pop("_output_check", False):
+        _resp["output_check"] = True  # M1277: Layer B soft gate — MCP prompts Claude to confirm output existence
     return JSONResponse(_resp)
 
 
@@ -6675,6 +7022,22 @@ async def commit_milestone(proj_id: str, mid: str):
         r3 = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=proj_dir, capture_output=True, text=True)
         if r3.returncode == 0:
             sha = r3.stdout.strip()
+        # M1267: persist SHA to milestone_commits so GET /commits returns history
+        if sha:
+            try:
+                import sqlite3 as _sq3, datetime as _dt
+                _db = _sq3.connect(str(_NS_EVENTS_DB), timeout=5)
+                _db.execute(
+                    "CREATE TABLE IF NOT EXISTS milestone_commits "
+                    "(proj_id TEXT, mid TEXT, sha TEXT, subject TEXT, ts TEXT)"
+                )
+                _db.execute(
+                    "INSERT INTO milestone_commits (proj_id, mid, sha, subject, ts) VALUES (?,?,?,?,?)",
+                    (proj_id, mid, sha, msg, _dt.datetime.utcnow().isoformat())
+                )
+                _db.commit(); _db.close()
+            except Exception:
+                pass  # non-blocking — commit already succeeded
         return JSONResponse({"ok": True, "sha": sha, "message": msg})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
@@ -7308,12 +7671,18 @@ async def execute_project(proj_id: str, request: Request):
                                     + f"PARALLEL SUB-AGENT STEPS — each sub-agent:\n"
                                     f"  1) mcp__ns-hub__get_task_details(task_id='<MID>') for full stone\n"
                                     f"  2) implement (Edit/Bash/Skill/Agent as needed)\n"
-                                    f"  3) mcp__ns-hub__report_task_complete(task_id, summary)\n\n"
+                                    f"  3) mcp__ns-hub__report_task_complete(task_id, summary[, evidence_url if artifact produced])\n\n"
                                     f"COMPLETION — when each stone is done:\n"
                                     f"  mcp__ns-hub__report_task_complete(\n"
                                     f"    task_id='<MID>',\n"
-                                    f"    summary='<1-line past-tense>'\n"
+                                    f"    summary='<1-line past-tense>',\n"
+                                    f"    evidence_url='<GDrive link>'  # REQUIRED if stone produced a file/image/doc/Excel/screenshot\n"
                                     f"  )\n"
+                                    f"  RESULT UPLOAD (if artifact produced):\n"
+                                    f"    rclone copy <file> 'gdrive:claude-shared/{proj_id}/outbox/'\n"
+                                    f"    FILE_ID=$(rclone lsjson 'gdrive:claude-shared/{proj_id}/outbox/' --include '<filename>' | python3 -c \"import sys,json; d=json.load(sys.stdin); items=[x for x in d if not x.get('IsDir',False)]; print(items[0]['ID'] if items else '')\")\n"
+                                    f"    RESULT_URL=\"https://drive.google.com/file/d/$FILE_ID/view?usp=sharing\"\n"
+                                    f"    → pass RESULT_URL as evidence_url above\n"
                                     f"  Q&A reply: mcp__ns-hub__reply_to_stone(task_id='<MID>', message='<≤3 lines>')\n"
                                     f"  No-op: mcp__ns-hub__reply_to_stone(task_id='<MID>', message='<1-line reason>') — silent skip forbidden.\n\n"
                                     + _waves_section
@@ -7712,7 +8081,8 @@ async def execute_project(proj_id: str, request: Request):
                 f"     Excel, PDF, analysis, screenshot), you MUST include it in the completion PATCH as evidence_url.\n"
                 f"     This populates the 'result' badge the user clicks to see the output.\n"
                 f"     ① Upload to GDrive: rclone copy <local-file> 'gdrive:claude-shared/{proj_id}/outbox/'\n"
-                f"     ② Get link:         RESULT_URL=$(rclone link 'gdrive:claude-shared/{proj_id}/outbox/<filename>')\n"
+                f"     ② Get link (M1239 fast):  FILE_ID=$(rclone lsjson 'gdrive:claude-shared/{proj_id}/outbox/' --include '<filename>' | python3 -c \"import sys,json; d=json.load(sys.stdin); items=[x for x in d if not x.get('IsDir',False)]; print(items[0]['ID'] if items else '')\")\n"
+                f"                               RESULT_URL=\"https://drive.google.com/file/d/$FILE_ID/view?usp=sharing\"\n"
                 f"     ③ Add to PATCH:     \"evidence_url\": \"$RESULT_URL\"\n"
                 f"     If result is text/analysis only (no file): include the key summary in append_message instead.\n"
                 f"     evidence_url is shown to the user as the 'result' badge on the stone — always provide it\n"
@@ -7728,9 +8098,10 @@ async def execute_project(proj_id: str, request: Request):
                 f"      and attach it as the 'result' badge:\n"
                 f"      ① Take screenshot: mcp__playwright-session-1__browser_navigate to http://127.0.0.1:{PORT}/northstar,\n"
                 f"         then mcp__playwright-session-1__browser_take_screenshot with\n"
-                f"         filename='/home/desk-1/Project/Moat/.playwright-mcp/review-<MID>-result.png'\n"
-                f"      ② Upload: rclone copy /home/desk-1/Project/Moat/.playwright-mcp/review-<MID>-result.png 'gdrive:claude-shared/Moat/outbox/'\n"
-                f"         RESULT_URL=$(rclone link 'gdrive:claude-shared/Moat/outbox/review-<MID>-result.png')\n"
+                f"         filename='${{HOME}}/.playwright-mcp/review-<MID>-result.png'\n"
+                f"      ② Upload: rclone copy ${{HOME}}/.playwright-mcp/review-<MID>-result.png 'gdrive:claude-shared/{proj_id}/outbox/'\n"
+                f"         FILE_ID=$(rclone lsjson 'gdrive:claude-shared/{proj_id}/outbox/' --include 'review-<MID>-result.png' | python3 -c \"import sys,json; d=json.load(sys.stdin); items=[x for x in d if not x.get('IsDir',False)]; print(items[0]['ID'] if items else '')\")\n"
+                f"         RESULT_URL=\"https://drive.google.com/file/d/$FILE_ID/view?usp=sharing\"\n"
                 f"      ③ Include in completion PATCH: add \"evidence_url\":\"$RESULT_URL\" to the PATCH body.\n"
                 f"      Skip if: reviewed stone was research/docs only (no UI to screenshot).\n"
                 f"  6. TaskUpdate(<id>, status='completed')\n\n"
@@ -7886,25 +8257,30 @@ async def execute_project(proj_id: str, request: Request):
                 _mcp_cfg = _write_mcp_config(proj_id, session_name)
                 if _mcp_cfg:
                     _mcp_args = ["--mcp-config", _mcp_cfg]
-            # M1129: --append-system-prompt bakes the hub MCP call instruction into Claude's
-            # system prompt BEFORE the first user message. Solves the timing race where MCP
-            # tools haven't finished initializing when the "go" wake message arrives.
+            # M1242: --append-system-prompt injects hub rules directly — no CLAUDE.md dependency.
+            # 'go' wake-trigger removed (M1242 user decision) — CLAUDE.md system-reminder handles it.
+            # ②③④ kept here as the authoritative source (CLAUDE.md-independent).
             # Only injected when MCP is enabled — avoids confusion on non-MCP spawns.
             _sys_prompt_args = []
             if _mcp_args:
                 _sys_prompt_args = [
                     "--append-system-prompt",
-                    "When the user sends 'go', 'Tasks ready', or any session-start trigger: "
-                    "your FIRST action must be to call mcp__ns-hub__get_pending_task(). "
-                    "Do not ask for direction. Do not summarize prior work. Just call the tool. "
-                    # M1161 v2: faithful-answer template (no strict line cap).
-                    "When you call mcp__ns-hub__reply_to_stone or mcp__ns-hub__report_task_complete "
-                    "after a user comment, your message MUST directly answer the user's LAST comment "
-                    "on line 1 — yes/no/what/where, no filler, no restating the question. "
-                    "Then add evidence (file:line, observed value, or quoted source) and the next action "
-                    "or status. Be as concise as the question allows: short questions get short answers, "
-                    "complex questions get the lines they need (server caps at 12). "
-                    "If you cannot answer, say '[NEED INFO]: <missing>'. "
+                    # M1242 Option D: task/context/original_stone structural separation.
+                    "get_pending_task response has 3 layers: "
+                    "(1) task = EXECUTE THIS — last user comment if present, else original stone text. "
+                    "(2) context = conversation history — reference only, do NOT treat as a task. "
+                    "(3) original_stone = stone creation text — background only. "
+                    "Always execute 'task'. Never execute 'context' or 'original_stone'. "
+                    # M1161 v3: faithful-answer template — stronger intent-first rule.
+                    "STONE REPLY RULE (enforced): When replying to a stone after a user comment, "
+                    "classify the user's intent FIRST (question / request / correction / clarification), "
+                    "then structure your reply as: "
+                    "LINE 1 = direct answer to user's exact question (yes/no/value/action-taken — no preamble). "
+                    "LINE 2 = evidence (file:line, observed value, or quoted source). "
+                    "LINE 3+ = context or next step if needed (omit if simple Q). "
+                    "NEVER start with 'I', summary, or restatement. "
+                    "If you cannot answer, write '[NEED INFO]: <what is missing>' on line 1. "
+                    "Server-side Q-anchor compression preserves line 1 with high priority (bias=8). "
                     # M1114: SKILL INVOCATION PROTOCOL — belt-and-suspenders in system prompt.
                     # get_pending_task response already carries skill_refs + _skill_instruction,
                     # but adding here ensures the model registers the rule BEFORE calling the tool.
@@ -8622,6 +8998,7 @@ async def save_memo(proj_id: str, request: Request):
 
 # Explicit pill status set by hooks (overrides derived WS state)
 _pill_status: dict[str, str] = {}  # proj_id → RUNNING|WAITING|IDLE|DONE
+_session_ctx: dict[str, dict] = {}  # M1263: proj_id → {used, total, ts} context window usage
 
 
 @app.patch("/api/northstar/{proj_id}/session-status")
@@ -8633,6 +9010,24 @@ async def set_session_status(proj_id: str, request: Request):
         return JSONResponse({"ok": False, "error": "invalid status"}, status_code=400)
     _pill_status[proj_id] = status
     return JSONResponse({"ok": True, "status": status})
+
+
+@app.post("/api/northstar/{proj_id}/session-ctx")
+async def set_session_ctx(proj_id: str, request: Request):
+    """M1263: Stop hook reports context_window usage — stored in memory for terminal badge."""
+    data = await request.json()
+    used = data.get("used", 0)
+    total = data.get("total", 0)
+    import datetime as _dt_ctx
+    _session_ctx[proj_id] = {"used": used, "total": total, "ts": _dt_ctx.datetime.now().isoformat()}
+    _ns_push("ctx_updated", proj_id=proj_id, used=used, total=total)
+    return JSONResponse({"ok": True, "used": used, "total": total})
+
+
+@app.get("/api/northstar/{proj_id}/session-ctx")
+async def get_session_ctx(proj_id: str):
+    """M1263: Return latest context window usage for this project."""
+    return JSONResponse(_session_ctx.get(proj_id) or {"used": 0, "total": 0})
 
 
 @app.delete("/api/northstar/{proj_id}/session")
@@ -8986,6 +9381,46 @@ _IDLE_PUSH_COOLDOWN = 5.0  # seconds — minimum gap between session_idle SSE pu
 # M389 fix: server-side background idle detector — runs independently of client polling
 # This ensures Telegram notifications fire even when no browser tab is open.
 @app.on_event("startup")
+async def _start_compress_scanner():
+    """M1253 P1: periodic scan of all stones for missed compress triggers (token/time/explicit).
+    Runs every 30 min, complements the queued→pending_confirmation hook in PATCH handler."""
+    import asyncio as _aio
+    async def _scan():
+        while True:
+            await _aio.sleep(1800)  # 30 minutes
+            try:
+                if not PROJECTS_DIR.is_dir():
+                    continue
+                for proj_dir in PROJECTS_DIR.iterdir():
+                    if not proj_dir.is_dir():
+                        continue
+                    proj_id = proj_dir.name
+                    proj = _db_load_project(proj_id)
+                    if not proj:
+                        continue
+                    ms = proj.get("milestones") or []
+                    if not isinstance(ms, list) or not ms:
+                        continue
+                    dirty = False
+                    for stone in list(ms):
+                        if not isinstance(stone, dict):
+                            continue
+                        if stone.get("done") or str(stone.get("category") or "").startswith("meta/"):
+                            continue
+                        reason = _compress_trigger_reason(stone)
+                        if reason and reason != "length":
+                            # length-based trigger already fires inline on PATCH; this scanner picks up the others.
+                            _maybe_queue_compress(proj_id, stone, ms, reason_override=reason)
+                            dirty = True
+                    if dirty:
+                        proj["milestones"] = ms
+                        _save_project(proj_id, proj)
+            except Exception:
+                pass  # never crash the scanner
+    _aio.create_task(_scan())
+
+
+@app.on_event("startup")
 async def _start_exec_idle_detector():
     """Server-side background task: detect exec session idle transitions every 5s.
     Previously relied solely on client /api/exec-sessions polling — broke when browser closed."""
@@ -9108,12 +9543,25 @@ def _push_session_idle(session_name: str, proj_id: str) -> bool:
 @app.get("/api/exec-sessions")
 async def get_exec_sessions():
     """Return agent-exec-* tmux sessions where the runtime is actually running."""
-    result = subprocess.run(
-        ["tmux", "list-sessions", "-F", "#{session_name}:#{session_created}:#{session_windows}"],
-        capture_output=True, text=True
-    )
-    sessions = []
-    for line in result.stdout.splitlines():
+    # M1234-C: async subprocess — avoids blocking the event loop every 5s poll
+    # M1234-C2: parallel gather — all sessions processed concurrently (~9×speedup)
+    async def _run(*cmd):
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
+        return stdout.decode("utf-8", errors="replace") if stdout else ""
+
+    try:
+        _ls_out = await _run("tmux", "list-sessions", "-F", "#{session_name}:#{session_created}:#{session_windows}")
+    except Exception:
+        _ls_out = ""
+
+    # Parse session lines and filter to exec sessions only
+    _session_lines = []
+    for line in _ls_out.splitlines():
         parts = line.split(":", 2)
         session_name = parts[0] if parts else ""
         agent = ""
@@ -9126,88 +9574,69 @@ async def get_exec_sessions():
         if not proj_id:
             continue
         created_ts = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        _session_lines.append((session_name, agent, proj_id, created_ts))
+
+    # M1234-C2: process each session concurrently via asyncio.gather
+    async def _process_session(session_name, agent, proj_id, created_ts):
+        import re as _re
+        from datetime import datetime as _dt
 
         # Check if the runtime is actually running — not just a shell prompt after exit
-        pane_cmds = subprocess.run(
-            ["tmux", "list-panes", "-t", session_name, "-F", "#{pane_current_command}"],
-            capture_output=True, text=True
-        ).stdout.splitlines()
+        try:
+            _pane_cmds_out = await _run("tmux", "list-panes", "-t", session_name, "-F", "#{pane_current_command}")
+        except Exception:
+            _pane_cmds_out = ""
+        pane_cmds = _pane_cmds_out.splitlines()
         cmds = [c.strip() for c in pane_cmds if c.strip()]
         runtime_running = any(c not in _SHELLS for c in cmds) if cmds else False
         if not runtime_running:
             # M345 v2: fire ntfy when tracked session exits — check key EXISTENCE not value
-            # Bug was: idle-at-prompt sets value=False, so _was_running_before was False → no notify
             _was_tracked = session_name in _exec_was_running
             _exec_was_running.pop(session_name, None)
             _exec_idle_count.pop(session_name, None)
             if _was_tracked:
                 _ns_push("session_idle", proj_id=proj_id, kind="exec")
                 _send_ntfy_notification(f"{proj_id} exec done", f"Exec session for {proj_id} finished/exited", priority="high")
-            continue
+            return None
 
-        # M97/M183: detect busy first (positive signal), then idle is the complement.
-        # The unique busy markers are "esc to interrupt" and the spinner timer
-        # pattern "… (". Same rules as the M148 wake-detection.
-        # M364: use tmux visible viewport (no -S flag) — captures what's currently on screen
-        # including spinner in header area. -S flags miss spinner when scrolled past viewport.
-        pane_out = subprocess.run(
-            ["tmux", "capture-pane", "-p", "-t", session_name],
-            capture_output=True, text=True
-        ).stdout
-        import re as _re
+        # M97/M183/M364/M396: detect busy via spinner or "esc to interrupt"
+        try:
+            pane_out = await _run("tmux", "capture-pane", "-p", "-t", session_name)
+        except Exception:
+            pane_out = ""
         clean = _re.sub(r'\x1b\[[0-9;]*[mKHJ]', '', pane_out)
-        # M371: use spinner-only for both exec_status AND ntfy — avoids all-projects-live from M366
-        # SSE session_running handles instant green on spawn; spinner handles ongoing state
-        # M396: busy = spinner OR "esc to interrupt" (active even when feedback dialog shown)
         busy_for_ntfy = "… (" in clean or "esc to i" in clean
-        idle_for_ntfy = not busy_for_ntfy
-        idle = idle_for_ntfy  # unified: spinner/interrupt = busy, otherwise = idle
+        idle = not busy_for_ntfy
 
-        # M388: startup grace period — sessions < 30s old without spinner are "starting up",
-        # not idle. Prevents poll from overwriting SSE optimistic LIVE state during Claude init.
+        # M388: startup grace period
         if idle and created_ts > 0:
-            session_age_s = time.time() - created_ts
-            if session_age_s < 30:
-                idle = False  # treat as running until startup completes
+            if time.time() - created_ts < 30:
+                idle = False
 
-        from datetime import datetime as _dt
-        # Surface the resume flag used at spawn time so UI can show whether this
-        # live session is continuing prior stone work or started fresh.
+        # Spawn info / model
         spawn_mode = None
         spawn_from = None
+        spawn_model = ""
         spawn_info_file = PROJECTS_DIR / proj_id / ".last-spawn-info.json"
         if spawn_info_file.exists():
             try:
                 si = json.loads(spawn_info_file.read_text())
                 si_at = si.get("at", "")
-                # Only trust spawn_info if it was written at/after this tmux session's creation
                 si_epoch = 0
                 if si_at:
                     try:
                         si_epoch = int(_dt.fromisoformat(si_at).timestamp())
                     except Exception:
-                        si_epoch = 0
-                # Tight window: spawn_info must be within ±120s of tmux session creation.
-                # Prevents matching a later PTY/respawn write to an older tmux session.
+                        pass
                 if si_epoch and abs(si_epoch - created_ts) <= 120:
                     spawn_mode = si.get("mode")
                     spawn_from = si.get("from_id") or None
-                    spawn_model = si.get("model") or ""
-                else:
-                    spawn_model = si.get("model") or ""  # always include model even if time mismatch
+                spawn_model = si.get("model") or ""
             except Exception:
-                spawn_model = ""
-        else:
-            spawn_model = ""
-        # M1131: when spawn_model is still empty, try two fallbacks in order:
-        # 1. project_meta SQLite — user may have changed the model after last spawn
-        # 2. ~/.claude/settings.json global model (explicit key only)
-        # This ensures _execModel is never blank for a running session.
+                pass
         if not spawn_model:
             try:
-                _proj_meta_model = _get_project_model_value(proj_id) or ""
-                if _proj_meta_model:
-                    spawn_model = _proj_meta_model
+                spawn_model = _get_project_model_value(proj_id) or ""
             except Exception:
                 pass
         if not spawn_model:
@@ -9217,11 +9646,9 @@ async def get_exec_sessions():
                     spawn_model = json.loads(_cc.read_text()).get("model", "") or ""
             except Exception:
                 pass
-        # v0.2.4: single-transition detection with 2-read idle debounce.
-        # M378 false-positive fix: user typing "go" shows brief prompt (no spinner) then
-        # spinner appears — without debounce this fires session_idle toast immediately.
-        # Require 2 consecutive idle readings (2×3s = 6s) before firing session_idle SSE.
-        _was_running = _exec_was_running.get(session_name, False)  # M892: default False → no false idle ntfy on hub restart
+
+        # v0.2.4 idle debounce + SSE events (M378/M998/M1171)
+        _was_running = _exec_was_running.get(session_name, False)
         _exec_was_running[session_name] = not idle
         if idle:
             _exec_idle_count[session_name] = _exec_idle_count.get(session_name, 0) + 1
@@ -9229,41 +9656,35 @@ async def get_exec_sessions():
             _exec_idle_count.pop(session_name, None)
         _consec_idle = _exec_idle_count.get(session_name, 0)
         if idle and (_was_running and _consec_idle >= 2 or _consec_idle >= 3):
-            # M998 fix: fire for sessions that ran too quickly to be caught (_consec_idle>=3 fallback)
-            _already_notified = session_name in _exec_notified
-            if not _already_notified:
+            if session_name not in _exec_notified:
                 _push_session_idle(session_name, proj_id)
-                # M1171 v2: only notify when queue is empty — suppress mid-batch notifications
                 if not _has_queued_stones(proj_id):
                     _send_ntfy_notification(f"{proj_id} exec idle", f"Exec session for {proj_id} just went idle", priority="default")
                 _exec_notified[session_name] = time.time()
         elif not idle:
-            # session running → reset notified flag so next idle can fire
             _exec_notified.pop(session_name, None)
         if not _was_running and not idle:
-            # idle→running: push SSE so detail-card updates within 3s poll
-            _exec_idle_count.pop(session_name, None)  # reset idle count on running
+            _exec_idle_count.pop(session_name, None)
             _ns_push("session_running", proj_id=proj_id, kind="exec")
 
-        # M365: find live_session_id = newest transcript modified after session spawn
+        # M365: live session id from transcript
         _live_session_id = ""
         try:
             _base = Path.home() / ".claude" / "projects"
-            # Find the transcript dir for this project (case-insensitive suffix match)
             _candidates = [d for d in _base.iterdir() if d.name.lower().endswith(f"-project-{proj_id.lower()}")]
             if not _candidates:
                 _candidates = [d for d in _base.iterdir() if proj_id.lower() in d.name.lower() and "project" in d.name.lower()]
             if _candidates:
-                _transcript_dir = sorted(_candidates, key=lambda d: len(d.name))[0]  # shortest match
+                _transcript_dir = sorted(_candidates, key=lambda d: len(d.name))[0]
                 _all = sorted(_transcript_dir.glob("*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)
-                # The live session = most recently written file that was modified AFTER session creation
                 for _f in _all:
                     if _f.stat().st_mtime > created_ts:
                         _live_session_id = _f.stem
                         break
         except Exception:
             pass
-        sessions.append({
+
+        return {
             "session": session_name,
             "proj_id": proj_id,
             "agent": agent,
@@ -9272,9 +9693,16 @@ async def get_exec_sessions():
             "idle": idle,
             "spawn_mode": spawn_mode,
             "spawn_from": spawn_from,
-            "live_session_id": _live_session_id,  # M365: actual running session ID
-            "model": spawn_model,  # M189: show model in exec session panel
-        })
+            "live_session_id": _live_session_id,
+            "model": spawn_model,
+        }
+
+    # Run all sessions in parallel
+    _results = await asyncio.gather(*[
+        _process_session(sn, ag, pid, cts) for sn, ag, pid, cts in _session_lines
+    ])
+    sessions = [r for r in _results if r is not None]
+
     # Clean up stale entries from _exec_was_running
     _alive_sessions = {s.get("session") for s in sessions if s.get("session")}
     for k in list(_exec_was_running.keys()):
@@ -9289,12 +9717,9 @@ async def get_exec_sessions():
     # M1158: also include all tmux sessions (main, branch, etc.) for sess badge
     _all_sx = []
     try:
-        _tmux_out = subprocess.run(
-            ["tmux", "list-sessions", "-F", "#{session_name}"],
-            capture_output=True, text=True, timeout=3,
-        ).stdout.strip()
+        _tmux_all_out = await _run("tmux", "list-sessions", "-F", "#{session_name}")
         _proj_lower = p.id.lower()
-        _all_sx = [l for l in _tmux_out.splitlines() if _proj_lower in l.lower()]
+        _all_sx = [l for l in _tmux_all_out.splitlines() if _proj_lower in l.lower()]
     except Exception:
         pass
     return JSONResponse({"ok": True, "sessions": sessions, "all_sessions": _all_sx})
@@ -9839,9 +10264,9 @@ def _detect_session_model(transcript_path: Path, max_lines: int = 50) -> str:
 async def health(service: str):
     if service in ("northstar", "market-signals"):
         return JSONResponse({"ok": True})
-    # M60: ctx is fully integrated — mounted at /ctx, always available if hub is up
+    # M1235: CTX disabled
     if service == "ctx":
-        return JSONResponse({"ok": True, "status": 200, "mode": "integrated"})
+        return JSONResponse({"ok": False, "error": "CTX disabled (M1235)"}, status_code=404)
     if False:  # dead code — kept for reference
         try:
             async with httpx.AsyncClient(timeout=1.5) as client:
@@ -9983,10 +10408,35 @@ async def corpus_skills_agents():
                 "description": (fm.get("description") or "").strip(),
             })
 
+    # Corpus docs: ~/.hub/projects/*/corpus/*.md + ~/.hub/corpus/*.md
+    docs = []
+    hub_home = Path.home() / ".hub"
+    corpus_dirs = []
+    projects_dir = hub_home / "projects"
+    if projects_dir.is_dir():
+        for proj in sorted(projects_dir.iterdir(), key=lambda x: x.name.lower()):
+            cdir = proj / "corpus"
+            if cdir.is_dir():
+                corpus_dirs.append((proj.name, cdir))
+    global_corpus = hub_home / "corpus"
+    if global_corpus.is_dir():
+        corpus_dirs.append(("global", global_corpus))
+    for proj_name, cdir in corpus_dirs:
+        for f in sorted(cdir.iterdir(), key=lambda x: x.name.lower()):
+            if f.is_file() and f.suffix.lower() == ".md":
+                docs.append({
+                    "name": f.stem,
+                    "project": proj_name,
+                    "path": str(f),
+                    "size": f.stat().st_size,
+                    "mtime": int(f.stat().st_mtime),
+                })
+
     return JSONResponse({
         "skills": skills,
         "agents": agents,
-        "counts": {"skills": len(skills), "agents": len(agents)},
+        "docs": docs,
+        "counts": {"skills": len(skills), "agents": len(agents), "docs": len(docs)},
     })
 
 
@@ -10003,6 +10453,23 @@ async def delete_skill(skill_name: str):
     bak = skill_dir / "SKILL.md.bak"
     try:
         skill_md.rename(bak)
+        return JSONResponse({"ok": True, "backed_up_to": str(bak)})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.delete("/api/agent/{agent_name}")
+async def delete_agent(agent_name: str):
+    """M1275: Delete an agent by backing up its .md file."""
+    import re as _re
+    if not _re.match(r'^[\w\-]+$', agent_name):
+        return JSONResponse({"ok": False, "error": "invalid agent name"}, status_code=400)
+    agent_file = Path.home() / ".claude" / "agents" / f"{agent_name}.md"
+    if not agent_file.is_file():
+        return JSONResponse({"ok": False, "error": "agent file not found"}, status_code=404)
+    bak = agent_file.with_suffix(".md.bak")
+    try:
+        agent_file.rename(bak)
         return JSONResponse({"ok": True, "backed_up_to": str(bak)})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
@@ -10026,71 +10493,10 @@ async def get_skill_content(skill_name: str):
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
-_CTX_TEL_CACHE: dict = {"data": None, "ts": 0.0}
-_CTX_TEL_TTL = 60  # 60s TTL — Turso is slow (Korea→AWS us-west-2), cache to avoid blocking
-
 @app.get("/api/ctx-telemetry")
 async def ctx_telemetry():
-    """CTX ↔ NS-Hub integration: live telemetry from hub-ctx Turso DB.
-
-    Returns user counts, recent session stats, and version breakdown so the
-    hub dashboard can show CTX data collection health alongside milestone progress.
-    Uses asyncio.to_thread + TTL cache to avoid blocking the event loop.
-    """
-    import time as _time
-    now = _time.time()
-    if _CTX_TEL_CACHE["data"] is not None and (now - _CTX_TEL_CACHE["ts"]) < _CTX_TEL_TTL:
-        return JSONResponse(_CTX_TEL_CACHE["data"])
-
-    import os as _os_tel
-    _turso_token_check = _os_tel.environ.get("HUB_CTX_TURSO_TOKEN", "")
-    if not _turso_token_check:
-        return JSONResponse({"error": "HUB_CTX_TURSO_TOKEN not configured", "sources": []})
-
-    def _fetch_sync():
-        import urllib.request as _ur, os as _os
-        turso_url = _os.environ.get("HUB_CTX_TURSO_URL", "https://hub-ctx-jaytoone.aws-us-west-2.turso.io")
-        turso_token = _os.environ.get("HUB_CTX_TURSO_TOKEN", "")
-
-        def _q(sql: str):
-            payload = json.dumps({"requests": [
-                {"type": "execute", "stmt": {"sql": sql}},
-                {"type": "close"}
-            ]}).encode()
-            req = _ur.Request(f"{turso_url}/v2/pipeline", data=payload,
-                headers={"Authorization": f"Bearer {turso_token}", "Content-Type": "application/json"},
-                method="POST")
-            with _ur.urlopen(req, timeout=6) as r:
-                return json.load(r)["results"][0]["response"]["result"]["rows"]
-
-        total_rows = int(_q("SELECT COUNT(*) FROM ctx_session_aggregates")[0][0]["value"])
-        total_users = int(_q("SELECT COUNT(DISTINCT user_id) FROM ctx_session_aggregates")[0][0]["value"])
-        ext_q = ("SELECT COUNT(DISTINCT user_id) FROM ctx_session_aggregates "
-                 "WHERE user_id NOT IN ('6d7f66b2fb843134','2e00a759e17a12c4','validate_test_001') "
-                 "AND user_id NOT LIKE 'retry%' AND user_id NOT LIKE 'test%' "
-                 "AND user_id NOT LIKE '12293e702290%'")
-        ext_users = int(_q(ext_q)[0][0]["value"])
-        ver_rows = _q("SELECT ctx_version, COUNT(DISTINCT user_id) u FROM ctx_session_aggregates "
-                      "WHERE ctx_version >= '0.3.26' GROUP BY ctx_version ORDER BY ctx_version DESC LIMIT 5")
-        versions = {(r[0]["value"] if r[0]["type"] != "null" else "unknown"): int(r[1]["value"])
-                    for r in ver_rows}
-        return {
-            "total_rows": total_rows, "total_users": total_users,
-            "external_users": ext_users, "versions": versions,
-            "ns2_passed": ext_users > 0,
-            "db": "hub-ctx-jaytoone.aws-us-west-2.turso.io",
-        }
-
-    try:
-        data = await asyncio.to_thread(_fetch_sync)
-        _CTX_TEL_CACHE["data"] = data
-        _CTX_TEL_CACHE["ts"] = _time.time()
-        return JSONResponse(data)
-    except Exception as exc:
-        stale = _CTX_TEL_CACHE.get("data")
-        if stale:
-            return JSONResponse({**stale, "_stale": True})
-        return JSONResponse({"error": str(exc)[:100]}, status_code=503)
+    """M1235: CTX disabled."""
+    return JSONResponse({"error": "CTX disabled (M1235)"}, status_code=404)
 
 
 @app.get("/api/verify-plan")
@@ -10340,6 +10746,93 @@ def _hub_pkg_version() -> str:
     except Exception:
         return "unknown"
 
+def _compress_trigger_reason(parent: dict) -> str | None:
+    """M1253: evaluate all 4 trigger conditions, return reason string if any match, else None.
+    Triggers:
+      1) length: conv_len >= 10 AND (conv_len - last_compressed_len) >= 5
+      2) tokens: sum(input+output) >= 50_000 stone-wide
+      3) time: now - last conversation entry >= 7 days AND conv_len > 10
+      4) explicit: parent.text or claude_comment contains '[compress]' tag
+    """
+    try:
+        conv = parent.get("conversation") or []
+        conv_len = len(conv)
+        if conv_len < 1:
+            return None
+        state = parent.get("summary_state") or {}
+        last_len = int(state.get("last_compressed_len") or 0)
+        # Trigger 4: explicit tag (highest priority — manual override)
+        for k in ("text", "claude_comment"):
+            v = (parent.get(k) or "")
+            if "[compress]" in str(v).lower():
+                return "explicit"
+        # Trigger 1: length-based (lowered from 25/10 → 10/5 per M1253 user feedback)
+        if conv_len >= 10 and (conv_len - last_len) >= 5:
+            return "length"
+        # Trigger 2: token-based (API-key env only — subscription users have no token fields,
+        # so tok=0 always and this branch never fires; effectively a no-op in that case)
+        tok = int(parent.get("input_tokens") or 0) + int(parent.get("output_tokens") or 0)
+        if tok >= 50_000 and (conv_len - last_len) >= 5:
+            return "tokens"
+        # Trigger 3: time-based — stagnant >= 7 days
+        if conv_len > 10 and (conv_len - last_len) >= 5:
+            last_ts = conv[-1].get("ts") or ""
+            if last_ts:
+                try:
+                    import datetime as _dt
+                    last_dt = _dt.datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+                    now_naive = _dt.datetime.now(last_dt.tzinfo) if last_dt.tzinfo else _dt.datetime.now()
+                    if (now_naive - last_dt).days >= 7:
+                        return "time"
+                except (ValueError, TypeError):
+                    pass
+        return None
+    except Exception:
+        return None
+
+
+def _maybe_queue_compress(proj_id: str, parent: dict, milestones: list, reason_override: str | None = None) -> None:
+    """M1253: idempotently queue a [compress] child stone when parent conversation grew enough.
+    See _compress_trigger_reason for the 4 trigger types.
+    Skip if a [compress] child already exists for this parent (in-flight idempotency).
+    """
+    try:
+        reason = reason_override or _compress_trigger_reason(parent)
+        if not reason:
+            return
+        parent_id = parent.get("id")
+        if not parent_id:
+            return
+        # In-flight idempotency: skip if a [compress] child for this parent is still open.
+        for sib in milestones:
+            if not isinstance(sib, dict):
+                continue
+            if sib.get("parent_id") == parent_id and str(sib.get("text", "")).startswith("[compress]"):
+                if sib.get("status") in ("queued", "pending", "pending_confirmation", "needs_clarification") and not sib.get("done"):
+                    return
+        # Queue a fresh child stone — exec-dispatcher (M222) handles wake-up.
+        import datetime as _dt
+        child_id = f"{parent_id}.cmp{int(_dt.datetime.now().timestamp()) % 10000}"
+        child = {
+            "id": child_id,
+            "parent_id": parent_id,
+            "layer": 1,  # M1264: layer=1 required for grouping border + toggle button on parent
+            "substar_id": parent.get("substar_id") or None,  # inherit parent's group — avoids Ungrouped
+            "text": (
+                f"[compress] (trigger: {reason}) Read stone {parent_id}'s full conversation, write a 3-8 line summary "
+                f"of key decisions/constraints/open items, then call attach_summary(task_id='{parent_id}', summary='<your-summary>'). "
+                f"Do NOT touch other status fields. This is a meta task — keep it brief."
+            ),
+            "status": "queued",
+            "done": False,
+            "category": "meta/compress",
+            "created_at": _dt.datetime.now().isoformat(),
+        }
+        milestones.append(child)
+    except Exception:
+        pass  # never block stone completion on compress queuing
+
+
 def _record_usage_event(event: str, extra: dict = None):
     """M929: Record usage event locally + centrally via Turso (consent-gated, no PII)."""
     if not _get_consent().get("data_collection", True):
@@ -10359,18 +10852,19 @@ def _record_usage_event(event: str, extra: dict = None):
             f.write(json.dumps(entry) + "\n")
     except Exception:
         pass
-    # Central telemetry (hub_usage only, no stone data) — async, non-blocking
+    # Central telemetry — async, non-blocking
     if _TEL_ENABLED:
         import threading
         def _send_telemetry():
             try:
                 import urllib.request as _ur2, json as _j2
+                extra_json = _j2.dumps({k: v for k, v in (extra or {}).items()})
                 payload = _j2.dumps({"requests": [
-                    {"type": "execute", "stmt": {"sql": "CREATE TABLE IF NOT EXISTS hub_usage (ts INTEGER, event TEXT, install_id TEXT, version TEXT, os TEXT)"}},
-                    {"type": "execute", "stmt": {"sql": "INSERT INTO hub_usage (ts, event, install_id, version, os) VALUES (?, ?, ?, ?, ?)",
+                    {"type": "execute", "stmt": {"sql": "CREATE TABLE IF NOT EXISTS hub_usage (ts INTEGER, event TEXT, install_id TEXT, version TEXT, os TEXT, extra_json TEXT)"}},
+                    {"type": "execute", "stmt": {"sql": "INSERT INTO hub_usage (ts, event, install_id, version, os, extra_json) VALUES (?, ?, ?, ?, ?, ?)",
                         "args": [{"type": "integer", "value": str(entry["ts"])}, {"type": "text", "value": entry["event"]},
                                  {"type": "text", "value": entry["install_id"]}, {"type": "text", "value": entry["version"]},
-                                 {"type": "text", "value": entry["os"]}]}},
+                                 {"type": "text", "value": entry["os"]}, {"type": "text", "value": extra_json}]}},
                 ]}).encode()
                 req = _ur2.Request(f"{_HUB_TELEMETRY_URL}/v2/pipeline", data=payload,
                     headers={"Authorization": f"Bearer {_HUB_TELEMETRY_TOKEN}", "Content-Type": "application/json"})
@@ -10410,6 +10904,128 @@ async def set_consent(request: Request):
 
 
 # ── M705: /api/hub/config REST endpoints ──────────────────────────────────────
+_gdrive_name_cache: dict = {}  # file_id → name, permanent in-memory cache
+
+def _gdrive_token_from_rclone() -> str | None:
+    """Read access_token from rclone.conf [gdrive] — used for direct Drive API calls."""
+    import json as _json
+    conf = Path.home() / ".config" / "rclone" / "rclone.conf"
+    try:
+        text = conf.read_text()
+        in_gdrive = False
+        for line in text.splitlines():
+            if line.strip().startswith("["):
+                in_gdrive = line.strip().lower() in ("[gdrive]",)
+            elif in_gdrive and line.strip().startswith("token"):
+                raw = line.split("=", 1)[1].strip()
+                tok = _json.loads(raw)
+                return tok.get("access_token")
+    except Exception:
+        pass
+    return None
+
+@app.post("/api/gdrive-filename")
+async def gdrive_filename_seed(request: Request):
+    """M1304: Pre-seed the in-memory filename cache (file_id → name) without any GDrive API call.
+    Called at upload time when the local filename is already known.
+    Body: {"id": "<gdrive_file_id>", "name": "<filename>"}"""
+    try:
+        body = await request.json()
+        fid = (body.get("id") or "").strip()
+        name = (body.get("name") or "").strip()
+        if fid and name:
+            _gdrive_name_cache[fid] = name
+            return JSONResponse({"ok": True, "cached": True})
+    except Exception:
+        pass
+    return JSONResponse({"ok": False})
+
+
+@app.get("/api/gdrive-filename")
+async def gdrive_filename(id: str = ""):
+    """M1295: Resolve GDrive file ID → filename.
+    Strategy: in-memory cache → GDrive API (fast, ~100ms) → rclone lsjson fallback."""
+    if not id or len(id) < 10:
+        return JSONResponse({"ok": False, "name": None})
+    # Cache hit — instant
+    if id in _gdrive_name_cache:
+        return JSONResponse({"ok": True, "name": _gdrive_name_cache[id], "cached": True})
+    import json as _json
+    # Fast path: direct Google Drive API v3 using rclone oauth token
+    token = _gdrive_token_from_rclone()
+    if token:
+        try:
+            import urllib.request as _ur
+            req = _ur.Request(
+                f"https://www.googleapis.com/drive/v3/files/{id}?fields=name",
+                headers={"Authorization": f"Bearer {token}"}
+            )
+            with _ur.urlopen(req, timeout=4) as resp:
+                data = _json.loads(resp.read())
+                name = data.get("name")
+                if name:
+                    _gdrive_name_cache[id] = name
+                    return JSONResponse({"ok": True, "name": name})
+        except Exception:
+            pass
+    # Fallback: rclone lsjson per-project outbox
+    import shutil as _sh
+    if not _sh.which("rclone"):
+        return JSONResponse({"ok": False, "name": None})
+    import asyncio
+    loop = asyncio.get_event_loop()
+    try:
+        for proj in ["MOAT", "Sales", "FRWP", "UniversEye", "Hub", "Crons"]:
+            r2 = await loop.run_in_executor(None, lambda p=proj: subprocess.run(
+                ["rclone", "lsjson", f"gdrive:claude-shared/{p}/outbox/"],
+                capture_output=True, text=True, timeout=6
+            ))
+            if r2.returncode == 0:
+                for item in _json.loads(r2.stdout or "[]"):
+                    if item.get("ID") == id:
+                        name = item.get("Name")
+                        if name:
+                            _gdrive_name_cache[id] = name
+                        return JSONResponse({"ok": True, "name": name})
+    except Exception as e:
+        return JSONResponse({"ok": False, "name": None, "error": str(e)})
+    return JSONResponse({"ok": False, "name": None})
+
+
+@app.get("/api/setup/rclone-status")
+async def get_rclone_status():
+    """M1265: Check if rclone gdrive remote is configured — used for new-user onboarding banner."""
+    import shutil as _sh
+    rclone_bin = _sh.which("rclone")
+    if not rclone_bin:
+        return JSONResponse({"ok": True, "rclone_installed": False, "gdrive_configured": False,
+                             "setup_required": True,
+                             "install_hint": "Install rclone: curl https://rclone.org/install.sh | sudo bash"})
+    conf = Path.home() / ".config" / "rclone" / "rclone.conf"
+    if not conf.exists():
+        return JSONResponse({"ok": True, "rclone_installed": True, "gdrive_configured": False,
+                             "setup_required": True,
+                             "setup_hint": "Run: rclone config  →  n (new remote) → name: gdrive → Google Drive → OAuth in browser"})
+    # Check if a drive-type remote exists
+    try:
+        r = subprocess.run(["rclone", "listremotes"], capture_output=True, text=True, timeout=5)
+        remotes = [x.rstrip(":") for x in r.stdout.splitlines() if x.strip()]
+        # Check each remote's type
+        drive_remotes = []
+        for rem in remotes:
+            tr = subprocess.run(["rclone", "config", "show", rem], capture_output=True, text=True, timeout=5)
+            if "type = drive" in tr.stdout:
+                drive_remotes.append(rem)
+        if not drive_remotes:
+            return JSONResponse({"ok": True, "rclone_installed": True, "gdrive_configured": False,
+                                 "setup_required": True,
+                                 "setup_hint": "Run: rclone config  →  n → name: gdrive → Google Drive → OAuth"})
+        return JSONResponse({"ok": True, "rclone_installed": True, "gdrive_configured": True,
+                             "setup_required": False, "drive_remotes": drive_remotes})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
 @app.get("/api/hub/config")
 async def get_hub_config():
     """Return current user config (defaults + per-project overrides)."""
