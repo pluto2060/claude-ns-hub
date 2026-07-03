@@ -2,6 +2,7 @@
 43f873c9a9ad26773b13474bb33795399b4e18db:server.py.pre-mcp-20260608:generic-api-key:9068
 07807740e2a4ded3e70f5733477de669dec4268e:server.py:generic-api-key:9099
 308acfd4de06bb8363f798812ef2eeb2ac9f8ae6:server.py:generic-api-key:8570
+server.py:generic-api-key:11104
 # Old Turso tokens in git history — already rotated (M929 security fix applied to working tree)
 13d839ef930e7e1a07d713d584b85ee3d11d31b2:server.py:jwt:46
 43f873c9a9ad26773b13474bb33795399b4e18db:server.py.pre-mcp-20260608:jwt:52
