@@ -4504,7 +4504,9 @@ async def _start_queue_continuation_poller():
                         _dispatch_inflight[proj_id] = now  # M1585 v6: mark so _dispatch_blocking also respects this
 
                 # M1635 fork-protocol: scan for projects with queued stones but NO alive exec session.
-                # When agent exits cleanly (should_exit=true), the session dies and we re-spawn here.
+                # Covers: crashed sessions, manual kills, hub-restart kills, and harnesses that
+                # honor should_exit (interactive claude CLI cannot self-exit — its session stays
+                # alive at prompt and is handled by the alive-session wake path above instead).
                 # Spawn cooldown: 60s per project to prevent rapid re-spawn loops.
                 _FORK_SPAWN_COOLDOWN = 60
                 if not hasattr(_poll_queue_continuation, "_fork_spawn_last"):
@@ -4529,15 +4531,22 @@ async def _start_queue_continuation_poller():
                             continue  # spawn cooldown
                         if now - _dispatch_inflight.get(_fork_proj_id, 0) < _DISPATCH_INFLIGHT_SECS:
                             continue  # dispatch already in-flight
-                        # Trigger execute endpoint to spawn a new session
-                        try:
-                            import urllib.request as _ureq, json as _json_fork
-                            _fork_url = f"http://127.0.0.1:{PORT}/api/northstar/{_fork_proj_id}/execute"
-                            _fork_req = _ureq.Request(_fork_url, data=b"{}", headers={"Content-Type": "application/json"}, method="POST")
-                            with _ureq.urlopen(_fork_req, timeout=5):
+                        # Trigger execute endpoint to spawn a new session.
+                        # asyncio.to_thread — a blocking urlopen here stalls the event loop
+                        # (execute waits up to 12s for spawn readiness; see blocking-urlopen incident).
+                        def _fork_spawn_call(_fp=_fork_proj_id):
+                            import urllib.request as _ureq
+                            _req = _ureq.Request(
+                                f"http://127.0.0.1:{PORT}/api/northstar/{_fp}/execute",
+                                data=b"{}", headers={"Content-Type": "application/json"}, method="POST")
+                            with _ureq.urlopen(_req, timeout=30):
                                 pass
+                        try:
+                            # Mark BEFORE the await — spawn takes up to 12s and the guards
+                            # must hold if anything else inspects state mid-spawn.
                             _fork_spawn_last[_fork_proj_id] = now
                             _dispatch_inflight[_fork_proj_id] = now
+                            await asyncio.to_thread(_fork_spawn_call)
                         except Exception:
                             pass
                 except Exception:
@@ -9177,11 +9186,11 @@ async def execute_project(proj_id: str, request: Request):
                     "(2) context = conversation history — reference only, do NOT treat as a task. "
                     "(3) original_stone = stone creation text — background only. "
                     "Always execute 'task'. Never execute 'context' or 'original_stone'. "
-                    # M1635 fork-protocol: agent exits cleanly when no queued work;
-                    # queue poller re-spawns on next stone arrival (pane-scrape removed).
+                    # M1635 fork-protocol: agent goes silent when no queued work;
+                    # get_pending_task already posted busy=False (authoritative idle signal).
                     "EXIT PROTOCOL (M1635): if get_pending_task returns should_exit=true, "
-                    "stop ALL work immediately and exit (do not reply, do not call any other tool). "
-                    "The hub will re-spawn this session automatically when a new task arrives. "
+                    "END YOUR TURN immediately — no reply, no further tool calls. "
+                    "The hub dispatches the next task to this session automatically when it arrives. "
                     # M1161 v3: faithful-answer template — stronger intent-first rule.
                     "STONE REPLY RULE (enforced): When replying to a stone after a user comment, "
                     "classify the user's intent FIRST (question / request / correction / clarification), "
@@ -10635,21 +10644,22 @@ async def _start_exec_idle_detector():
                 pass
     # M460 cold-start fix: pre-scan existing exec sessions at startup.
     # Sessions already running → mark _exec_was_running=True so we catch their next idle.
-    # Sessions already idle at startup → skip (we missed the transition, can't go back).
-    import re as _re_cs
+    # M1635 Stage-1: spinner capture-pane scan replaced with OOB state (hydrated from SQLite
+    # at L747 startup handler, which runs before this one — registration order guarantees it).
+    # This removes the LAST content-based pane scrape from the idle-detection path.
     try:
         _cs_result = subprocess.run(
             ["tmux", "list-sessions", "-F", "#{session_name}"],
             capture_output=True, text=True, timeout=2)
         for _cs_sname in _cs_result.stdout.splitlines():
-            if not any(_cs_sname.startswith(p) for p in ("claude-exec-", "codex-exec-", "openrouter-exec-", "dsk-exec-")):
+            _cs_proj = ""
+            for _cs_pfx in ("claude-exec-", "codex-exec-", "openrouter-exec-", "dsk-exec-"):
+                if _cs_sname.startswith(_cs_pfx):
+                    _cs_proj = _cs_sname[len(_cs_pfx):]
+                    break
+            if not _cs_proj:
                 continue
-            _cs_pane = subprocess.run(
-                ["tmux", "capture-pane", "-p", "-t", _cs_sname],
-                capture_output=True, text=True, timeout=2).stdout
-            _cs_clean = _re_cs.sub(r'\x1b\[[0-9;]*[mKHJ]', '', _cs_pane)
-            # M1370: "esc to i" removed — claude status bar text, always present even when idle
-            if "… (" in _cs_clean:
+            if _oob_is_busy(_cs_proj):
                 _exec_was_running[_cs_sname] = True  # currently running → will detect idle
     except Exception:
         pass

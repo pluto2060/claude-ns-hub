@@ -47,7 +47,7 @@ TOOLS = [
             "task = WHAT TO DO NOW (execute this), "
             "context = conversation history (reference only, do NOT execute), "
             "original_stone = the stone's original creation text (background only). "
-            "has_task=false + should_exit=true → no tasks queued; call exit() or stop immediately (poller will re-spawn when next task arrives). "
+            "has_task=false + should_exit=true → no tasks queued; END YOUR TURN immediately, no further tool calls (hub auto-dispatches the next task when it arrives). "
             "SKILL PROTOCOL: skill_refs non-empty → call Skill(skill=skill_refs[0]) FIRST before any other tool. "
             "_child_stone_required=true → call create_child_stone() for each sub-task FIRST."
         ),
