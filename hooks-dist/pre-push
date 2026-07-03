@@ -1,0 +1,37 @@
+#!/bin/bash
+# M1635: Block push of runtime files (server.py, northstar.html, hub-mcp-server.py)
+# These files are .gitignore'd but user wants local commit capability without remote push
+
+set -e
+
+FORBIDDEN_PATTERN='server\.py|static/northstar\.html|hooks/hub-mcp-server\.py'
+
+# Read stdin: <local ref> <local oid> <remote ref> <remote oid>
+while read local_ref local_oid remote_ref remote_oid; do
+    if [ "$local_oid" = "0000000000000000000000000000000000000000" ]; then
+        # Deleting a branch, allow
+        continue
+    fi
+
+    if [ "$remote_oid" = "0000000000000000000000000000000000000000" ]; then
+        # New branch, compare against empty tree
+        range="$local_oid"
+    else
+        # Existing branch, compare range
+        range="$remote_oid..$local_oid"
+    fi
+
+    # Check if forbidden files are in the diff
+    forbidden_files=$(git diff --name-only "$range" | grep -E "$FORBIDDEN_PATTERN" || true)
+
+    if [ -n "$forbidden_files" ]; then
+        echo "ERROR: Push blocked — the following runtime files cannot be pushed:"
+        echo "$forbidden_files" | sed 's/^/  - /'
+        echo ""
+        echo "These files are for local development only (server.py, northstar.html, hub-mcp-server.py)."
+        echo "To bypass (NOT recommended): git push --no-verify"
+        exit 1
+    fi
+done
+
+exit 0
