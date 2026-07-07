@@ -1,0 +1,1 @@
+../static/hooks/northstar-precompact-busy.py

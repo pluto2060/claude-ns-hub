@@ -12,3 +12,14 @@ repos:
       - id: check-yaml
       - id: check-merge-conflict
       - id: detect-private-key
+
+  # M1694 P2: non-blocking for now — server.py has 277 pre-existing lint issues
+  # (mostly harmless: f-string-missing-placeholders, one-line if/semicolons).
+  # Cleaning all of them is a separate, large, unrelated diff — exit-zero surfaces
+  # new issues in the pre-commit diff output without blocking commits on old debt.
+  # Flip to blocking once the existing backlog is worked down.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.15
+    hooks:
+      - id: ruff
+        args: [--exit-zero]

@@ -11,9 +11,12 @@ Priority: --arg → NS_HUB_PROJ/NS_HUB_URL env → ~/.hub/config.yaml → defaul
 import argparse
 import json
 import os
+import re
+import subprocess
 import sqlite3
 import sys
 import urllib.request
+import urllib.error
 import datetime
 from pathlib import Path
 
@@ -31,9 +34,33 @@ def _hub_request(url: str, method: str = "GET", body: dict = None, timeout: int 
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            # M1709: server hard-rejects (422 stale_reference_blocked, reply_line_limit_blocked,
+            # etc.) return a structured JSON body with a "detail" field the LLM needs to see to
+            # self-correct (e.g. "max 3 lines... or set allow_long_reply:true"). Previously the
+            # body was never read — callers' `except Exception as e: return {"error": str(e)}`
+            # only got Python's generic "HTTP Error 422: Unprocessable Entity", so the LLM had no
+            # idea WHY it failed or how to fix it. Observed live: HugwartsBanana M110 retried
+            # blindly 4 times against the new line-limit gate with no visibility into the actual
+            # rule. Read the body and re-raise with it attached so callers can surface it.
+            try:
+                _err_body = json.loads(e.read())
+            except Exception:
+                _err_body = None
+            last_err = HubHTTPError(e.code, _err_body) if _err_body else e
         except Exception as e:
             last_err = e
     raise last_err
+
+
+class HubHTTPError(Exception):
+    """M1709: carries the server's structured error JSON body through _hub_request's retry
+    loop so callers can surface `detail`/`error`/etc. to the LLM instead of a bare HTTP status
+    string."""
+    def __init__(self, code: int, body: dict):
+        self.code = code
+        self.body = body
+        super().__init__(f"HTTP {code}: {body.get('error', body)}")
 
 
 # M1212: P3/P4 tool description compression — keep Purpose component, trim Examples/redundant prose.
@@ -110,6 +137,7 @@ TOOLS = [
                 "task_id": {"type": "string"},
                 "message": {"type": "string", "description": "Reply text, max 1 line"},
                 "evidence_url": {"type": "string", "description": "Optional GDrive URL (https://drive.google.com/file/d/<ID>/view?usp=sharing). Pass when the QA reply delivers an artifact (e.g. revised Excel). Sets the result badge without calling attach_evidence_url separately."},
+                "evidence_filename": {"type": "string", "description": "Local filename hint (M{ID}-{suffix}.{ext} convention). Pass alongside evidence_url so the UI shows the real filename instantly without a GDrive API call — omitting this leaves the evd badge dependent on a live GDrive lookup that can fail under quota pressure."},
             },
             "required": ["task_id", "message"],
         },
@@ -162,6 +190,29 @@ TOOLS = [
                 "evidence_filename": {"type": "string", "description": "Local filename hint (M{ID}-{suffix}.{ext} convention). Optional but recommended."},
             },
             "required": ["task_id", "evidence_url"],
+        },
+    },
+    {
+        "name": "upload_evidence",
+        "description": (
+            "M1592: ONE-CALL evidence upload — runs rclone copy + rclone lsjson + URL assembly + "
+            "evidence_url PATCH internally, so the stone's evd badge is attached the INSTANT the "
+            "file lands on GDrive, independent of whichever tool you call next (report_task_complete "
+            "OR reply_to_stone — both skip the badge if evidence_url isn't passed explicitly; this "
+            "tool removes that failure mode by not depending on either). "
+            "Use this INSTEAD OF manually chaining `rclone copy` + `rclone lsjson` + attach_evidence_url. "
+            "❌ NEVER use GDrive MCP (mcp__claude_ai_Google_Drive__*) — base64 encoding is extremely slow. "
+            "FILENAME CONVENTION: M{ID}-{suffix}.{ext} (e.g. M70-comparison.xlsx) — pass as evidence_filename "
+            "or the local basename of file_path is used."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "file_path": {"type": "string", "description": "Absolute local path of the file to upload (already written to disk)."},
+                "evidence_filename": {"type": "string", "description": "Optional override filename for the GDrive copy (M{ID}-{suffix}.{ext} convention). Defaults to the basename of file_path."},
+            },
+            "required": ["task_id", "file_path"],
         },
     },
     {
@@ -373,27 +424,24 @@ def _post_busy(proj_id: str, hub_url: str, busy: bool, reason: str, stone_id: st
 
 def handle_get_pending_task(proj_id: str, hub_url: str) -> dict:
     try:
-        data = _hub_request(f"{hub_url}/api/northstar/{proj_id}/milestones")
-        milestones = data if isinstance(data, list) else data.get("milestones", [])
-        queued = [
-            m for m in milestones
-            if m.get("status") == "queued"
-            and not m.get("held")
-            and not m.get("done")
-            and str(m.get("text", "")).strip()
-        ]
-        if not queued:
-            # M1533 v4: agent has no task → idle. Toggle OFF for poller to allow next dispatch.
-            # M1635 fork-protocol: should_exit=True signals agent to exit cleanly; queue poller
-            # will re-spawn when next stone arrives (no pane-scrape needed for idle detection).
+        # M1656-③: use session-scoped claim endpoint so each session only picks up
+        # stones assigned to it (or unassigned stones), with atomic claim-at-pickup.
+        _sk, _is_exec = _session_identity()
+        _claim_resp = _hub_request(
+            f"{hub_url}/api/northstar/{proj_id}/claim-task",
+            method="POST",
+            body={"session_name": _sk},
+        )
+        if not _claim_resp.get("has_task"):
+            # No queued tasks for this session → idle
             _post_busy(proj_id, hub_url, False, "no_pending_task")
             return {
                 "has_task": False,
                 "message": "No queued tasks. Session is idle.",
-                "queued_count": 0,
+                "queued_count": _claim_resp.get("queued_count", 0),
                 "should_exit": True,
             }
-        stone = queued[0]
+        stone = _claim_resp["stone"]
         # M1154 v5: compress conversation FOR THE LLM on the fly. The DB stays untouched
         # (UI fetches full history from /api/northstar/{proj}/milestones).
         _full_conv = stone.get("conversation") or []
@@ -458,7 +506,7 @@ def handle_get_pending_task(proj_id: str, hub_url: str) -> dict:
             "task": _task,                  # M1242: EXECUTE THIS — last user comment or original stone
             "context": _llm_conv,           # M1242: reference history only (do not execute)
             "original_stone": _stone_text,  # M1242: stone creation text (background)
-            "queued_count": len(queued),
+            "queued_count": _claim_resp.get("queued_count", 0),
             "is_qa": _is_qa_stone,          # M687-fix: True = reply_to_stone only (no report_task_complete needed)
         }
         if _is_qa_stone:
@@ -467,6 +515,19 @@ def handle_get_pending_task(proj_id: str, hub_url: str) -> dict:
                 "ONLY call reply_to_stone(task_id, message). "
                 "Do NOT call report_task_complete — it will be auto-completed server-side after your reply."
             )
+        # M1712: AskUserQuestion blocks this exec session's turn until a human answers in the
+        # terminal — unlike report_task_complete/reply_to_stone, it has no queue-continuation
+        # path, so the session sits fully idle from the hub's perspective for however long the
+        # human takes to notice and respond. Injected per-task-fetch (not into the always-on
+        # system prompt) since this only matters when a real choice-point is likely, keeping
+        # the fixed per-spawn token cost at zero.
+        result["_option_choice_hint"] = (
+            "If this task requires you to choose between options/approaches: prefer stating the "
+            "choice you need clarified in your reply_to_stone/report_task_complete message and "
+            "leaving the stone in a state the user can respond to on their own time, rather than "
+            "calling AskUserQuestion — that tool blocks this exec session's turn until a human "
+            "answers in the terminal, with no hub-side queue-continuation while blocked."
+        )
         # Backward compat: keep text/conversation for any callers that read them
         result["text"] = _stone_text
         result["conversation"] = _llm_conv
@@ -578,9 +639,13 @@ def handle_report_task_complete(
                 "NO → task is complete, no further action needed."
             )
         elif result.get("proof_warning"):
-            # Layer B fallback warning (no output_check flag set)
+            # Layer B fallback warning (no output_check flag set).
+            # M1699 fix: pass through the server's actual message instead of overwriting it
+            # with a hardcoded "evidence_url missing" string — that string was misleading
+            # for cases where evidence_url WAS provided but evidence_filename wasn't
+            # (M1697's warning), making it indistinguishable from a genuine missing-URL case.
             resp["ok"] = True
-            resp["proof_warning"] = "Layer B: evidence_url missing — result badge will not show. Provide evidence_url if a file was produced."
+            resp["proof_warning"] = result.get("proof_warning")
         # M1533 v4: agent reports completion → idle. Toggle OFF for poller dispatch readiness.
         # SKIP when task did NOT actually complete: Layer A blocked (requires_evidence) → agent
         # will re-upload and call again. Setting busy=false here would race-fire immediate dispatch
@@ -588,6 +653,10 @@ def handle_report_task_complete(
         if not result.get("requires_evidence"):
             _post_busy(proj_id, hub_url, False, "task_complete")
         return resp
+    except HubHTTPError as e:
+        # M1709: same fix as handle_reply_to_stone — surface the server's structured
+        # error body (e.g. reply_line_limit_blocked detail) instead of a bare HTTP status.
+        return {"ok": False, **(e.body or {})}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -609,12 +678,74 @@ def handle_attach_evidence_url(
             method="PATCH",
             body=patch,
         )
-        return {
+        out = {
             "ok": result.get("ok", False),
             "task_id": task_id,
             "evidence_url": evidence_url,
             "evidence_filename": evidence_filename or None,
         }
+        # M1697: no local file_path exists in this standalone path, so there is no
+        # server-verified filename to fall back on — if the caller also omits the
+        # filename hint, the UI badge is permanently dependent on an async GDrive API
+        # call that can fail (quota, network). Surface this immediately in the tool
+        # result so the calling agent can self-correct on the same turn.
+        if not evidence_filename:
+            out["warning"] = (
+                "evidence_filename not provided — the UI's evd badge will depend on a "
+                "live GDrive API lookup that can fail (rate limits, network). Prefer "
+                "upload_evidence(file_path=...) which derives the filename from the "
+                "verified local file, or pass evidence_filename explicitly here."
+            )
+        return out
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def handle_upload_evidence(
+    proj_id: str, hub_url: str,
+    task_id: str, file_path: str, evidence_filename: str = "",
+) -> dict:
+    """M1592: single-call evidence upload. Runs rclone copy + rclone lsjson + URL assembly
+    + evidence_url PATCH (via handle_attach_evidence_url) in one shot, so the badge is
+    attached the instant the file lands on GDrive — independent of whether the calling
+    session later closes the stone with report_task_complete or replies with
+    reply_to_stone (both silently skip the badge if evidence_url isn't passed explicitly;
+    this tool removes that dependency entirely, see M130/M1592 recurrence).
+    Root cause this fixes: model runs `rclone copy` + `rclone lsjson` manually in Bash,
+    then forgets to also pass the resulting URL into the completion/reply call — two
+    independent tool calls with no server-side link between them."""
+    try:
+        fp = Path(file_path)
+        if not fp.is_file():
+            return {"ok": False, "error": f"file_path not found: {file_path}"}
+        # M1697: prefer the server-verified real filename (fp.name, just confirmed to
+        # exist via fp.is_file()) over the caller-supplied evidence_filename hint — the
+        # hint is an arbitrary string that can be stale/typo'd, while fp.name is ground
+        # truth. Previously this was (evidence_filename or fp.name), letting a wrong
+        # hint silently override a verified value.
+        fname = (fp.name or evidence_filename).strip()
+        dest = f"gdrive:claude-shared/{proj_id}/outbox/"
+        cp = subprocess.run(["rclone", "copy", str(fp), dest], capture_output=True, text=True, timeout=120)
+        if cp.returncode != 0:
+            return {"ok": False, "error": f"rclone copy failed: {(cp.stderr or cp.stdout)[:300]}"}
+        ls = subprocess.run(
+            ["rclone", "lsjson", dest, "--include", fp.name],
+            capture_output=True, text=True, timeout=45,
+        )
+        if ls.returncode != 0:
+            return {"ok": False, "error": f"rclone lsjson failed: {(ls.stderr or ls.stdout)[:300]}"}
+        items = [x for x in json.loads(ls.stdout or "[]") if not x.get("IsDir", False)]
+        if not items:
+            return {"ok": False, "error": f"upload succeeded but file not found via lsjson: {fp.name}"}
+        file_id = items[0]["ID"]
+        evidence_url = f"https://drive.google.com/file/d/{file_id}/view?usp=sharing"
+        attach_result = handle_attach_evidence_url(
+            proj_id, hub_url, task_id=task_id, evidence_url=evidence_url, evidence_filename=fname,
+        )
+        attach_result["uploaded_from"] = str(fp)
+        return attach_result
+    except subprocess.TimeoutExpired as e:
+        return {"ok": False, "error": f"rclone timed out: {e}"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -668,7 +799,7 @@ def handle_get_session_overview(proj_id: str, hub_url: str) -> dict:
         return {"error": str(e)}
 
 
-def handle_reply_to_stone(proj_id: str, hub_url: str, task_id: str, message: str, evidence_url: str = "") -> dict:
+def handle_reply_to_stone(proj_id: str, hub_url: str, task_id: str, message: str, evidence_url: str = "", evidence_filename: str = "") -> dict:
     try:
         patch = {
             "append_message": {"role": "claude", "text": message},
@@ -676,6 +807,11 @@ def handle_reply_to_stone(proj_id: str, hub_url: str, task_id: str, message: str
         # M1638: attach evidence_url directly from reply_to_stone (QA artifact delivery)
         if evidence_url:
             patch["evidence_url"] = evidence_url
+        # M1699: pass local filename hint through, same as report_task_complete/attach_evidence_url —
+        # without this, reply_to_stone had no way to set it at all, guaranteeing the evd badge
+        # would always depend on the async GDrive lookup for any evidence attached this way.
+        if evidence_filename:
+            patch["evidence_filename"] = evidence_filename
         result = _hub_request(
             f"{hub_url}/api/northstar/{proj_id}/milestones/{task_id}",
             method="PATCH",
@@ -703,7 +839,15 @@ def handle_reply_to_stone(proj_id: str, hub_url: str, task_id: str, message: str
                 _post_busy(proj_id, hub_url, False, "qa_reply_complete")
         except Exception:
             pass
-        return {"ok": result.get("ok", False), "task_id": task_id}
+        out = {"ok": result.get("ok", False), "task_id": task_id}
+        if result.get("proof_warning"):
+            out["proof_warning"] = result.get("proof_warning")
+        return out
+    except HubHTTPError as e:
+        # M1709: surface the server's structured 422/409 body (error code + detail +
+        # any override field like allow_long_reply) so the LLM can actually self-correct
+        # instead of retrying blind against a bare "HTTP Error 422" string.
+        return {"ok": False, **(e.body or {})}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -945,6 +1089,7 @@ def main():
                         task_id=tool_args.get("task_id", ""),
                         message=tool_args.get("message", ""),
                         evidence_url=tool_args.get("evidence_url", ""),
+                        evidence_filename=tool_args.get("evidence_filename", ""),
                     )
                 elif tool_name in ("compress_summary", "attach_artifact"):
                     result = handle_attach_artifact(proj_id, hub_url,
@@ -972,6 +1117,13 @@ def main():
                         proj_id, hub_url,
                         task_id=tool_args.get("task_id", ""),
                         evidence_url=tool_args.get("evidence_url", ""),
+                        evidence_filename=tool_args.get("evidence_filename", ""),
+                    )
+                elif tool_name == "upload_evidence":
+                    result = handle_upload_evidence(
+                        proj_id, hub_url,
+                        task_id=tool_args.get("task_id", ""),
+                        file_path=tool_args.get("file_path", ""),
                         evidence_filename=tool_args.get("evidence_filename", ""),
                     )
                 elif tool_name == "create_child_stone":

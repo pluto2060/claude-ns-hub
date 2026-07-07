@@ -628,63 +628,136 @@ async def hub_network_info():
     hub_url = f"http://{ts_ip}:{PORT}" if has_tailscale else f"http://127.0.0.1:{PORT}"
     return JSONResponse({"hub_url": hub_url, "tailscale_ip": ts_ip if has_tailscale else None, "port": PORT})
 
-# M1533 v3: OOB agent-busy channel — wrappers POST their own busy/idle state
-# (replaces brittle tmux pane-scrape + substring match).
-# M1479-P2: persisted to user_settings on every change so hub restart preserves state.
-_agent_busy_state: dict[str, dict] = {}  # proj_id → {"busy": bool, "reason": str, "ts": float}
-_OOB_STALE_SECS = 120  # M1635-fix: 30→120s — long sub-agent tasks can go >30s without PostToolUse heartbeat
-# M1579 Phase 2: session → currently-running stone_id (set by /api/agent-busy POST with stone_id)
-_session_running_stone: dict[str, str] = {}  # proj_id → stone_id (cleared when idle)
-# M1585 Option B: timestamp when stone started — used for 2h safety cap in _oob_is_busy()
-_session_running_stone_ts: dict[str, float] = {}  # proj_id → time.time() when stone registered
-# M1585 v5: per-project dispatch inflight guard — prevents concurrent busy=False POSTs
-# from all triggering _dispatch_blocking when they arrive simultaneously.
-# TTL aligned with _WAKE_DEDUP_SECS (90s) so hub restart doesn't lose the guard.
-_dispatch_inflight: dict[str, float] = {}  # proj_id → timestamp of last dispatch trigger
-_DISPATCH_INFLIGHT_SECS = 90  # aligned with _WAKE_DEDUP_SECS — one dispatch per 90s per project
-# M1656: session-scoped busy state. Hooks now send session_key (tmux exec session name, or
-# CLAUDE_CODE_SESSION_ID for CLI conversations) + is_exec. Non-exec signals must never gate
-# dispatch — a user conversation in a project cwd is not the exec agent.
+# ─── M1656-R: unified busy/idle state (surgical simplification) ─────────────────
+# SINGLE SOURCE OF TRUTH: _agent_busy_sessions[session_key] — one record per exec session.
+#   {proj_id, busy, reason, ts, stone_id}
+# Everything else is DERIVED:
+#   _session_is_busy(session)   — the one busy predicate (freshness + in-flight stone hold)
+#   _first_running_stone(proj)  — which stone a project is working on (for task-board/UI)
+#   _oob_is_busy(proj, session) — legacy-compatible wrapper over the two above
+# Removed layers (replaced by the above + _send_exec_wake's atomic 90s dedup):
+#   _session_running_stone sentinels (__done__/__dispatching__), _dispatch_inflight,
+#   _wake_inflight, _last_go_sent/GO_COOLDOWN, poller idle-file/idle-count gating.
+_agent_busy_state: dict[str, dict] = {}  # proj_id → legacy proj-level record (harnesses w/o session_key)
+_OOB_STALE_SECS = 120        # session/proj report freshness window (heartbeats arrive via PostToolUse)
+_WORK_STALE_CAP_SECS = 7200  # max busy hold for an in-flight stone with no heartbeat (crash safety cap)
 _agent_busy_cli: dict[str, dict] = {}       # proj_id → last non-exec (CLI) signal — observability only
-_agent_busy_sessions: dict[str, dict] = {}  # session_key → {proj_id, busy, reason, ts} (exec only)
+_agent_busy_sessions: dict[str, dict] = {}  # session_key → {proj_id, busy, reason, ts, stone_id}
+_WAKE_SENT_TTL_SECS = 45  # M1675: optimistic busy hold after wake injection (claim measured 6-12s;
+                          # expires if the session never picks up so the poller can retry)
+# M1683: compacting busy-hold. _COMPACT_HOLD_SECS is the absolute cap in _session_is_busy
+# (backstop when the poller self-heal below never runs, e.g. no queued stones). The poller
+# releases the hold earlier once the PreCompact marker is older than _COMPACT_SELFHEAL_SECS
+# (compaction finished). Marker mtime is set at compaction START, so this must exceed the
+# longest realistic compaction (~3.5min observed) to avoid clearing a live compaction.
+_COMPACT_HOLD_SECS = 300       # was 600 — self-heal + fixed Stop hook now clear it promptly
+_COMPACT_SELFHEAL_SECS = 240   # marker-age past which compaction is deemed complete
 
 
-def _oob_is_busy(proj_id: str) -> bool:
-    """M1574: TTL-aware busy check. Returns False if state is stale (>_OOB_STALE_SECS).
-    M1585 Option B: if _session_running_stone is set, bypass TTL — stone execution is
-    the authoritative in-flight signal. Safety cap: 2h max (crash recovery)."""
-    import time as _time
-    # M1656: session-scoped check first — any fresh busy exec session of this project wins.
-    # Fixes the branched-session clobber: main + branched sessions no longer overwrite each
-    # other's busy state through the single project-level record.
-    _now_ss = _time.time()
-    for _srec in _agent_busy_sessions.values():
-        if (_srec.get("proj_id") == proj_id and _srec.get("busy")
-                and (_now_ss - _srec.get("ts", 0)) < _OOB_STALE_SECS):
+def _validate_stone_hold(session_name: str, rec: dict) -> str | None:
+    """M1656-R10: check whether rec['stone_id'] is STILL a real in-flight claim for this
+    session (still 'queued' + claimed_by_session matches). Returns the stone_id if valid,
+    else None AND clears rec['stone_id'] in place.
+    Root cause fixed: tool_call_heartbeat POSTs carry no stone_id, so a session doing
+    ANY tool call (including plain interactive conversation, unrelated to dispatch)
+    keeps re-confirming busy=True while blindly preserving whatever stone_id was set by
+    the last real claim — forever, even after that stone finished. Observed live: mother's
+    own pane showed 'running M1672' though M1672 had been pending_confirmation for
+    ~40 minutes and belonged to a different (child) session entirely. Previously this
+    DB check only ran once heartbeats went stale (>120s); a session with continuous
+    heartbeats (<120s gaps) never re-validated at all."""
+    _sid = rec.get("stone_id")
+    if not _sid:
+        return None
+    try:
+        conn = sqlite3.connect(str(_NS_EVENTS_DB))
+        row = conn.execute(
+            "SELECT data_json FROM milestones_store WHERE proj_id=? AND stone_id=? AND status='queued'",
+            (rec.get("proj_id", ""), _sid)
+        ).fetchone()
+        conn.close()
+        if row:
+            _claimed = (json.loads(row[0]).get("claimed_by_session") or "").strip()
+            if not _claimed or _claimed == session_name:
+                return _sid  # still genuinely in-flight for this session
+        rec["stone_id"] = None
+        return None
+    except Exception:
+        return _sid  # DB hiccup → don't flicker the UI off a transient error
+
+
+def _session_is_busy(session_name: str) -> bool:
+    """THE busy predicate for one exec session.
+    Fresh report (<_OOB_STALE_SECS) → trust its busy flag.
+    Stale but a stone is in-flight → hold busy up to _WORK_STALE_CAP_SECS, validated
+    against the DB (covers long thinking/compaction phases with no tool-call heartbeats,
+    while never letting a deleted/finished stone pin a session busy for hours)."""
+    rec = _agent_busy_sessions.get(session_name)
+    if not rec:
+        return False
+    _age = time.time() - rec.get("ts", 0)
+    # M1675: optimistic wake_sent hold — busy from the instant the wake is injected,
+    # but only for _WAKE_SENT_TTL_SECS (a real heartbeat/claim replaces the record;
+    # a dead session falls back to idle so the poller can retry).
+    if rec.get("reason") == "wake_sent":
+        return bool(rec.get("busy", False)) and _age < _WAKE_SENT_TTL_SECS
+    # M1672: compaction emits no tool-call heartbeats, so a compacting session went
+    # stale after 120s and the poller injected duplicate wakes mid-compaction.
+    # Hold busy up to 10min for an explicit compacting report; the session's first
+    # post-compaction heartbeat (or Stop) replaces the record either way.
+    if rec.get("reason") == "compacting" and rec.get("busy"):
+        return _age < _COMPACT_HOLD_SECS
+    # M1672-b: PreToolUse tool_start hold — a single >120s tool call (SSH build,
+    # subagent) emits no PostToolUse heartbeat. Hold busy up to 1h, but past the
+    # normal freshness window require the tmux session to still exist (crash guard).
+    if rec.get("reason") == "tool_start" and rec.get("busy"):
+        if _age < _OOB_STALE_SECS:
+            return True
+        return _age < 3600 and _tmux_session_alive(session_name)
+    # M131-d: a background subagent (Task/Agent) outlives the parent's own turn —
+    # Stop fires (parent turn ended) while the subagent still computes. Same 1h/
+    # tmux-alive shape as tool_start; northstar-stop-idle.py sets this reason when
+    # its subagent-count marker is >0 instead of posting plain agent_stopped.
+    if rec.get("reason") == "subagent_running" and rec.get("busy"):
+        if _age < _OOB_STALE_SECS:
+            return True
+        return _age < 3600 and _tmux_session_alive(session_name)
+    if _age < _OOB_STALE_SECS:
+        return bool(rec.get("busy", False))
+    if rec.get("busy") and rec.get("stone_id") and _age < _WORK_STALE_CAP_SECS:
+        if _validate_stone_hold(session_name, rec):
+            return True
+        rec["busy"] = False
+        return False
+    return False
+
+
+def _first_running_stone(proj_id: str) -> str | None:
+    """Stone id currently being worked on by any busy session of this project.
+    M1656-R10: always DB-validates the stone_id (see _validate_stone_hold) — a fresh
+    heartbeat alone is not proof the held stone_id is still relevant."""
+    for _sk, rec in _agent_busy_sessions.items():
+        if rec.get("proj_id") == proj_id and rec.get("stone_id") and _session_is_busy(_sk):
+            if _validate_stone_hold(_sk, rec):
+                return rec["stone_id"]
+    return None
+
+
+def _oob_is_busy(proj_id: str, session_name: str | None = None) -> bool:
+    """Legacy-compatible busy check.
+    session_name given + that session has ever reported → its own state only.
+    Otherwise: any busy session of the project, then legacy proj-level record."""
+    if session_name and session_name in _agent_busy_sessions:
+        rec = _agent_busy_sessions[session_name]
+        if rec.get("proj_id") == proj_id:
+            return _session_is_busy(session_name)
+    for _sk, rec in _agent_busy_sessions.items():
+        if rec.get("proj_id") == proj_id and _session_is_busy(_sk):
             return True
     oob = _agent_busy_state.get(proj_id)
     if not oob:
         return False
-    # M1585 Option B: running stone present → bypass 30s TTL entirely
-    _stone_val = _session_running_stone.get(proj_id)
-    if _stone_val:
-        _stone_ts = _session_running_stone_ts.get(proj_id, 0)
-        _stone_age = _time.time() - _stone_ts
-        # M1651: "__done__" sentinel has short 30s grace (gap between task_complete and next dispatch).
-        # M1655: "__dispatching__" sentinel has short 60s grace (gap before get_pending_task fires).
-        # Real stone_id has 2h safety cap.
-        _cap = 30 if _stone_val == "__done__" else (60 if _stone_val == "__dispatching__" else 7200)
-        if _stone_age < _cap:
-            return True
-        # Cap exceeded → stale, force-clear and fall through to TTL check
-        _stale_stone_id = _session_running_stone.pop(proj_id, None)
-        _session_running_stone_ts.pop(proj_id, None)
-        # M1650: also clear _agent_busy_state so UI shows idle after crash-stuck recovery
-        if proj_id in _agent_busy_state:
-            _agent_busy_state[proj_id]["busy"] = False
-        if _stale_stone_id != "__done__":
-            logging.warning("[M1585] 2h safety cap expired for proj=%s stone=%s — force-clearing session lock", proj_id, _stale_stone_id)
-    if (_time.time() - oob.get("ts", 0)) >= _OOB_STALE_SECS:
+    if (time.time() - oob.get("ts", 0)) >= _OOB_STALE_SECS:
         return False
     return bool(oob.get("busy", False))
 
@@ -693,7 +766,7 @@ def _tmux_session_alive(session_name: str) -> bool:
     """M1650: check tmux session existence without inspecting pane commands."""
     import subprocess as _sp
     try:
-        r = _sp.run(["tmux", "has-session", "-t", session_name],
+        r = _sp.run(["tmux", "has-session", "-t", f"={session_name}"],
                     capture_output=True, timeout=2)
         return r.returncode == 0
     except Exception:
@@ -723,19 +796,32 @@ def _agent_busy_load_from_db():
                     # Keep newer entry when two case variants exist
                     if not existing or v.get("ts", 0) > existing.get("ts", 0):
                         _agent_busy_state[canonical] = v
+        # M1656-R: also hydrate session records so in-flight stone holds survive hub restart
+        # (prevents duplicate wake injection into a mid-work session after restart).
+        conn2 = sqlite3.connect(str(_NS_EVENTS_DB))
+        row2 = conn2.execute("SELECT value_json FROM user_settings WHERE key='_agent_busy_sessions'").fetchone()
+        conn2.close()
+        if row2 and row2[0]:
+            data2 = json.loads(row2[0])
+            if isinstance(data2, dict):
+                _agent_busy_sessions.update(data2)
     except Exception:
         pass
 
 
 def _agent_busy_persist():
-    """Write current _agent_busy_state to SQLite. Fire-and-forget."""
+    """Write busy state (proj mirror + session records) to SQLite. Fire-and-forget."""
     try:
         import datetime as _dt
+        _now_iso = _dt.datetime.utcnow().isoformat()
         conn = sqlite3.connect(str(_NS_EVENTS_DB))
         conn.execute(
             "INSERT OR REPLACE INTO user_settings(key, value_json, updated_at) VALUES(?, ?, ?)",
-            ("_agent_busy_state", json.dumps(_agent_busy_state, ensure_ascii=False),
-             _dt.datetime.utcnow().isoformat()),
+            ("_agent_busy_state", json.dumps(_agent_busy_state, ensure_ascii=False), _now_iso),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO user_settings(key, value_json, updated_at) VALUES(?, ?, ?)",
+            ("_agent_busy_sessions", json.dumps(_agent_busy_sessions, ensure_ascii=False), _now_iso),
         )
         conn.commit()
         conn.close()
@@ -787,72 +873,50 @@ async def agent_busy(request: Request):
         _agent_busy_cli[proj_id] = {"busy": new_busy, "reason": _reason[:200],
                                     "session_key": _session_key, "ts": time.time()}
         return JSONResponse({"ok": True, "scope": "cli", "gates_dispatch": False})
-    if _session_key:
-        _agent_busy_sessions[_session_key] = {"proj_id": proj_id, "busy": new_busy,
-                                              "reason": _reason[:200], "ts": time.time()}
-    prev = _agent_busy_state.get(proj_id) or {}
-    prev_busy = bool(prev.get("busy", True))
-    _agent_busy_state[proj_id] = {
-        "busy": new_busy,
-        "reason": str(body.get("reason") or "")[:200],
-        "ts": time.time(),
-    }
-    _agent_busy_persist()  # M1479-P2: durable across hub restart
-    # M1579 Phase 2: track which stone is running per session (for harness-agnostic task-board)
+    # M1656-R: single write to the session record (source of truth). stone_id rides along.
     _stone_id = str(body.get("stone_id") or "").strip()
-    if new_busy and _stone_id:
-        _session_running_stone[proj_id] = _stone_id
-        _session_running_stone_ts[proj_id] = time.time()  # M1585 Option B: record start time
-    elif not new_busy:
-        if _reason == "task_complete":
-            # M1651: delay clear — hold "__done__" sentinel until get_pending_task picks up next stone.
-            # Prevents false-idle during the gap between task_complete and next dispatch sentinel.
-            # Sentinel expires via _oob_is_busy() 2h cap or next get_pending_task overwrite.
-            # 30s grace: if no next stone within 30s, _oob_is_busy() TTL expiry handles it naturally.
-            _session_running_stone[proj_id] = "__done__"
-            _session_running_stone_ts[proj_id] = time.time()
-        else:
-            _session_running_stone.pop(proj_id, None)
-            _session_running_stone_ts.pop(proj_id, None)  # M1585 Option B: clear ts on idle
-    # M1585: clear inflight lock when agent reports busy=True (it received the wake)
-    # M1597: also clear on task_complete so _dispatch_blocking can reset dedup and fire immediately.
-    # IMPORTANT: do NOT clear on sub-agent Stop hooks (reason != task_complete) — that re-opens
-    # the M1585 multi-sub-agent duplicate wake bug.
-    if new_busy or _reason == "task_complete":
-        for _prefx in ("claude-exec-", "openrouter-exec-", "codex-exec-", "dsk-exec-"):
-            _wake_inflight.pop(_prefx + proj_id, None)
-    if new_busy or _reason == "task_complete":
-        # M1633-fix: clear inflight gate when agent goes busy (wake was received) OR task_complete.
-        # Without this, if task_complete is missed the gate stays locked for 90s blocking the poller.
-        _dispatch_inflight.pop(proj_id, None)
-    # M1639: task_complete → immediate session_idle SSE + _exec_was_running reset.
-    # Bypasses the 5s×2-tick debounce that causes 10-15s UI lag after task completion.
-    # Only fires on explicit "task_complete" reason (MCP-guaranteed, low false-positive risk).
+    # Harnesses that send stone_id but no session_key get a synthetic per-project key so
+    # the in-flight stone hold still works for them.
+    _rec_key = _session_key or f"legacy::{proj_id}"
+    _prev_rec = _agent_busy_sessions.get(_rec_key) or {}
+    prev_busy = bool(_prev_rec.get("busy", _agent_busy_state.get(proj_id, {}).get("busy", True)))
+    # stone_id resolution: explicit on this POST wins; busy heartbeats WITHOUT stone_id
+    # preserve the in-flight stone (heartbeats don't carry it); idle clears it.
+    if new_busy:
+        _eff_stone = _stone_id or (_prev_rec.get("stone_id") if _prev_rec.get("busy") else None)
+    else:
+        _eff_stone = None
+    _agent_busy_sessions[_rec_key] = {
+        "proj_id": proj_id, "busy": new_busy, "reason": _reason[:200],
+        "ts": time.time(),
+        "stone_id": _eff_stone,
+    }
+    # Legacy proj-level mirror — kept for GET /api/agent-busy consumers and old harnesses.
+    _agent_busy_state[proj_id] = {"busy": new_busy, "reason": _reason[:200], "ts": time.time()}
+    _agent_busy_persist()  # M1479-P2: durable across hub restart
+    # M1677: busy-state transition → invalidate exec-sessions cache so the session pane
+    # (SSE-triggered or next poll) reflects the new state instead of a ≤2s-old snapshot.
+    if prev_busy != new_busy:
+        _exec_sessions_cache["ts"] = 0.0
+    # M1639: task_complete → immediate session_idle SSE (instant avatar/pane update).
+    # M1656-R: longest-prefix match so branched child sessions get the SSE too.
     if _reason == "task_complete" and not new_busy:
         try:
             _ls = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"], capture_output=True, text=True, timeout=2)
             for _sn in (_ls.stdout or "").splitlines():
                 _sn = _sn.strip()
-                for _pfx in ("claude-exec-", "openrouter-exec-", "codex-exec-", "dsk-exec-"):
-                    if _sn.startswith(_pfx) and _sn[len(_pfx):] == proj_id:
-                        _exec_was_running[_sn] = False  # reset so detector doesn't re-fire
-                        _exec_idle_count.pop(_sn, None)
-                        _push_session_idle(_sn, proj_id)
-                        break
+                _ag, _pid = _parse_exec_session_name(_sn)
+                # Push only for the reporting session when identifiable; else all proj sessions
+                if _pid == proj_id and (not _session_key or _sn == _session_key):
+                    _exec_was_running[_sn] = False  # reset transition detector
+                    _push_session_idle(_sn, proj_id)
         except Exception:
             pass
     dispatched = False
-    # M1533 v4: busy→idle transition + queued stones present → immediate go-injection.
-    # M1533 v5 audit: tmux subprocess + _send_exec_wake offloaded to thread so this POST
-    # handler returns within ~50ms even if tmux send-keys blocks briefly.
-    # M1585 v4: dispatch inflight guard — concurrent busy=False POSTs (e.g. 6 get_pending_task
-    # calls arriving simultaneously) all see prev_busy=True before state is updated.
-    # Use _dispatch_inflight[proj_id] as a per-project mutex: only the first within 5s dispatches.
-    _now_dispatch = time.time()
-    _dispatch_allowed = (_now_dispatch - _dispatch_inflight.get(proj_id, 0)) > _DISPATCH_INFLIGHT_SECS
-    if prev_busy and not new_busy and _dispatch_allowed:
-        _dispatch_inflight[proj_id] = _now_dispatch  # gate: subsequent concurrent POSTs skip dispatch
-    if prev_busy and not new_busy and _dispatch_allowed:  # noqa: SIM102 — intentional two-step to set inflight before await
+    # M1533 v4: busy→idle transition + queued stones present → immediate wake.
+    # M1656-R: no separate inflight mutex — _send_exec_wake's atomic 90s dedup
+    # (with task_complete force-reset) is the single anti-duplicate gate.
+    if prev_busy and not new_busy:
         try:
             _qdb = sqlite3.connect(str(_NS_EVENTS_DB))
             try:
@@ -868,25 +932,28 @@ async def agent_busy(request: Request):
                         ls = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"], capture_output=True, text=True, timeout=2)
                     except Exception:
                         return False
-                    for sn in (ls.stdout or "").splitlines():
-                        sn = sn.strip()
-                        for prefix in ("claude-exec-", "openrouter-exec-", "codex-exec-", "dsk-exec-"):
-                            if sn.startswith(prefix) and sn[len(prefix):] == proj_id:
-                                try:
-                                    # M1533 fix: OOB busy→idle transition is authoritative —
-                                    # reset dedup guard so _send_exec_wake is never blocked
-                                    # by prior same-session wake within the 90s window.
-                                    # M1322 v5: skip dedup reset if reason="compacting" —
-                                    # compaction fires Stop→busy=false mid-session; the 90s
-                                    # guard is still valid and should not be cleared.
-                                    # M1597: task_complete → always reset dedup for instant next-stone dispatch.
-                                    # Other reasons (sub-agent Stop hooks): only reset if no wake inflight.
-                                    # M1585 v4: only task_complete resets dedup. no_pending_task / agent_stopped /
-                                    # compacting / sub-agent stops must NOT reset — they cause repeated wake injection.
-                                    _do_reset = _reason == "task_complete"
-                                    return bool(_send_exec_wake(sn, proj_id, force_dedup_reset=_do_reset))
-                                except Exception:
-                                    return False
+                    _names = [x.strip() for x in (ls.stdout or "").splitlines()]
+                    # M1656-R: prefer waking the session that just went idle (it is the free one);
+                    # fall back to the project's main session.
+                    _targets = []
+                    if _session_key and _session_key in _names:
+                        _targets.append(_session_key)
+                    for sn in _names:
+                        _ag2, _pid2 = _parse_exec_session_name(sn)
+                        if _pid2 == proj_id and sn not in _targets:
+                            _targets.append(sn)
+                    for sn in _targets:
+                        if _session_is_busy(sn):
+                            continue  # never inject into a working session
+                        # M1676: only wake a session with stones it can actually claim
+                        if _session_claimable_queued_count(proj_id, sn) == 0:
+                            continue
+                        try:
+                            _do_reset = _reason == "task_complete"
+                            if _send_exec_wake(sn, proj_id, force_dedup_reset=_do_reset):
+                                return True
+                        except Exception:
+                            return False
                     return False
                 try:
                     dispatched = await asyncio.to_thread(_dispatch_blocking)
@@ -913,6 +980,14 @@ async def agent_busy_get(proj_id: str = ""):
         # M1574: apply TTL — stale entries report busy=false
         if oob and (_time.time() - oob.get("ts", 0)) >= _OOB_STALE_SECS:
             oob = {**oob, "busy": False, "stale": True}
+        # M1656-R: authoritative derived busy + per-session detail for accurate UI display
+        oob = dict(oob)
+        oob["busy"] = _oob_is_busy(proj_id)
+        oob["sessions"] = {
+            _sk: {"busy": _session_is_busy(_sk), "reason": rec.get("reason", ""),
+                  "stone_id": rec.get("stone_id"), "ts": rec.get("ts", 0)}
+            for _sk, rec in _agent_busy_sessions.items() if rec.get("proj_id") == proj_id
+        }
         return JSONResponse(oob)
     # Return all entries with TTL applied
     now = _time.time()
@@ -2877,7 +2952,7 @@ async def tmux_send_key(request: Request):
         return JSONResponse({"ok": False, "error": f"key '{key}' not in allowlist"}, status_code=400)
     # Verify session exists before sending — avoids leaking allowlist for arbitrary sessions.
     chk = await asyncio.to_thread(
-        subprocess.run, ["tmux", "has-session", "-t", session], capture_output=True, timeout=2)
+        subprocess.run, ["tmux", "has-session", "-t", f"={session}"], capture_output=True, timeout=2)
     if chk.returncode != 0:
         return JSONResponse({"ok": False, "error": f"tmux session '{session}' not found"}, status_code=404)
     spec = _TMUX_VKEY_ALLOW[key]
@@ -3710,6 +3785,17 @@ _pty_last_busy_ts: dict[str, float] = {}
 _pty_drain_tasks: dict[str, "asyncio.Task"] = {}
 _pty_subscribers: dict[str, set] = {}  # proj_id → set of asyncio.Queue
 _SESSION_TTL = 30 * 60  # kill after 30 min idle
+# M1685: registry for the live-terminal exec-attach relay (WS /ws/session/{proj}?tmux_session=...).
+# That code path spawns `tmux attach-session` PtyProcess objects but never registers them
+# anywhere else — unlike _sessions/_pty_subscribers above. If the browser's TCP connection
+# dies without a clean close frame (mobile background/sleep, network drop), the websocket
+# coroutine can sit blocked in receive_text() indefinitely (uvicorn's ws ping/pong only
+# catches DEAD sockets, not a genuinely-idle-but-unclosed one), leaving the tmux client
+# permanently attached — which then makes _send_exec_wake's M1337 "user is watching" skip
+# fire forever, silently blocking all dispatch to that session. Tracked here so the poller
+# can self-heal stale attaches. key = tmux_session_name → {pid, attached_at}.
+_exec_attach_relay: dict[str, dict] = {}
+_EXEC_ATTACH_STALE_SECS = 900  # 15min — well past any real interactive terminal glance
 
 
 def _kill_session(proj_id: str) -> None:
@@ -4004,7 +4090,7 @@ async def _start_milestone_watcher():
                             pending_reply_ids.append(m.get("id"))
                     if pending_reply_ids:
                         session_name = _live_exec_session_name(proj_id)
-                        check = subprocess.run(["tmux", "has-session", "-t", session_name], capture_output=True, timeout=2)
+                        check = subprocess.run(["tmux", "has-session", "-t", f"={session_name}"], capture_output=True, timeout=2)
                         if check.returncode == 0:
                             # M149: append-only queue (one entry per write)
                             # M172: enforce comment-reply protocol (3-line max, details to doc)
@@ -4284,7 +4370,7 @@ async def _dedup_exec_sessions_on_startup():
             sessions.sort(key=lambda x: x[0], reverse=True)  # newest first
             for _, sname in sessions[1:]:
                 try:
-                    subprocess.run(["tmux", "kill-session", "-t", sname],
+                    subprocess.run(["tmux", "kill-session", "-t", f"={sname}"],
                                    capture_output=True, timeout=3)
                     print(f"[hub] startup dedup: killed stale exec session {sname}", file=sys.stderr)
                 except Exception:
@@ -4379,6 +4465,44 @@ async def _stream_pane_fifo_DISABLED(session_name: str, proj_id: str):
 # Detection is now purely client-poll-triggered (v0.2.1 approach) with _push_session_idle() dedup.
 
 
+def _session_claimable_queued_count(proj_id: str, session_name: str) -> int:
+    """M1676: count queued stones THIS session could actually claim — mirrors
+    /claim-task's ownership filter (substar assigned_session; free pool = main only;
+    skip stones in-flight on another session within the 120s claim TTL).
+    The poller previously used a project-wide queued count, so an idle child was
+    woken every dedup cycle while the main session worked its own stone (claim
+    keeps status='queued'), producing endless empty 'Tasks ready' turns."""
+    try:
+        conn = sqlite3.connect(str(_NS_EVENTS_DB))
+        try:
+            rows = conn.execute(
+                "SELECT data_json FROM milestones_store WHERE proj_id=? AND status='queued' AND COALESCE(held,0)=0",
+                (proj_id,)).fetchall()
+        finally:
+            conn.close()
+        stones = [json.loads(r[0]) for r in rows]
+        if not stones:
+            return 0
+        proj = _db_load_project(proj_id) or {}
+        sub_sess = {ns.get("id"): (ns.get("assigned_session") or "").strip()
+                    for ns in (proj.get("north_stars") or []) if isinstance(ns, dict)}
+        _ag_e, _pid_e = _parse_exec_session_name(session_name)
+        is_child = bool(_pid_e) and session_name != f"{_ag_e}-exec-{_pid_e}"
+        _now_e = time.time()
+        n = 0
+        for m in stones:
+            cb = (m.get("claimed_by_session") or "").strip()
+            if cb and cb != session_name and (_now_e - (m.get("claimed_at") or 0)) < 120:
+                continue  # in-flight on another session
+            sid = (m.get("substar_id") or "").strip()
+            owner = sub_sess.get(sid, "") if sid else ""
+            if owner == session_name or (not owner and not is_child):
+                n += 1
+        return n
+    except Exception:
+        return 0
+
+
 @app.on_event("startup")
 async def _start_queue_continuation_poller():
     """M456: hub-side queue continuation — periodically scans alive exec sessions and
@@ -4388,8 +4512,7 @@ async def _start_queue_continuation_poller():
     import re as _re
     POLL_INTERVAL = 10  # M1351: 30→10s — measured 44ms/tick × 6/min = 0.44% one-core CPU, ~20s faster wake
     IDLE_MIN_SECS = 10  # session must have been idle for this long (avoids racing turn-start)
-    _last_go_sent: dict[str, float] = {}  # session → epoch of last 'go' to dedup
-    GO_COOLDOWN = 60  # don't re-send 'go' within 60s of last one
+    # M1656-R: per-session wake dedup lives inside _send_exec_wake (_wake_last_sent, 90s)
 
     async def _arun(*cmd, timeout=3):
         """M1493: async subprocess helper for BG loop — avoids blocking event loop."""
@@ -4413,57 +4536,69 @@ async def _start_queue_continuation_poller():
                 exec_sessions = []
                 for line in _ls_out.splitlines():
                     sn = line.strip()
-                    for prefix in ("claude-exec-", "openrouter-exec-", "codex-exec-", "dsk-exec-"):
-                        if sn.startswith(prefix):
-                            proj_id = sn[len(prefix):]
-                            exec_sessions.append((sn, proj_id))
-                            break
+                    # M1656-④: longest-prefix match so branched child sessions
+                    # (claude-exec-MOAT-Marketing) resolve to proj_id=MOAT and get woken
+                    _ag, _pid = _parse_exec_session_name(sn)
+                    if _pid:
+                        exec_sessions.append((sn, _pid))
 
                 now = time.time()
                 for sname, proj_id in exec_sessions:
-                    # Skip if we just sent 'go' recently
-                    if now - _last_go_sent.get(sname, 0) < GO_COOLDOWN:
-                        continue
-
                     # M1337: skip if user has the live panel open (tmux client attached) —
                     # they're watching the terminal, no need to auto-inject wake.
                     _clients_out = await _arun("tmux", "list-clients", "-t", sname, timeout=2)
                     if _clients_out.strip():
-                        continue  # user is watching — don't inject
+                        # M1685: self-heal a LEAKED exec-attach relay (browser tab closed
+                        # without a clean WS close frame — see _exec_attach_relay registry
+                        # comment). If this session's client is our own tracked relay PID
+                        # and it's been attached far longer than any real interactive glance,
+                        # kill it so M1337 stops permanently blocking dispatch on a phantom.
+                        _relay = _exec_attach_relay.get(sname)
+                        if _relay and (now - _relay.get("attached_at", now)) > _EXEC_ATTACH_STALE_SECS:
+                            try:
+                                os.kill(_relay["pid"], 9)
+                                _exec_attach_relay.pop(sname, None)
+                                _server_log_action(proj_id, "", "exec:attach_relay_selfheal",
+                                                   f"session:{sname} pid:{_relay['pid']} age:{int(now - _relay['attached_at'])}s")
+                            except Exception:
+                                pass
+                            # fall through to re-check clients this tick — next poll picks up the change
+                        continue  # user is watching (or was, until the kill above) — don't inject
 
-                    # M1533 v5: OOB-first busy detection — pane-scrape removed (non-universal across agents).
-                    # OOB channel: agent calls report_busy_state MCP tool; authoritative for all agent types.
-                    # Fallback: file-idle + idle_count cycle (set by stop-hook or 2-cycle timeout).
-                    busy = _oob_is_busy(proj_id)  # M1574: TTL-aware
-                    if busy:
-                        # Session is actively running — clear stale idle file if present
-                        _exec_idle_file(proj_id).unlink(missing_ok=True)
+                    # M1683: self-heal a stranded 'compacting' hold. A compaction that
+                    # finishes at a prompt with no follow-up turn fires no event to clear
+                    # the hold, so it pinned the session busy for the full 600s (server.py
+                    # _session_is_busy) and blocked dispatch. If the record is 'compacting'
+                    # but the PreCompact marker (~/.claude/.compact-marker, refreshed at each
+                    # compaction start) is older than _COMPACT_SELFHEAL_SECS, the compaction
+                    # is done — release the hold so the busy check below sees the true state.
+                    _rec_ch = _agent_busy_sessions.get(sname)
+                    if _rec_ch and _rec_ch.get("reason") == "compacting" and _rec_ch.get("busy"):
+                        try:
+                            _mk = Path.home() / ".claude" / ".compact-marker"
+                            _mk_age = (now - _mk.stat().st_mtime) if _mk.exists() else 1e9
+                            if _mk_age > _COMPACT_SELFHEAL_SECS:
+                                _rec_ch["busy"] = False
+                                _rec_ch["reason"] = "compact_selfheal"
+                                _server_log_action(proj_id, "", "exec:compact_selfheal",
+                                                   f"session:{sname} marker_age:{int(_mk_age)}s")
+                        except Exception:
+                            pass
+
+                    # M1678: session-scoped busy pre-filter (final gate lives in _send_exec_wake).
+                    # Was _oob_is_busy(proj, session) — its proj-aggregate fallback made a busy
+                    # mother block her fresh no-record child forever (why blind spawn-wakes existed).
+                    if _session_is_busy(sname):
                         continue  # don't interrupt
 
-                    # M536: primary idle check — .exec-idle file written by stop-hook when truly idle
-                    file_idle = _exec_idle_file(proj_id).exists()
-
-                    idle_count = _exec_idle_count.get(sname, 0)
-                    # Idle if: file-idle (stop-hook confirmed) OR legacy 1-cycle count
-                    if not file_idle and idle_count < 1:
-                        continue  # not confirmed idle yet
-
-                    # Check: queued stones exist for this project (read from SQLite directly)
-                    queued_count = 0
-                    try:
-                        _qdb = sqlite3.connect(str(_NS_EVENTS_DB))
-                        try:
-                            queued_count = _qdb.execute(
-                                "SELECT COUNT(*) FROM milestones_store WHERE proj_id=? AND status='queued' AND COALESCE(held,0)=0",
-                                (proj_id,)
-                            ).fetchone()[0]
-                        finally:
-                            _qdb.close()
-                    except Exception:
-                        continue
+                    # M1676: per-session eligibility — only wake a session that has stones
+                    # IT can claim (was project-wide count → idle children were woken for
+                    # main-owned work they can never pick up, every 90s dedup cycle).
+                    queued_count = await asyncio.to_thread(
+                        _session_claimable_queued_count, proj_id, sname)
 
                     if queued_count == 0:
-                        continue  # nothing to do
+                        continue  # nothing this session could claim
 
                     # M1097: run M836.2 auto-assign before "go" injection so substars get
                     # their assigned_session even when poller fires instead of execute button.
@@ -4488,20 +4623,10 @@ async def _start_queue_continuation_poller():
                     except Exception:
                         pass
 
-                    # M1585 v6: skip poller injection if _dispatch_blocking already fired recently.
-                    # _dispatch_blocking sets _dispatch_inflight[proj_id] on busy→idle transition;
-                    # poller must respect the same 90s gate or it re-injects 10s later.
-                    _poller_inflight_ok = (now - _dispatch_inflight.get(proj_id, 0)) > _DISPATCH_INFLIGHT_SECS
-                    if not _poller_inflight_ok:
-                        continue  # _dispatch_blocking already dispatched within TTL — skip
-
-                    # Send wake message — MCP sessions get tool-call instruction, others get 'go'
-                    # M1114: _send_exec_wake handles skill pre-inject (two-step) when stone has skill_refs
-                    # M1322 v3: update _last_go_sent only when wake was actually sent (not dedup-suppressed)
-                    sent = _send_exec_wake(sname, proj_id)
-                    if sent:
-                        _last_go_sent[sname] = now
-                        _dispatch_inflight[proj_id] = now  # M1585 v6: mark so _dispatch_blocking also respects this
+                    # Send wake message — MCP sessions get tool-call instruction, others get 'go'.
+                    # M1656-R: _send_exec_wake's atomic per-session 90s dedup is the ONLY
+                    # anti-duplicate gate (per-session, so children never starve behind mother).
+                    _send_exec_wake(sname, proj_id)
 
                 # M1635 fork-protocol: scan for projects with queued stones but NO alive exec session.
                 # Covers: crashed sessions, manual kills, hub-restart kills, and harnesses that
@@ -4522,15 +4647,68 @@ async def _start_queue_continuation_poller():
                         ).fetchall()
                     finally:
                         _fork_qdb.close()
+                    _alive_names: set = {sn for sn, _ in exec_sessions}
                     for (_fork_proj_id,) in _fork_rows:
                         if _fork_proj_id in _alive_exec_proj_ids:
-                            continue  # session alive — poller already handles it above
-                        if _oob_is_busy(_fork_proj_id):
-                            continue  # agent just exited but OOB still warm — wait
-                        if now - _fork_spawn_last.get(_fork_proj_id, 0) < _FORK_SPAWN_COOLDOWN:
-                            continue  # spawn cooldown
-                        if now - _dispatch_inflight.get(_fork_proj_id, 0) < _DISPATCH_INFLIGHT_SECS:
-                            continue  # dispatch already in-flight
+                            # M1656-R4: children may be alive while the MAIN session is dead.
+                            # Children cannot claim free-pool / main-assigned stones, so spawn
+                            # the main session when any queued stone targets it.
+                            _agent_fp = _get_project_agent_value(_fork_proj_id)
+                            _main_fp = f"{_agent_fp}-exec-{_fork_proj_id}"
+                            if _main_fp in _alive_names:
+                                continue  # main alive — normal wake path handles it
+                            try:
+                                _pfp = _db_load_project(_fork_proj_id) or {}
+                                _ss_map = {ns.get("id"): (ns.get("assigned_session") or "").strip()
+                                           for ns in (_pfp.get("north_stars") or []) if isinstance(ns, dict)}
+                                _fq = sqlite3.connect(str(_NS_EVENTS_DB))
+                                _fq_rows = _fq.execute(
+                                    "SELECT data_json FROM milestones_store WHERE proj_id=? AND status='queued' AND COALESCE(held,0)=0",
+                                    (_fork_proj_id,)).fetchall()
+                                _fq.close()
+                                _main_targeted = False
+                                for _r in _fq_rows:
+                                    _m = json.loads(_r[0])
+                                    _tgt = _ss_map.get((_m.get("substar_id") or "").strip(), "")
+                                    if not _tgt or _tgt == _main_fp:
+                                        _main_targeted = True
+                                        break
+                                if not _main_targeted:
+                                    continue  # all queued stones belong to alive children
+                            except Exception:
+                                continue
+                            if _session_is_busy(_main_fp):
+                                continue
+                            if now - _fork_spawn_last.get(_fork_proj_id, 0) < _FORK_SPAWN_COOLDOWN:
+                                continue
+                            _server_log_action(_fork_proj_id, "", "exec:main_respawn_with_children",
+                                               f"main:{_main_fp} dead, main-targeted stones queued")
+                        else:
+                            if _oob_is_busy(_fork_proj_id):
+                                continue  # agent just exited but OOB still warm — wait
+                            if now - _fork_spawn_last.get(_fork_proj_id, 0) < _FORK_SPAWN_COOLDOWN:
+                                continue  # spawn cooldown (single gate — M1656-R)
+                            # M1702-b: no session anywhere for this project — only spawn if at
+                            # least one queued stone did NOT come from a bare badge/queue-toggle
+                            # click (queue_source != "badge"). A project with zero sessions where
+                            # every queued stone was badge-only should wait for the explicit
+                            # dispatch button, matching the from_badge guard in execute_project
+                            # itself — this poller previously ignored that distinction entirely
+                            # and spawned unconditionally (verified live: Clone project, 2026-07-06).
+                            try:
+                                _fq_badge = sqlite3.connect(str(_NS_EVENTS_DB))
+                                _fq_badge_rows = _fq_badge.execute(
+                                    "SELECT data_json FROM milestones_store WHERE proj_id=? AND status='queued' AND COALESCE(held,0)=0",
+                                    (_fork_proj_id,)).fetchall()
+                                _fq_badge.close()
+                                _non_badge_found = any(
+                                    (json.loads(_r[0]).get("queue_source") or "") != "badge"
+                                    for _r in _fq_badge_rows
+                                )
+                                if not _non_badge_found:
+                                    continue  # every queued stone was badge-only — wait for dispatch button
+                            except Exception:
+                                pass  # on read failure, fall through to prior (spawn) behavior
                         # Trigger execute endpoint to spawn a new session.
                         # asyncio.to_thread — a blocking urlopen here stalls the event loop
                         # (execute waits up to 12s for spawn readiness; see blocking-urlopen incident).
@@ -4542,10 +4720,9 @@ async def _start_queue_continuation_poller():
                             with _ureq.urlopen(_req, timeout=30):
                                 pass
                         try:
-                            # Mark BEFORE the await — spawn takes up to 12s and the guards
+                            # Mark BEFORE the await — spawn takes up to 12s and the guard
                             # must hold if anything else inspects state mid-spawn.
                             _fork_spawn_last[_fork_proj_id] = now
-                            _dispatch_inflight[_fork_proj_id] = now
                             await asyncio.to_thread(_fork_spawn_call)
                         except Exception:
                             pass
@@ -4565,20 +4742,102 @@ async def _start_queue_continuation_poller():
                             if not _p:
                                 continue
                             _changed = False
+                            _now_ts = time.time()
+                            _cleared_ns_ids = []
                             for _ns in (_p.get("north_stars") or []):
                                 if not isinstance(_ns, dict):
                                     continue
                                 _assigned = (_ns.get("assigned_session") or "").strip()
-                                if _assigned and _assigned not in alive_sessions:
-                                    _ns["assigned_session"] = None
-                                    _changed = True
+                                if not _assigned or _assigned in alive_sessions:
+                                    continue
+                                # M1656-①: grace window — skip clear for 60s after assign_spawn
+                                _grace = _ns.get("spawning_grace_until") or 0
+                                if _grace > _now_ts:
+                                    continue
+                                _cleared_ns_ids.append(f"{_ns.get('id','?')}:{_assigned}")
+                                _ns["assigned_session"] = None
+                                _changed = True
                             if _changed:
                                 _db_save_project(_pid, _p)
                                 _parse_cache.pop(str(PROJECTS_DIR / _pid / "north-star.md"), None)
+                                # M131-c: this cleanup previously had NO log line — the only silent
+                                # assigned_session-clearing path (vs. exec:kill / exec:mother_death_cascade,
+                                # both logged). Made a user unable to tell "I killed it" from "poller found
+                                # it dead for an unrelated reason" after the fact.
+                                _server_log_action(_pid, "", "exec:dead_session_unassign",
+                                                   f"cleared:{','.join(_cleared_ns_ids)}")
                         except Exception:
                             pass
                 except Exception:
                     pass  # cleanup must never crash the poller
+
+                # M1656-②v2: mother natural-death → cascade kill orphan child sessions.
+                # DEATH = observed alive→gone TRANSITION, not mere absence — a child spawned
+                # while the mother never existed is standalone and must NOT be reaped
+                # (observed: child killed ≤10s after spawn when mother was already gone).
+                # Also: mother ref must be a real tmux exec session name — legacy
+                # branch_from values holding conversation UUIDs killed innocent sessions.
+                if not hasattr(_poll_queue_continuation, "_sess_last_alive"):
+                    _poll_queue_continuation._sess_last_alive = {}
+                _sess_last_alive: dict = _poll_queue_continuation._sess_last_alive
+                _now_alive_ts = time.time()
+                for _sn_alive in alive_sessions:
+                    if "-exec-" in _sn_alive:
+                        _sess_last_alive[_sn_alive] = _now_alive_ts
+                _MOTHER_DEATH_WINDOW = 600  # cascade only if mother seen alive within last 10min
+                try:
+                    for _pdir in PROJECTS_DIR.iterdir():
+                        try:
+                            _pid = _pdir.name
+                            _p = _db_load_project(_pid)
+                            if not _p:
+                                continue
+                            _ns_list = _p.get("north_stars") or []
+                            # Build session → branch_from map
+                            _sess_to_ns: dict = {}
+                            for _ns in _ns_list:
+                                if not isinstance(_ns, dict):
+                                    continue
+                                _a = (_ns.get("assigned_session") or "").strip()
+                                if _a:
+                                    _sess_to_ns[_a] = _ns
+                            _changed = False
+                            for _ns in _ns_list:
+                                if not isinstance(_ns, dict):
+                                    continue
+                                _child_sess = (_ns.get("assigned_session") or "").strip()
+                                _mother_id = (_ns.get("branch_from_session_id") or "").strip()
+                                if not _child_sess or not _mother_id:
+                                    continue
+                                # Find mother session name from its substar
+                                _mother_ns = _sess_to_ns.get(_mother_id)
+                                _mother_sess = (_mother_ns.get("assigned_session") or "").strip() if _mother_ns else _mother_id
+                                # M1656-②v2 guards: mother ref must be a tmux exec name (not a
+                                # conversation UUID), and mother must have been SEEN alive recently
+                                # — absence alone is not death.
+                                if not _mother_sess or "-exec-" not in _mother_sess:
+                                    continue
+                                _mother_seen = _sess_last_alive.get(_mother_sess, 0)
+                                _mother_died = (_mother_sess not in alive_sessions
+                                                and _mother_seen > 0
+                                                and (_now_alive_ts - _mother_seen) < _MOTHER_DEATH_WINDOW)
+                                if _child_sess in alive_sessions and _mother_died:
+                                    try:
+                                        subprocess.run(["tmux", "kill-session", "-t", f"={_child_sess}"],
+                                                       capture_output=True, timeout=3)
+                                    except Exception:
+                                        pass
+                                    _ns["assigned_session"] = None
+                                    _agent_busy_sessions.pop(_child_sess, None)
+                                    _changed = True
+                                    _server_log_action(_pid, "", "exec:mother_death_cascade",
+                                                       f"child:{_child_sess} mother:{_mother_sess}")
+                            if _changed:
+                                _db_save_project(_pid, _p)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass  # cascade kill must never crash the poller
             except Exception:
                 pass  # poller must never crash
 
@@ -4706,11 +4965,13 @@ def _get_resume_args(proj_id: str, proj_dir: str, explicit_session_id: str = Non
 _ALLOWED_MODELS = {
     # Claude CLI accepts aliases and full IDs. Restrict to the ones we want users
     # to pick from in the UI; "" / unset → CLI default model.
-    "haiku", "sonnet", "opus",
+    "haiku", "sonnet", "opus", "fable",
     "claude-haiku-4-5",
     "claude-sonnet-4-6",
+    "claude-sonnet-5",
     "claude-opus-4-7",
     "claude-opus-4-8",
+    "claude-fable-5",
     # OSK/LiteLLM proxy on 127.0.0.1:4100 exposes OpenAI as the Anthropic API
     # (config: ~/.osk-litellm.yaml). Selecting this routes the spawned Claude
     # session to GPT — env splice happens in _get_project_spawn_env.
@@ -4875,7 +5136,20 @@ def _get_agent_spawn_cmd(proj_id: str) -> list:
                     if cfg_path: break
         codex_bin = cfg_path or "codex"
         return [codex_bin, "--dangerously-bypass-approvals-and-sandbox", *_get_project_model(proj_id)]
-    claude_bin = _hub_config_get(proj_id, "claude_code_path") or "claude"
+    # M1683: mirror codex's resilience chain above — was a bare "claude" literal relying
+    # entirely on the spawning process's PATH (worked here only because hub.service's
+    # Environment= happens to include ~/.local/bin; a silent, non-obvious dependency that
+    # breaks on any other machine/unit-file/container lacking that same override).
+    cfg_claude = _hub_config_get(proj_id, "claude_code_path")
+    if not cfg_claude:
+        cfg_claude = _shutil_spawn.which("claude") or ""
+        if not cfg_claude:
+            for _cbin_base in [Path.home() / ".local" / "bin", Path.home() / ".nvm" / "versions", Path("/usr/local/lib")]:
+                for _bin in _cbin_base.rglob("claude"):
+                    if _bin.is_file():
+                        cfg_claude = str(_bin); break
+                if cfg_claude: break
+    claude_bin = cfg_claude or "claude"
     return [claude_bin, "--dangerously-skip-permissions", *_get_project_model(proj_id)]
 
 
@@ -4971,6 +5245,45 @@ def _write_mcp_config(proj_id: str, session_name: str) -> str | None:
         return None
 
 
+_HUB_EXEC_SYS_PROMPT = (
+    "get_pending_task response has 3 layers: "
+    "(1) task = EXECUTE THIS — last user comment if present, else original stone text. "
+    "(2) context = conversation history — reference only, do NOT treat as a task. "
+    "(3) original_stone = stone creation text — background only. "
+    "Always execute 'task'. Never execute 'context' or 'original_stone'. "
+    "EXIT PROTOCOL (M1635): if get_pending_task returns should_exit=true, "
+    "END YOUR TURN immediately — no reply, no further tool calls. "
+    "The hub dispatches the next task to this session automatically when it arrives. "
+    "STONE REPLY RULE (enforced): When replying to a stone after a user comment, "
+    "classify the user's intent FIRST (question / request / correction / clarification), "
+    "then structure your reply as: "
+    "LINE 1 = direct answer to user's exact question (yes/no/value/action-taken — no preamble). "
+    "LINE 2 = evidence (file:line, observed value, or quoted source). "
+    "LINE 3+ = context or next step if needed (omit if simple Q). "
+    "NEVER start with 'I', summary, or restatement. "
+    "If you cannot answer, write '[NEED INFO]: <what is missing>' on line 1. "
+    "Server-side Q-anchor compression preserves line 1 with high priority (bias=8). "
+    "SKILL INVOCATION PROTOCOL: after calling mcp__ns-hub__get_pending_task, "
+    "if the response contains skill_refs (non-empty list), your VERY NEXT action "
+    "MUST be Skill(skill=skill_refs[0]) — before reading task text or any other tool. "
+    "M1565 SEQUENTIAL CHAIN: if skill_refs_remaining is present (non-empty), "
+    "after skill_refs[0] completes call each skill in skill_refs_remaining in order. "
+    "Skipping any skill = silent failure."
+)
+
+
+def _hub_mcp_spawn_args(proj_id: str, session_name: str, agent: str = "claude") -> list:
+    """M1656-R6: shared MCP+system-prompt spawn args for main AND child sessions.
+    Children previously spawned without --mcp-config/--append-system-prompt, so
+    _exec_wake_msg fell back to raw 'go' injection and the child lacked hub rules."""
+    if agent not in (None, "", "claude", "openrouter"):
+        return []
+    _cfg = _write_mcp_config(proj_id, session_name)
+    if not _cfg:
+        return []
+    return ["--mcp-config", _cfg, "--append-system-prompt", _HUB_EXEC_SYS_PROMPT]
+
+
 def _exec_wake_msg(session_name: str) -> str:
     """Return the tmux wake message for an exec session.
     MCP-enabled sessions get a direct tool-call instruction; others get 'go'."""
@@ -5002,12 +5315,15 @@ def _get_first_queued_skill(proj_id: str) -> str | None:
 
 
 _wake_last_sent: dict[str, float] = {}  # M1322: dedup guard — session → last send timestamp
+_session_spawn_ts: dict[str, float] = {}  # M1678-c: session → spawn time (in-memory boot-grace source;
+                                          # replaces tmux display-message query — tmux 3.2a segfaulted
+                                          # under per-wake-attempt queries against booting servers)
 _WAKE_DEDUP_SECS = 90  # M1322 v2: 5→90s — compaction takes 30-60s; 5s window let second inject slip through
-_wake_inflight: dict[str, float] = {}  # M1585: OOB-sent wakes in-flight — poller skips while set (TTL=90s)
 _wake_send_lock = __import__('threading').Lock()  # M1585 v2: atomic dedup check+set across _queued_dispatch / _dispatch_blocking race
 
 
-def _send_exec_wake(session_name: str, proj_id: str | None = None, force_dedup_reset: bool = False) -> bool:
+def _send_exec_wake(session_name: str, proj_id: str | None = None, force_dedup_reset: bool = False,
+                    _skip_boot_grace: bool = False) -> bool:
     """M1114: Send exec wake message to tmux, with optional skill pre-inject.
     If the first queued stone has skill_refs, sends /skill-name first (CLI intercept)
     then sleeps 1s, then sends the main wake message.
@@ -5018,9 +5334,47 @@ def _send_exec_wake(session_name: str, proj_id: str | None = None, force_dedup_r
     M1585 v2: threading.Lock() makes dedup check+set atomic — prevents double-inject race
     between _queued_dispatch and _dispatch_blocking threads.
     M1585 v3: force_dedup_reset moves .pop() inside the lock so reset+check+set is atomic.
-    Returns True if wake was sent, False if suppressed by dedup."""
+    M1678: THE single wake choke point — alive/attached/busy gates live HERE so every
+    caller (poller, task_complete dispatch, create_wake, spawn paths) shares identical
+    semantics. Busy gate is session-scoped (_session_is_busy): a busy mother must not
+    block her child's wake, and a fresh no-record session counts as idle.
+    Returns True if wake was sent, False if suppressed by any gate."""
     import time as _time_wake
+    # M1678-c: CHEAP in-memory gates first — tmux 3.2a segfaulted under repeated
+    # per-attempt queries (display-message/has-session every poller cycle against a
+    # booting server, dmesg signal-11 loop 21:07-21:12). Order: dedup-peek → busy →
+    # boot-grace (memory) → tmux alive/attached (rare, only when a send is imminent).
     now = _time_wake.time()
+    if now - _wake_last_sent.get(session_name, 0.0) < _WAKE_DEDUP_SECS and not force_dedup_reset:
+        return False  # read-only peek — atomic check+set happens below under the lock
+    # M131 fix: a stale 'wake_sent' optimistic-busy record (from a PREVIOUS wake that found
+    # nothing queued and let the session go idle) can outlive its own turn and then block
+    # the NEXT, genuinely-needed wake for the rest of its 45s TTL (observed: 56s dispatch
+    # delay on a freshly-spawned child — courtesy boot-wake found no stone, went idle, then
+    # a real stone arrived and was silently skipped here). force_dedup_reset callers have
+    # already confirmed real claimable work exists for this exact session, so they may also
+    # clear a wake_sent hold — same trust level that already bypasses the dedup timer above.
+    # Never clears a REAL busy signal (heartbeat/claim/tool_start/compacting).
+    if force_dedup_reset:
+        _rec_fdr = _agent_busy_sessions.get(session_name)
+        if _rec_fdr and _rec_fdr.get("reason") == "wake_sent":
+            _agent_busy_sessions.pop(session_name, None)
+    if _session_is_busy(session_name):
+        return False  # never inject into a working session
+    # M1678-b: boot grace — a wake landing while the harness TUI is still initializing
+    # parks as unsubmitted text in the input box. _spawn_wake_when_ready owns the boot
+    # window (_skip_boot_grace=True after its readiness probe); everyone else waits 20s.
+    if not _skip_boot_grace and (now - _session_spawn_ts.get(session_name, 0.0)) < 20:
+        return False  # booting — readiness thread / next poller pass will wake
+    if not _tmux_session_alive(session_name):
+        return False
+    try:
+        _cl = subprocess.run(["tmux", "list-clients", "-t", f"={session_name}"],
+                             capture_output=True, text=True, timeout=2)
+        if (_cl.stdout or "").strip():
+            return False  # M1337: user has the pane open — never auto-inject
+    except Exception:
+        pass
     # M1585 v3: atomic reset+check+set — pop() is inside the lock so no thread can
     # reset the guard while another thread is between pop() and send_exec_wake().
     with _wake_send_lock:
@@ -5046,13 +5400,63 @@ def _send_exec_wake(session_name: str, proj_id: str | None = None, force_dedup_r
         ["tmux", "send-keys", "-t", session_name, wake_msg, "Enter"],
         capture_output=True, timeout=2,
     )
-    # M1585: mark inflight so poller skips duplicate wake within TTL window
-    _wake_inflight[session_name] = _time_wake.time()
+    # M1675: optimistic busy from the moment of injection — wake→busy was previously
+    # invisible until the session's get_pending_task claim (6-12s UI idle gap).
+    # Never clobber a fresh real busy record (heartbeat/claim); wake_sent has its own
+    # short TTL (_WAKE_SENT_TTL_SECS) inside _session_is_busy.
+    if proj_id:
+        _rec_w = _agent_busy_sessions.get(session_name)
+        _fresh_busy = bool(_rec_w and _rec_w.get("busy")
+                           and (_time_wake.time() - _rec_w.get("ts", 0)) < _OOB_STALE_SECS
+                           and _rec_w.get("reason") != "wake_sent")
+        if not _fresh_busy:
+            _agent_busy_sessions[session_name] = {
+                "proj_id": proj_id, "busy": True, "reason": "wake_sent",
+                "ts": _time_wake.time(), "stone_id": None,
+            }
     # M1533 v5b: emit session_running SSE so swimlane avatar opacity updates without 5s poll lag.
     if proj_id:
+        _exec_sessions_cache["ts"] = 0.0  # M1677: pane refresh must see post-wake state
         try: _ns_push("session_running", proj_id=proj_id, kind="exec")
         except Exception: pass
     return True
+
+
+def _spawn_wake_when_ready(session_name: str, proj_id: str, timeout: float = 30.0) -> None:
+    """M1678: readiness-gated spawn wake — replaces blind `tmux send-keys` fired
+    immediately after `tmux new-session` (child spawns), which parked the wake text
+    in the input box while the harness was still booting (mother never showed this
+    because /execute verifies pane-alive before waking). Polls until the pane runs a
+    non-shell command, settles 1.5s for the TUI, then goes through _send_exec_wake
+    (single choke point: alive/attached/busy gates + dedup + optimistic busy + SSE).
+    Run in a background thread — never on the event loop."""
+    import time as _t_sw
+    _session_spawn_ts[session_name] = _t_sw.time()  # M1678-c: in-memory boot-grace source
+    deadline = _t_sw.time() + timeout
+    while _t_sw.time() < deadline:
+        try:
+            r = subprocess.run(["tmux", "list-panes", "-t", f"={session_name}",
+                                "-F", "#{pane_current_command}"],
+                               capture_output=True, text=True, timeout=2)
+            cmds = [c.strip() for c in (r.stdout or "").splitlines() if c.strip()]
+            if r.returncode != 0:
+                return  # session died during boot — fork-protocol will handle respawn
+            if cmds and any(c not in _SHELLS for c in cmds):
+                _t_sw.sleep(1.5)  # TUI settle — keys sent mid-init can be dropped
+                break
+        except Exception:
+            pass
+        _t_sw.sleep(1.0)  # M1678-c: gentle poll — tmux 3.2a fragile under rapid queries
+    # M1688: re-check claimable work right before waking — this call site (assign-spawn,
+    # manual "Assign" action in the UI) can fire with zero queued stones for the substar
+    # (assigning a session ahead of any real work), and CLI boot alone takes 10-30s+ during
+    # which the ORIGINAL triggering stone (if any) may already have been claimed elsewhere
+    # or deleted. M1676 added this same guard to the queue-continuation poller but this
+    # function (written afterward for M1678) never got it — the gap this stone reported:
+    # "child shows busy right at spawn even with no queue."
+    if _session_claimable_queued_count(proj_id, session_name) == 0:
+        return
+    _send_exec_wake(session_name, proj_id, _skip_boot_grace=True)
 
 
 _COMPACT_THRESHOLD_MB = 4  # M1185: ~80% of 200K window (calibrated: 5MB≈88%, 4MB≈80%)
@@ -5105,12 +5509,18 @@ def _transcript_too_large(proj_id: str) -> bool:
     return False
 
 
-def _record_spawn_info(proj_id: str, resume_args: list, agent: str = "claude") -> None:
-    """Snapshot what resume flag we used when spawning Claude for this project.
+def _record_spawn_info(proj_id: str, resume_args: list, agent: str = "claude", session_name: str = "") -> None:
+    """Snapshot what resume flag we used when spawning Claude for this project/session.
 
     Surfaces to the UI via /api/exec-sessions so users can see whether the
     currently running tmux session is actually continuing prior stone work
     (--resume <id>) or starting fresh (--continue / nothing).
+
+    M1656-R9: keyed by session_name (dict inside one file) — was a single
+    per-project record, so only whichever session spawned LAST within a 120s
+    guess-window showed real data; every sibling (mother vs children) showed
+    "— unknown". session_name="" falls back to the legacy "_main" key so old
+    call sites (main execute path) keep working unchanged.
     """
     from datetime import datetime as _dt
     if agent == "codex":
@@ -5135,7 +5545,8 @@ def _record_spawn_info(proj_id: str, resume_args: list, agent: str = "claude") -
             from_id = resume_args[idx + 1] if idx + 1 < len(resume_args) else ""
         except Exception:
             from_id = ""
-        info = {"agent": agent, "mode": "resume", "from_id": from_id, "at": _dt.now().isoformat(timespec="seconds")}
+        _mode = "fork" if "--fork-session" in resume_args else "resume"
+        info = {"agent": agent, "mode": _mode, "from_id": from_id, "at": _dt.now().isoformat(timespec="seconds")}
     elif "--continue" in resume_args:
         info = {"agent": agent, "mode": "continue", "from_id": "", "at": _dt.now().isoformat(timespec="seconds")}
     else:
@@ -5153,12 +5564,95 @@ def _record_spawn_info(proj_id: str, resume_args: list, agent: str = "claude") -
         except Exception:
             pass
     info["model"] = _proj_model
+    _key = session_name or "_main"
     try:
         pdir = PROJECTS_DIR / proj_id
         pdir.mkdir(parents=True, exist_ok=True)
-        (pdir / ".last-spawn-info.json").write_text(json.dumps(info))
+        _f = pdir / ".spawn-info-by-session.json"
+        _all = {}
+        if _f.exists():
+            try:
+                _all = json.loads(_f.read_text())
+            except Exception:
+                _all = {}
+        _all[_key] = info
+        _f.write_text(json.dumps(_all, ensure_ascii=False))
+        # M1656-R9: legacy single-file mirror for the main session only — keeps any
+        # unrefactored reader working during rollout.
+        if _key == "_main":
+            (pdir / ".last-spawn-info.json").write_text(json.dumps(info))
     except Exception:
         pass
+
+
+def _capture_live_session_id_bg(proj_id: str, proj_dir: str, session_name: str, pre_existing: set,
+                                 poll_interval: float = 1.0, timeout: float = 20.0) -> None:
+    """M1656-R9: session-scoped live_session_id capture — runs in a background thread so
+    the spawn call site doesn't block. POLLS the transcript directory (Claude CLI can take
+    well over 2s to boot and write its first transcript line, especially forking a large
+    context) diffing against a pre-spawn snapshot to find the ONE new file this spawn
+    created — unambiguous even when sibling sessions (mother/other children) share the
+    same transcript directory and write concurrently (the old heuristic just grabbed
+    'newest mtime file', which frequently picked a SIBLING's transcript instead of this
+    session's own — confirmed root cause of the mother/child pane info mismatch)."""
+    import time as _t, threading as _th
+
+    def _run():
+        encoded = _encode_cwd_for_claude(str(proj_dir))
+        tdir = Path.home() / ".claude" / "projects" / encoded
+        _deadline = _t.time() + timeout
+        while _t.time() < _deadline:
+            _t.sleep(poll_interval)
+            try:
+                if not tdir.exists():
+                    continue
+                _now_files = {f.name for f in tdir.glob("*.jsonl")}
+                _new_files = _now_files - pre_existing
+                if len(_new_files) == 1:
+                    _new_sid = next(iter(_new_files))[:-6]  # strip ".jsonl"
+                    _f = PROJECTS_DIR / proj_id / ".spawn-info-by-session.json"
+                    _all = {}
+                    if _f.exists():
+                        try:
+                            _all = json.loads(_f.read_text())
+                        except Exception:
+                            _all = {}
+                    if session_name in _all:
+                        _all[session_name]["live_session_id"] = _new_sid
+                        _f.write_text(json.dumps(_all, ensure_ascii=False))
+                    return
+                if len(_new_files) > 1:
+                    return  # genuinely ambiguous — leave unset, UI falls back to heuristic
+            except Exception:
+                return
+
+    _th.Thread(target=_run, daemon=True).start()
+
+
+def _read_spawn_info(proj_id: str, session_name: str) -> dict:
+    """M1656-R9: session-scoped read counterpart to _record_spawn_info."""
+    _ag, _pid = _parse_exec_session_name(session_name)
+    _is_main = bool(_pid) and session_name == f"{_ag}-exec-{_pid}"
+    try:
+        _f = PROJECTS_DIR / proj_id / ".spawn-info-by-session.json"
+        if _f.exists():
+            _all = json.loads(_f.read_text())
+            if session_name in _all:
+                return _all[session_name]
+            if _is_main and "_main" in _all:
+                return _all["_main"]
+    except Exception:
+        pass
+    # M1656-R9: legacy single-file fallback — covers main sessions spawned before this
+    # fix was deployed (their data lives only in the old per-project file).
+    if _is_main:
+        try:
+            _legacy = PROJECTS_DIR / proj_id / ".last-spawn-info.json"
+            if _legacy.exists():
+                return json.loads(_legacy.read_text())
+        except Exception:
+            pass
+    return {}
 
 
 def _update_session_history_from_transcript(proj_id: str, proj_dir: str, model_key: str = "") -> str | None:
@@ -5198,6 +5692,115 @@ def _update_session_history_from_transcript(proj_id: str, proj_dir: str, model_k
         return new_sid
     except Exception:
         return None
+
+
+_known_projs_cache: dict = {"ts": 0.0, "ids": set()}
+
+
+def _parse_exec_session_name(session_name: str) -> tuple:
+    """M1656-④ shared: return (agent, proj_id) for an exec tmux session name.
+    Longest-prefix match against known project dirs so branched child names
+    like 'claude-exec-MOAT-Marketing' resolve to proj_id='MOAT' (not 'MOAT-Marketing').
+    Returns ('','') for non-exec sessions."""
+    _now = time.monotonic()
+    if _now - _known_projs_cache["ts"] > 10.0:
+        try:
+            _known_projs_cache["ids"] = {p.name for p in PROJECTS_DIR.iterdir() if p.is_dir()}
+        except Exception:
+            pass
+        _known_projs_cache["ts"] = _now
+    for prefix, prefix_agent in (("claude-exec-", "claude"), ("codex-exec-", "codex"),
+                                 ("openrouter-exec-", "openrouter"), ("dsk-exec-", "dsk")):
+        if not session_name.startswith(prefix):
+            continue
+        remainder = session_name[len(prefix):]
+        best = ""
+        for pid in _known_projs_cache["ids"]:
+            if remainder == pid or remainder.startswith(pid + "-"):
+                if len(pid) > len(best):
+                    best = pid
+        return prefix_agent, (best or remainder)
+    return "", ""
+
+
+def _truncate_transcript_before_stone(transcript_path: Path, stone_id: str) -> "Path | None":
+    """M1679: cut point for fork-while-busy. A branched child spawned via --fork-session
+    inherits the mother's FULL live conversation verbatim — if the mother is mid-work on
+    an in-flight stone (tool calls issued, reply not yet posted), the fork carries that
+    unfinished work along, and the child (being told 'just continue') completes it
+    instead of starting its own assignment (observed: FromScratch M127, VLM-assigned,
+    finished by a child spawned for VLA). Root cause is fork operating at the session
+    layer with no concept of stone ownership.
+    Fix: locate the get_pending_task tool_result line where {"has_task":true,"task_id":
+    "<stone_id>"} first appears in the mother's JSONL transcript, and write a COPY
+    containing only the lines before it to a new synthetic-uuid file in the same
+    directory. The mother's own file is never touched — she keeps working normally.
+    Returns the new file's session id (stem) on success, None if the marker wasn't
+    found or on any I/O error (caller must fall back to forking the mother's raw id)."""
+    import uuid as _uuid_trunc
+    try:
+        # M1679: the tool_result is a JSON string EMBEDDED inside the JSONL line, so its
+        # own quotes are backslash-escaped one level (\"has_task\":true, not "has_task":true).
+        needle = '\\"task_id\\":\\"' + stone_id + '\\"'
+        marker = '\\"has_task\\":true'
+        lines = transcript_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        cut_idx = None
+        for i, line in enumerate(lines):
+            if marker in line and needle in line:
+                cut_idx = i
+                break
+        if cut_idx is None:
+            return None  # marker not found — nothing safe to cut, caller falls back
+        kept = lines[:cut_idx]
+        if not kept:
+            return None  # nothing precedes the marker — forking an empty transcript is pointless
+        new_sid = str(_uuid_trunc.uuid4())
+        new_path = transcript_path.parent / f"{new_sid}.jsonl"
+        new_path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+        return new_sid
+    except Exception:
+        return None
+
+
+def _mother_fork_args(proj_id: str, proj_dir: str) -> list:
+    """M1656-fork: return ['--resume', <mother_sid>, '--fork-session'] so a branched child
+    session inherits the mother conversation's full context while writing to its OWN new
+    session id (no transcript contention with the still-running mother).
+    Falls back to ['--continue'] when no valid mother transcript is found (M837-safe).
+    M1656-R8 (user decision): ALWAYS fork — never fresh. Oversized mother context is
+    handled by Claude's built-in auto-compact on the child's first turn.
+    M1679: if the mother is currently busy with an in-flight stone, fork from a
+    truncated COPY that ends right before that stone's assignment (see
+    _truncate_transcript_before_stone) instead of her live, in-progress conversation —
+    the child then starts its own turn clean instead of finishing the mother's work."""
+    try:
+        hist_file = PROJECTS_DIR / proj_id / ".session-history.json"
+        if hist_file.exists():
+            hist = json.loads(hist_file.read_text())
+            for _k in ("_current", "_default"):
+                sid = (hist.get(_k) or "").strip()
+                if sid:
+                    t = (Path.home() / ".claude" / "projects"
+                         / _encode_cwd_for_claude(str(proj_dir)) / f"{sid}.jsonl")
+                    if t.exists() and t.stat().st_size > 0:
+                        try:
+                            _agent_mfa = _get_project_agent_value(proj_id)
+                            _mother_sess = f"{_agent_mfa}-exec-{proj_id}"
+                            _mrec = _agent_busy_sessions.get(_mother_sess) or {}
+                            _mother_stone = _mrec.get("stone_id")
+                            if _mother_stone and _session_is_busy(_mother_sess):
+                                _cut_sid = _truncate_transcript_before_stone(t, _mother_stone)
+                                if _cut_sid:
+                                    _server_log_action(proj_id, _mother_stone, "exec:fork_truncated",
+                                                       f"mother:{_mother_sess} orig_sid:{sid} cut_sid:{_cut_sid}")
+                                    return ["--resume", _cut_sid, "--fork-session"]
+                        except Exception:
+                            pass  # any failure in the busy/cut check — fall back to raw fork below
+                        return ["--resume", sid, "--fork-session"]
+    except Exception:
+        pass
+    return ["--continue"]
+
 
 
 def _load_branch_sessions(proj_id: str) -> dict:
@@ -5285,17 +5888,27 @@ def _exec_session_names(proj_id: str) -> list:
 def _live_exec_session_name(proj_id: str) -> str:
     """Return the first running exec session name for a project, if any."""
     for candidate in _exec_session_names(proj_id):
-        check = subprocess.run(["tmux", "has-session", "-t", candidate], capture_output=True, timeout=2)
+        check = subprocess.run(["tmux", "has-session", "-t", f"={candidate}"], capture_output=True, timeout=2)
         if check.returncode == 0:
             return candidate
     return f"{_get_project_agent_value(proj_id)}-exec-{proj_id}"
 
 
-def _kill_all_exec_sessions(proj_id: str) -> None:
+def _kill_all_exec_sessions(proj_id: str, spare_children: bool = False) -> None:
     """M206: kill ALL agent-prefixed exec sessions for a project.
     Prevents duplicate panes when agent changes (e.g. claude-exec + openrouter-exec both alive).
-    M1087: also kills custom assigned_session values from substars (sess- or any non-exec pattern)."""
+    M1087: also kills custom assigned_session values from substars (sess- or any non-exec pattern).
+    M1656-R3: spare_children=True → branched child sessions ({agent}-exec-{proj}-{suffix})
+    are NOT killed and their substar assignments are preserved. Used by dispatch-time
+    respawn of the MAIN session — a mother respawn must never take down working children.
+    M1656-R3: kill uses tmux exact-match (=name) — plain -t does PREFIX matching, so
+    killing a dead 'claude-exec-MOAT' silently killed 'claude-exec-MOAT-Marketing'."""
     killed = []
+
+    def _is_child(sess: str) -> bool:
+        _ag, _pid = _parse_exec_session_name(sess)
+        return bool(_pid) and sess != f"{_ag}-exec-{_pid}"
+
     # Collect custom assigned sessions from substars before clearing them
     extra_sessions: list = []
     try:
@@ -5313,22 +5926,29 @@ def _kill_all_exec_sessions(proj_id: str) -> None:
         if s not in all_candidates:
             all_candidates.append(s)
     for candidate in all_candidates:
-        r = subprocess.run(["tmux", "kill-session", "-t", candidate], capture_output=True, timeout=5)
+        if spare_children and _is_child(candidate):
+            continue
+        # =name → exact target match only (no prefix fallback)
+        r = subprocess.run(["tmux", "kill-session", "-t", f"={candidate}"], capture_output=True, timeout=5)
         if r.returncode == 0:
             killed.append(candidate)
         # M355: clear idle tracking for killed sessions
         _exec_idle_count.pop(candidate, None)
         _exec_was_running.pop(candidate, None)
     if killed:
-        _server_log_action(proj_id, "", "exec:kill", f"sessions:{','.join(killed)}")
-    # M985: also clear assigned_session on all substars when all sessions killed
+        _server_log_action(proj_id, "", "exec:kill", f"sessions:{','.join(killed)}{' (children spared)' if spare_children else ''}")
+    # M985/M1656-R3: clear assigned_session ONLY for substars whose session was actually
+    # killed — spared children keep their assignments (prevents auto-assign absorption).
     try:
         p = _db_load_project(proj_id)
         if p:
             north_stars = p.get("north_stars") or []
             changed = False
             for ns in north_stars:
-                if isinstance(ns, dict) and ns.get("assigned_session"):
+                if not isinstance(ns, dict):
+                    continue
+                _a = (ns.get("assigned_session") or "").strip()
+                if _a and (_a in killed or not spare_children):
                     ns["assigned_session"] = None
                     changed = True
             if changed:
@@ -5434,7 +6054,7 @@ async def terminal_session(websocket: WebSocket, proj_id: str):
         # M1371: verify session exists before attach — attach-session exits immediately
         # with code 1 when session is missing, causing instant "session closed" in UI.
         _sess_check = _sp.run(
-            ["tmux", "has-session", "-t", tmux_session_name],
+            ["tmux", "has-session", "-t", f"={tmux_session_name}"],
             capture_output=True, timeout=3
         )
         if _sess_check.returncode != 0:
@@ -5458,6 +6078,8 @@ async def terminal_session(websocket: WebSocket, proj_id: str):
             await websocket.send_text(f"\r\n[Failed to attach to tmux session {tmux_session_name}: {e}]\r\n")
             await websocket.close()
             return
+        # M1685: register so the poller can self-heal if this relay leaks (see registry comment above)
+        _exec_attach_relay[tmux_session_name] = {"pid": proc.pid, "attached_at": time.time()}
         import signal as _signal
         _proc_killed = False
         def _kill_proc_sigkill():
@@ -5470,6 +6092,7 @@ async def terminal_session(websocket: WebSocket, proj_id: str):
                     os.kill(proc.pid, _signal.SIGKILL)
             except Exception:
                 pass
+            _exec_attach_relay.pop(tmux_session_name, None)
 
         queue: asyncio.Queue = asyncio.Queue(maxsize=512)
         async def _tmux_to_ws():
@@ -5830,12 +6453,72 @@ async def update_north_star(proj_id: str, ns_id: str, request: Request):
     ns = next((x for x in ns_list if x.get("id") == ns_id), None)
     if not ns:
         return JSONResponse({"ok": False, "error": "north-star not found"}, status_code=404)
+    _old_assigned = (ns.get("assigned_session") or "").strip()
     for field in ("name", "metric", "target", "current", "status", "default_agent", "assigned_session", "branch_from_session_id"):
         if field in data:
             ns[field] = data[field] or None if field in ("default_agent", "assigned_session", "branch_from_session_id") else data[field]
     proj["north_stars"] = ns_list
     _save_project(proj_id, proj)  # M289: was _write_md_frontmatter — bypassed SQLite project_meta
     # M1347: removed _sync_substars_to_claude_md call — hub no longer writes project CLAUDE.md  # PermissionError or missing CLAUDE.md must not abort the primary SQLite save
+
+    # M1656-①: Assign button → auto-spawn if session is dead so M1095 poller doesn't wipe it
+    _new_assigned = (ns.get("assigned_session") or "").strip()
+    if _new_assigned and _new_assigned != _old_assigned:
+        try:
+            _chk = subprocess.run(["tmux", "has-session", "-t", f"={_new_assigned}"],
+                                   capture_output=True, timeout=2)
+            if _chk.returncode != 0:
+                # M1656-① fix2: use repo_path resolver (was PROJECTS_DIR = ~/.hub metadata dir)
+                _proj_dir = _get_project_dir(proj_id) or ""
+                _spawn_cwd = _proj_dir if _proj_dir and Path(_proj_dir).exists() else str(Path.home())
+                _pf = PROJECTS_DIR / proj_id / f"pending-execute-prompt-{_new_assigned[-12:]}.txt"
+                _pf.write_text(
+                    _load_stone_memory(proj_id)
+                    + f"[EXECUTE SYNC] Project {proj_id} — Session '{_new_assigned}' just assigned.\n"
+                    f"Call get_pending_task() to find your assigned stones.",
+                    encoding="utf-8",
+                )
+                _sp_env = ["-e", f"NS_HUB_URL=http://{_tailscale_interface_ip()}:{PORT}",
+                           "-e", f"NS_SESSION_KEY={_new_assigned}",
+                           "-e", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80"]  # M1656-R8: children rely on CLI auto-compact
+                for _k, _v in _get_project_spawn_env(proj_id).items():
+                    _sp_env += ["-e", f"{_k}={_v}"]
+                # M1656-fork: inherit mother conversation context via fork (fallback --continue)
+                _sp_resume_args = _mother_fork_args(proj_id, _spawn_cwd)
+                # M1656-R9: session-scoped spawn-info record — was never written for children,
+                # so their exec-pane badge always showed "— unknown" instead of ↻ fork/resume.
+                _record_spawn_info(proj_id, _sp_resume_args, agent="claude", session_name=_new_assigned)
+                # Snapshot BEFORE spawn so the bg capture can find the one file THIS spawn creates
+                try:
+                    _sp_pre_files = {f.name for f in (Path.home() / ".claude" / "projects"
+                                     / _encode_cwd_for_claude(str(_spawn_cwd))).glob("*.jsonl")}
+                except Exception:
+                    _sp_pre_files = set()
+                _sp_cmd = (["claude", "--dangerously-skip-permissions"]
+                           + _hub_mcp_spawn_args(proj_id, _new_assigned)
+                           + _sp_resume_args + _get_project_model(proj_id))
+                subprocess.Popen(["tmux", "new-session", "-d", "-s", _new_assigned, "-c", _spawn_cwd]
+                                 + _sp_env + _sp_cmd)
+                _capture_live_session_id_bg(proj_id, _spawn_cwd, _new_assigned, _sp_pre_files)
+                # M1656-R8 (user decision): no server-side compact gating — Claude's
+                # built-in auto-compact (CLAUDE_AUTOCOMPACT_PCT_OVERRIDE) handles full context.
+                # M1678: readiness-gated unified wake (was blind send-keys during boot)
+                threading.Thread(target=_spawn_wake_when_ready,
+                                 args=(_new_assigned, proj_id), daemon=True).start()
+                _server_log_action(proj_id, ns_id, "exec:assign_spawn", _new_assigned)
+                # Grace window: M1095 poller skips clearing for 60s after fresh spawn
+                ns["spawning_grace_until"] = time.time() + 60
+                proj["north_stars"] = ns_list
+                _save_project(proj_id, proj)
+                # Register idle in OOB so poller can immediately wake
+                _agent_busy_sessions[_new_assigned] = {
+                    "proj_id": proj_id, "busy": False,
+                    "reason": "assign_spawn_init", "ts": time.time()
+                }
+                _ns_push("session_update", proj_id=proj_id)
+        except Exception as _e:
+            _server_log_action(proj_id, ns_id, "exec:assign_spawn_err", str(_e)[:120])
+
     # M1469: sync CG node name when substar name changes
     # substar id = "cg_<node_id>"; strip "cg_" prefix to get CG node_id
     if "name" in data:
@@ -6081,6 +6764,113 @@ async def get_milestones(proj_id: str, request: Request):
             m.pop("conversation", None)
     return JSONResponse({"ok": True, "milestones": milestones},
                         headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/northstar/{proj_id}/claim-task")
+async def claim_task_for_session(proj_id: str, request: Request):
+    """M1656-③: atomically claim the next queued stone for a session.
+    POST body: {"session_name": "claude-exec-MOAT-M1656"}
+    Priority: stones whose substar is assigned to session_name first, then free-pool stones.
+    Claim = claimed_by_session + claimed_at fields with 120s TTL — status stays 'queued'
+    (UI has no 'in_progress' renderer; status mutation would hide the stone from the table)."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    session_name = (body.get("session_name") or "").strip()
+
+    conn = sqlite3.connect(str(_NS_EVENTS_DB))
+    try:
+        # Fetch all queued stones for project
+        rows = conn.execute(
+            "SELECT data_json FROM milestones_store WHERE proj_id=? AND status='queued' ORDER BY rowid",
+            (proj_id,)
+        ).fetchall()
+        stones = [json.loads(r[0]) for r in rows]
+        # Filter: not held, has text, and not claimed by ANOTHER session within TTL (120s)
+        _claim_ttl = 120.0
+        _now_c = time.time()
+
+        def _claim_blocked(m: dict) -> bool:
+            _cb = (m.get("claimed_by_session") or "").strip()
+            _ca = m.get("claimed_at") or 0
+            return bool(_cb and _cb != session_name and (_now_c - _ca) < _claim_ttl)
+
+        candidates = [m for m in stones
+                      if not m.get("held") and str(m.get("text", "")).strip()
+                      and not _claim_blocked(m)]
+
+        # M1656-③ v2: stones link to sessions via substar_id → substar.assigned_session
+        # (stones do NOT carry assigned_session directly — that field lives on substars)
+        _proj = _db_load_project(proj_id) or {}
+        _substar_session: dict = {}   # substar_id → assigned_session
+        for _ns in (_proj.get("north_stars") or []):
+            if isinstance(_ns, dict) and _ns.get("id"):
+                _substar_session[_ns["id"]] = (_ns.get("assigned_session") or "").strip()
+
+        def _stone_session(m: dict) -> str:
+            """Resolve which session a stone belongs to via its substar."""
+            _sid = (m.get("substar_id") or "").strip()
+            return _substar_session.get(_sid, "") if _sid else ""
+
+        # M1656-R4: children claim ONLY their own substar's stones. The free pool
+        # (no substar / unassigned substar) belongs to the MAIN session — a mother's
+        # stone must be worked by the mother, never work-stolen by an idle child.
+        _ag_c, _pid_c = _parse_exec_session_name(session_name) if session_name else ("", "")
+        _is_child_session = bool(_pid_c) and session_name != f"{_ag_c}-exec-{_pid_c}"
+
+        stone = None
+        if session_name:
+            # First: stones whose substar is assigned to this session
+            for m in candidates:
+                if _stone_session(m) == session_name:
+                    stone = m
+                    break
+            # Second (MAIN session only): free-pool stones (no substar / unassigned substar)
+            if stone is None and not _is_child_session:
+                for m in candidates:
+                    if not _stone_session(m):
+                        stone = m
+                        break
+            # NOTE: stones assigned to OTHER sessions are never returned to this session
+        else:
+            # No session context — return first queued (original behaviour)
+            stone = candidates[0] if candidates else None
+
+        if stone is None:
+            conn.close()
+            return JSONResponse({"has_task": False, "queued_count": 0})
+
+        # Claim via TTL fields only — status remains 'queued' (UI-safe)
+        # M1656-⑥ atomicity: conditional UPDATE guards against concurrent claims —
+        # two sessions POSTing within the same second both passed the read-time filter
+        # (observed 14:51:29 dual-claim). The WHERE clause re-checks the stored JSON's
+        # claim fields so only ONE writer wins; the loser retries the next candidate.
+        stone_id = stone.get("id", "")
+        _prev_json = json.dumps(stone, ensure_ascii=False)  # pre-claim serialization for CAS
+        stone["claimed_by_session"] = session_name
+        stone["claimed_at"] = _now_c
+        cur = conn.execute(
+            "UPDATE milestones_store SET data_json=? WHERE proj_id=? AND stone_id=? AND data_json=?",
+            (json.dumps(stone, ensure_ascii=False), proj_id, stone_id, _prev_json)
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            # Lost the race — another session claimed/modified this stone between our
+            # read and write. Return no-task; caller's next poll re-evaluates.
+            conn.close()
+            _server_log_action(proj_id, stone_id, "task:claim_race_lost", f"session:{session_name}")
+            return JSONResponse({"has_task": False, "queued_count": len(candidates),
+                                 "race_lost": True})
+        conn.close()
+        _server_log_action(proj_id, stone_id, "task:claimed", f"session:{session_name}")
+        return JSONResponse({"has_task": True, "stone": stone, "queued_count": len(candidates)})
+    except Exception as e:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
 @app.get("/api/northstar/{proj_id}/active-milestones")
@@ -6555,6 +7345,34 @@ async def create_milestone(proj_id: str, request: Request, background_tasks: Bac
     # M1211: stamp server blink on creation — new stone needs user attention
     _blink_skey_create = new_ms.get("substar_id") or "__ungrouped__"
     _mark_blink_server(proj_id, _blink_skey_create, new_id)
+    # M1673: instant dispatch on stone creation. An already-idle session otherwise waits
+    # for the 10s poller AND the 90s wake dedup (measured 80s queue→claim when a wake
+    # fired just before creation). Wake the target session directly when it is alive,
+    # idle, and unwatched — same gates as the queue-continuation poller.
+    if new_ms.get("status") == "queued" and not new_ms.get("held"):
+        _ns_list_cw = proj.get("north_stars") or []
+        _assigned_cw = ""
+        for _ns_cw in _ns_list_cw:
+            if isinstance(_ns_cw, dict) and _ns_cw.get("id") == new_ms.get("substar_id"):
+                _assigned_cw = (_ns_cw.get("assigned_session") or "").strip()
+                break
+        _agent_cw = _get_project_agent_value(proj_id)
+        _target_cw = _assigned_cw or f"{_agent_cw}-exec-{proj_id}"
+
+        def _stone_create_dispatch(_sn=_target_cw, _pid=proj_id, _mid=new_id):
+            try:
+                # M1678: alive/attached/busy gates unified inside _send_exec_wake.
+                # Coalesce rapid stone bursts: bypass the 90s dedup only when the last
+                # wake to this session is >10s old; within 10s the first wake suffices
+                # (session drains the queue via task_complete immediate dispatch).
+                _force = (time.time() - _wake_last_sent.get(_sn, 0.0)) > 10
+                if _send_exec_wake(_sn, _pid, force_dedup_reset=_force):
+                    _server_log_action(_pid, _mid, "exec:create_wake",
+                                       f"session:{_sn} force_dedup_reset:{_force}")
+            except Exception:
+                pass
+
+        background_tasks.add_task(_stone_create_dispatch)
     return JSONResponse({"ok": True, "milestone": new_ms})
 
 
@@ -6765,6 +7583,13 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                             _fid_m = _re.search(r"/file/d/([^/]+)", data[k])
                             if _fid_m:
                                 _gdrive_name_cache[_fid_m.group(1)] = _ev_fname
+                        # M1697: soft warning (UI-visible, non-blocking) when evidence_url
+                        # is accepted (survived the M1327 file:// check above) but no
+                        # filename hint came with it — badge will depend entirely on the
+                        # async /api/gdrive-filename fallback, which can fail under GDrive
+                        # API quota pressure (root cause of the M1694 incident).
+                        if data[k] and not _ev_fname:
+                            m.setdefault("_proof_warning", "M1697:evidence_url attached without evidence_filename — badge display depends on a live GDrive API lookup that can fail under quota pressure; pass evidence_filename to avoid this.")
                     # M1253: bump summary_state when conversation_summary is replaced.
                     if k == "conversation_summary" and data[k] and data.get("summary_state_bump"):
                         _conv_len_now = len(m.get("conversation") or [])
@@ -6894,15 +7719,128 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                                     f"\"allow_stale\":true in the body to override (M780.2)."
                                 ),
                             }, status_code=422)
+                        # M1709: Group-A hard-reject for reply length — mirrors the M780.2
+                        # pattern exactly (422 + retry, not a schema hint). Threshold is 3
+                        # lines, matching the convention already documented everywhere else in
+                        # this file (M172, M780.3, M270 TOKEN DISCIPLINE — all say "≤3-line");
+                        # the reply_to_stone tool schema's stricter "max 1 line" is description
+                        # text only and was proven unenforced this session (long prose replies
+                        # went through anyway, M1709/M110 screenshot). Deliberately scoped to a
+                        # MECHANICALLY verifiable rule (raw newline count) — semantic rules
+                        # ("is this a real direct answer") stay unenforced by design (M1706:
+                        # Group B, would need a second LLM judge call, not worth the FP rate).
+                        # allow_long_reply:true overrides for legitimate long analyses.
+                        # M1709-b: temporarily disabled per user request — the pure line-count
+                        # gate was proven to false-positive on legitimate well-structured replies
+                        # (RobotAI spot_voice_pipeline example: 8 real lines, clean per-item
+                        # bullets, blocked identically to unstructured prose since the gate only
+                        # counts newlines and has no concept of bullet/list markers). Re-enable
+                        # by flipping this flag once a marker-aware exception is designed, or
+                        # remove entirely if the length-only approach is abandoned.
+                        _LINE_GATE_ENABLED = False
+                        _len_text = str(msg.get("text", ""))
+                        _len_lines = [l for l in _len_text.split("\n") if l.strip()]
+                        _allow_long_reply = bool(data.get("allow_long_reply"))
+                        if _LINE_GATE_ENABLED and len(_len_lines) > 3 and not _allow_long_reply:
+                            try:
+                                _server_log_action(proj_id, mid, "reply_line_limit_blocked",
+                                                   f"{len(_len_lines)} lines")
+                            except Exception:
+                                pass
+                            return JSONResponse({
+                                "ok": False,
+                                "error": "reply_line_limit_blocked",
+                                "line_count": len(_len_lines),
+                                "detail": (
+                                    f"Reply has {len(_len_lines)} lines — max 3 lines for stone "
+                                    f"chat replies (M172/M270 convention). Condense, or set "
+                                    f"\"allow_long_reply\":true in the body to override (M1709)."
+                                ),
+                            }, status_code=422)
                     # M185/M1064 v2: line-summary — extract key lines, skip blanks
                     # M1161 v3: first-line bias raised 1→8 so the direct answer (line 0) survives
                     # compression. Faithfulness gate ensures line 0 is always kept when no Q-token
                     # appears in any chosen line. Last-line bias stays 1 (summary/next-action).
-                    _MAX_LINES = 6  # M1654: reduced from 12 — chatbox UX 5-6 lines per screen
+                    # M1701: disabled provisionally — code-fence unit not grouped atomically
+                    # (same bug class M1692 fixed for tables), reproduced live via
+                    # test_stone_compression.py. Re-enable (set True) once _group_table_units
+                    # is generalized to _group_structural_units (tables + code fences + lists).
+                    _STONE_COMPRESSION_ENABLED = False
+                    _MAX_LINES = 6 if _STONE_COMPRESSION_ENABLED else 10**9  # M1664: restored 12→6 per user request
                     _text = str(msg.get("text", ""))
+                    # M1687: the entire line-count gate below is blind to LINE LENGTH — a single
+                    # 1000-char sentence with zero \n counts as "1 line" and sails through
+                    # untouched, rendering as an unreadable prose wall on mobile (user-reported,
+                    # screenshot-confirmed). Force-split any unbroken run longer than
+                    # _SOFT_WRAP_CHARS onto natural clause boundaries BEFORE the line-count logic
+                    # runs, so a long reply gets real lines to compress/display instead of one blob.
+                    # Client renderer already converts \n→<br> (_renderNtTextHtml) — this only
+                    # adds the \n that was missing, it doesn't change rendering behavior.
+                    _SOFT_WRAP_CHARS = 80
+                    if _STONE_COMPRESSION_ENABLED and "\n" not in _text and len(_text) > _SOFT_WRAP_CHARS:
+                        import re as _re_wrap
+                        # Primary split: sentence/clause-ending punctuation followed by a space —
+                        # covers Korean (다./음./함. 등 + —) and English (. ! ? followed by space).
+                        _clauses = _re_wrap.split(r'(?<=[.!?다음함音—])\s+(?=\S)', _text)
+                        # Secondary: a clause that STILL runs far over budget (long comma-chained
+                        # run-on with no sentence-ending punctuation in between — the common case
+                        # in dense technical replies) also splits on comma+space.
+                        _expanded = []
+                        for _cl in _clauses:
+                            if len(_cl) > _SOFT_WRAP_CHARS * 1.5:
+                                _expanded.extend(_re_wrap.split(r'(?<=,)\s+(?=\S)', _cl))
+                            else:
+                                _expanded.append(_cl)
+                        _wrapped_lines = []
+                        _buf = ""
+                        for _cl in _expanded:
+                            if not _cl:
+                                continue
+                            if _buf and len(_buf) + 1 + len(_cl) > _SOFT_WRAP_CHARS:
+                                _wrapped_lines.append(_buf)
+                                _buf = _cl
+                            else:
+                                _buf = f"{_buf} {_cl}" if _buf else _cl
+                        if _buf:
+                            _wrapped_lines.append(_buf)
+                        # Only apply if splitting actually produced multiple lines — a single
+                        # clause longer than _SOFT_WRAP_CHARS with no punctuation at all stays
+                        # as-is rather than being cut mid-word.
+                        if len(_wrapped_lines) > 1:
+                            _text = "\n".join(_wrapped_lines)
+                            msg["text"] = _text
                     _all_lines = _text.split("\n")
                     _non_empty = [l for l in _all_lines if l.strip()]
-                    if len(_non_empty) > _MAX_LINES:
+                    # M1692: markdown tables were getting gutted by this compressor — table
+                    # rows (e.g. "| /venv | ~8GB |") share almost no word-tokens with the
+                    # user's question, so the Q-anchor scorer ranks them lowest and drops
+                    # them first, leaving an orphaned header+separator with no data rows
+                    # (observed live: a real capacity-estimate table survived as
+                    # "| 항목 | 크기 |\n|------|------|" with every data row deleted —
+                    # worse than no table, since it now reads as broken rather than short).
+                    # Fix: group contiguous "|"-prefixed lines into one atomic UNIT up front
+                    # (before the length gate, so the gate itself sees post-grouping counts —
+                    # otherwise a message that's short in units but long in raw table rows
+                    # would wrongly enter the truncation path and hit the overlapping
+                    # head+tail fallback slice). A table then counts as ONE candidate against
+                    # _MAX_LINES and is kept or dropped as a whole — never split into a
+                    # headless/bodyless stub.
+                    def _group_table_units(_lines):
+                        _units = []
+                        _i = 0
+                        while _i < len(_lines):
+                            if _lines[_i].lstrip().startswith("|"):
+                                _j = _i
+                                while _j < len(_lines) and _lines[_j].lstrip().startswith("|"):
+                                    _j += 1
+                                _units.append("\n".join(_lines[_i:_j]))
+                                _i = _j
+                            else:
+                                _units.append(_lines[_i])
+                                _i += 1
+                        return _units
+                    _units = _group_table_units(_non_empty)
+                    if len(_units) > _MAX_LINES:
                         _chosen = None
                         # Q-anchored top-N (claude responses only)
                         if msg.get("role") == "claude":
@@ -6918,25 +7856,32 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                                     return set(t for t in _re_qa.findall(r"[\w가-힣]+", (s or "").lower()) if len(t) > 1)
                                 _q_tokens = _toks(_q_text)
                                 if _q_tokens:
-                                    _n_lines = len(_non_empty)
+                                    _n_units = len(_units)
                                     _scored = []
-                                    for _idx, _ln in enumerate(_non_empty):
-                                        _ov = len(_q_tokens & _toks(_ln))
+                                    for _idx, _un in enumerate(_units):
+                                        _is_table = _un.lstrip().startswith("|")
+                                        _ov = len(_q_tokens & _toks(_un))
                                         # M1161 v3: first-line bias 1→8 so direct answer survives
-                                        _bias = (8 if _idx == 0 else 0) + (1 if _idx == _n_lines - 1 else 0)
-                                        _scored.append((_idx, _ln, _ov * 10 + _bias))
+                                        _bias = (8 if _idx == 0 else 0) + (1 if _idx == _n_units - 1 else 0)
+                                        # M1692: small structural bias so a table unit isn't
+                                        # automatically last-ranked purely for having 0 word-tokens
+                                        # (table cells are labels/numbers, not prose) — still loses
+                                        # to any unit with a real Q-token hit, just not to every
+                                        # zero-overlap prose line by tie-breaking order.
+                                        _bias += 2 if _is_table else 0
+                                        _scored.append((_idx, _un, _ov * 10 + _bias))
                                     _top = sorted(_scored, key=lambda x: -x[2])[:_MAX_LINES]
                                     _top_ordered = sorted(_top, key=lambda x: x[0])
                                     _chosen = [t[1] for t in _top_ordered]
                                     # Faithfulness gate: if line 0 was dropped and no Q-token
                                     # in any chosen line, prepend line 0 as direct-answer anchor.
                                     _chosen_set = set(t[0] for t in _top)
-                                    _has_q_hit = any(len(_q_tokens & _toks(_ln)) > 0 for _ln in _chosen)
+                                    _has_q_hit = any(len(_q_tokens & _toks(_un)) > 0 for _un in _chosen)
                                     if 0 not in _chosen_set and not _has_q_hit:
-                                        _chosen = [_non_empty[0]] + _chosen[:_MAX_LINES - 1]
+                                        _chosen = [_units[0]] + _chosen[:_MAX_LINES - 1]
                         if _chosen is None:
                             # Fallback: head + tail (preserve flow when no Q-anchor)
-                            _chosen = _non_empty[: _MAX_LINES // 2] + _non_empty[-(_MAX_LINES - _MAX_LINES // 2):]
+                            _chosen = _units[: _MAX_LINES // 2] + _units[-(_MAX_LINES - _MAX_LINES // 2):]
                         msg["text"] = "\n".join(_chosen[:_MAX_LINES])
                         msg["truncated"] = True
                     else:
@@ -7101,9 +8046,23 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                         _maybe_queue_compress(proj_id, m, milestones)
                     # M225: skip REPLY SYNC dispatch if stone is held (zero claude token spend on held).
                     if msg.get("role") == "user" and not m.get("done") and not m.get("held"):
-                        session_name = _live_exec_session_name(proj_id)
+                        # M131-b: resolve the session that OWNS this stone's substar — was
+                        # _live_exec_session_name(proj_id), which always returns the MAIN
+                        # session first regardless of ownership (see _exec_session_names:
+                        # main is index 0, children appended after). That woke the mother on
+                        # every user reply to a CHILD-owned stone (e.g. FromScratch/cg_vla),
+                        # even though /execute's own branched-split logic correctly resolves
+                        # ownership via substar.assigned_session. Mirror that resolution here.
+                        _sid_own = (m.get("substar_id") or "").strip()
+                        _owner_sess = ""
+                        if _sid_own:
+                            for _ns_own in (proj.get("north_stars") or []):
+                                if isinstance(_ns_own, dict) and _ns_own.get("id") == _sid_own:
+                                    _owner_sess = (_ns_own.get("assigned_session") or "").strip()
+                                    break
+                        session_name = _owner_sess or _live_exec_session_name(proj_id)
                         check = await asyncio.to_thread(  # M1345
-                            subprocess.run, ["tmux", "has-session", "-t", session_name], capture_output=True, timeout=2)
+                            subprocess.run, ["tmux", "has-session", "-t", f"={session_name}"], capture_output=True, timeout=2)
                         # M523: always write REPLY SYNC queue entry regardless of session state.
                         # Previously gated on check.returncode==0 — but when no exec session is
                         # running, the entry was silently dropped, leaving user comments unanswered
@@ -7150,7 +8109,8 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                         # 90s cooldown never blocks a user comment wake.
                         if check.returncode == 0:
                             try:
-                                _oob_idle = not _oob_is_busy(proj_id)
+                                # M1656-fix (option②): check this specific session's own reported state.
+                                _oob_idle = not _oob_is_busy(proj_id, session_name)
                                 if _oob_idle:
                                     if _send_exec_wake(session_name, proj_id, force_dedup_reset=True):
                                         _ns_push("session_running", proj_id=proj_id, kind="exec")
@@ -7164,6 +8124,12 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                 m["done"] = False
                 if new_status == "queued":
                     m.setdefault("queued_at", now_iso)
+                    # M1702-b: record how this stone became queued. "badge" = user clicked the
+                    # queue-toggle button (client sends queue_source:"badge" — see northstar.html
+                    # toggleQueueStatus). The fork-protocol poller (below, _find_unassigned_substars
+                    # region / ~L4631) reads this to decide whether "queued, no session" should
+                    # auto-spawn a session or wait for the explicit dispatch button.
+                    m["queue_source"] = data.get("queue_source") or ""
                     # M511: redo_count — increments when a completed stone is re-queued
                     if _prev_status in ("pending_confirmation", "done"):
                         m["redo_count"] = (m.get("redo_count") or 0) + 1
@@ -7243,8 +8209,18 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                     _ev_url = data.get("evidence_url") or m.get("evidence_url") or ""
                     # Strip PASTE attachment paths before keyword check — filenames like
                     # "스크린샷_....png" inside PASTE/.../PASTE blocks would falsely trigger.
+                    # M1709: the client wraps the sentinel in PUA chars (_PASTE_OPEN/_CLOSE =
+                    # 'PASTE' / '/PASTE', northstar.html) but this regex
+                    # only matched the bare 'PASTE/...  /PASTE' string — the PUA wrapper broke the
+                    # literal 'PASTE/' adjacency, so the strip silently no-op'd on every real
+                    # attachment and a filename like "스크린샷_*.png" leaked straight through into
+                    # the Layer A keyword check. Verified live: M1709's own stone text triggered
+                    # a false LAYER_A_BLOCKED for a pure Q&A task with no artifact to upload.
+                    # Fixed with a wrapper-agnostic pattern (optional \S either side of the
+                    # PASTE/…/PASTE markers, non-greedy body) — strips both the current PUA-
+                    # wrapped sentinel and the legacy bare-string sentinel in older stone text.
                     import re as _re_ev
-                    _stone_txt = _re_ev.sub(r'PASTE/\S+/PASTE', '', (m.get("text") or "")).lower()
+                    _stone_txt = _re_ev.sub(r'\S?PASTE\S?.*?\S?/PASTE\S?', '', (m.get("text") or ""), flags=_re_ev.S).lower()
                     # M1265: Layer A (artifact nouns) → force required; Layer B (action verbs) → warning only
                     # 결과물/산출물 → Layer B: generic output nouns, not file-specific; false positives too high
                     _layer_a_keywords = (
@@ -7606,15 +8582,31 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
     if _queuing_now:
         _save_project(proj_id, proj)
         # M1533 v6: new stone queued → if agent is idle, fire immediate wake (no 10s poll wait)
-        _agent_idle = not _oob_is_busy(proj_id)  # M1574: TTL-aware
+        # M131-b: resolve the OWNING session for this stone's substar first — was always
+        # targeting {agent}-exec-{proj_id} (main only; the loop's `== proj_id` match never
+        # matches a branched child name like claude-exec-FromScratch-1d987699), so a user
+        # reply that reopens a CHILD-owned stone always woke the MOTHER instead, regardless
+        # of ownership. Mirrors /execute's _owner_session resolution.
+        _sid_qd = (updated_m.get("substar_id") or "").strip() if updated_m else ""
+        _owner_sess_qd = ""
+        if _sid_qd:
+            for _ns_qd in (proj.get("north_stars") or []):
+                if isinstance(_ns_qd, dict) and _ns_qd.get("id") == _sid_qd:
+                    _owner_sess_qd = (_ns_qd.get("assigned_session") or "").strip()
+                    break
+        _agent_idle = not _oob_is_busy(proj_id, _owner_sess_qd or None)  # M1574: TTL-aware, session-scoped
         if _agent_idle:
             # M1633-fix: reopen path (prev status was non-queued, e.g. pending_confirmation→queued
             # via user comment) must reset dedup so the stone is dispatched immediately even if a
             # wake was sent within the last 90s. Pure new-stone-queue keeps force_dedup_reset=False
             # to avoid rapid re-injection (M1585 v5).
             _is_reopen = (_blink_old_status or "") not in ("queued", "")
-            def _queued_dispatch():
+            def _queued_dispatch(_owner=_owner_sess_qd):
                 try:
+                    if _owner:
+                        if _tmux_session_alive(_owner):
+                            _send_exec_wake(_owner, proj_id, force_dedup_reset=_is_reopen)
+                        return
                     ls = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"], capture_output=True, text=True, timeout=2)
                     for sn in (ls.stdout or "").splitlines():
                         sn = sn.strip()
@@ -7958,7 +8950,7 @@ async def get_tmux_output(proj_id: str, lines: int = 20, tmux_session: str = "")
         return JSONResponse({"ok": False, "running": False, "output": "", "error": "invalid_session_name"}, status_code=400)
     # Check if session exists
     check = await asyncio.to_thread(
-        subprocess.run, ["tmux", "has-session", "-t", session_name], capture_output=True, timeout=2)
+        subprocess.run, ["tmux", "has-session", "-t", f"={session_name}"], capture_output=True, timeout=2)
     if check.returncode != 0:
         return JSONResponse({"ok": False, "running": False, "output": ""})
     # Capture pane output
@@ -7998,7 +8990,7 @@ async def get_task_board(proj_id: str):
     # Fallback to first-queued heuristic when OOB has no running stone.
     session_name = _live_exec_session_name(proj_id)
     check = await asyncio.to_thread(
-        subprocess.run, ["tmux", "has-session", "-t", session_name], capture_output=True, timeout=2)
+        subprocess.run, ["tmux", "has-session", "-t", f"={session_name}"], capture_output=True, timeout=2)
     if check.returncode == 0:
         # M1368: SQLite-first
         proj = _db_load_project(proj_id)
@@ -8011,7 +9003,7 @@ async def get_task_board(proj_id: str):
             # M1579 Phase 2: OOB-based running stone detection (replaces Claude Code pane-scrape).
             # get_pending_task MCP call POSTs stone_id to /api/agent-busy → _session_running_stone.
             # Harness-agnostic: works for any agent type (Claude Code, codex, hermes, etc).
-            live_running_id = _session_running_stone.get(proj_id) or None
+            live_running_id = _first_running_stone(proj_id)  # M1656-R: derived from session records
 
             queued_ids = {m["id"] for m in queued_ms}
             for i, m in enumerate(queued_ms):
@@ -8344,29 +9336,26 @@ async def execute_project(proj_id: str, request: Request):
                 if _old_branches:
                     _stale_agent_found = True
                     break
-        # M1564: also kill same-agent branch sessions — enforce single session per project.
-        # Branch sessions match {agent}-exec-{proj_id}-* (hyphen suffix). Main session
-        # ({agent}-exec-{proj_id} exactly) is NOT killed here — inject path reuses it.
+        # M1564 REMOVED (M1656-R5): same-agent branch sessions are legitimate CHILDREN
+        # under the multi-session architecture — "single session per project" no longer
+        # holds. This trigger made a child-stone dispatch kill the healthy mother
+        # (observed 17:50:33: mother killed the moment a child queue was processed).
+        # M1569 (M1656-R5): stale detection counts only MAIN sessions across agents —
+        # e.g. claude-exec-X + openrouter-exec-X both alive = stale. Mother + her own
+        # children is the NORMAL state, never stale.
         if not _stale_agent_found:
-            _same_agent_base = f"{agent}-exec-{proj_id}-"
-            _same_agent_branches = [s for s in _live_sessions if s.startswith(_same_agent_base)]
-            if _same_agent_branches:
-                _stale_agent_found = True
-        # M1569: also kill if multiple sessions exist for same proj_id regardless of agent prefix
-        # e.g. both claude-exec-X and openrouter-exec-X alive simultaneously
-        if not _stale_agent_found:
-            _all_proj_sessions = [s for s in _live_sessions
-                                  if any(s.startswith(f"{a}-exec-{proj_id}") for a in ("claude", "openrouter", "codex", "dsk"))]
-            if len(_all_proj_sessions) > 1:
+            _main_names = [f"{a}-exec-{proj_id}" for a in ("claude", "openrouter", "codex", "dsk")]
+            _alive_mains = [s for s in _live_sessions if s in _main_names]
+            if len(_alive_mains) > 1:
                 _stale_agent_found = True
         if _stale_agent_found:
-            _kill_all_exec_sessions(proj_id)  # now includes branches via tmux scan (M858)
+            _kill_all_exec_sessions(proj_id, spare_children=True)  # M1656-R3: mother respawn must not kill children
         proj_dir = _get_project_dir(proj_id) or str(Path.home() / "Project" / proj_id)
 
         # M1096: badge-triggered execute must NOT spawn a dead session — only dispatch button may.
         if from_badge:
             _badge_check = await asyncio.to_thread(  # M1345
-                subprocess.run, ["tmux", "has-session", "-t", session_name], capture_output=True, timeout=2)
+                subprocess.run, ["tmux", "has-session", "-t", f"={session_name}"], capture_output=True, timeout=2)
             if _badge_check.returncode != 0:
                 # Session is dead — badge cannot spawn. Return "no-op" so badge does not hang.
                 return JSONResponse({"ok": True, "status": "badge_no_spawn",
@@ -8374,7 +9363,7 @@ async def execute_project(proj_id: str, request: Request):
 
         # M24/M123/M125: if tmux session exists, verify Claude is alive before injecting
         existing = await asyncio.to_thread(  # M1345
-            subprocess.run, ["tmux", "has-session", "-t", session_name], capture_output=True, timeout=2)
+            subprocess.run, ["tmux", "has-session", "-t", f"={session_name}"], capture_output=True, timeout=2)
         if existing.returncode == 0:
             # M123: check Claude process is alive (not just a bare shell after Claude exited)
             _pane_cmds = (await asyncio.to_thread(  # M1345
@@ -8389,15 +9378,18 @@ async def execute_project(proj_id: str, request: Request):
                     # Codex does not use the Claude Stop-hook queue path. Restart the
                     # live tmux session so the execute prompt can be re-injected cleanly.
                     await asyncio.to_thread(  # M1345
-                        subprocess.run, ["tmux", "kill-session", "-t", session_name], capture_output=True, timeout=5)
+                        subprocess.run, ["tmux", "kill-session", "-t", f"={session_name}"], capture_output=True, timeout=5)
                 else:
                     # M206: kill and restart if user selected different options (agent/model/session)
                     # vs what the current session was spawned with. If same → reuse.
+                    # M1685-j: was reading .last-spawn-info.json (legacy mirror, only updated for
+                    # _key=="_main" — stale since M1656-R9 session-scoped keying, see fix at
+                    # _update_session_history_from_transcript call site). Use the session-scoped
+                    # reader so _cur_model reflects what THIS session actually spawned with.
                     _options_changed = False
-                    _spawn_info_file = PROJECTS_DIR / proj_id / ".last-spawn-info.json"
-                    if _spawn_info_file.exists():
+                    _si = _read_spawn_info(proj_id, session_name)
+                    if _si:
                         try:
-                            _si = json.loads(_spawn_info_file.read_text())
                             _cur_agent = _si.get("agent", "claude")
                             _cur_model = _si.get("model", "")
                             _cur_sid   = _si.get("from_id") or ""
@@ -8415,8 +9407,8 @@ async def execute_project(proj_id: str, request: Request):
                     # currently running tmux session when the user selected Fresh or a
                     # specific prior session from the UI; restart below with that choice.
                     if explicit_session_id or _options_changed:
-                        # M206: kill ALL agent-prefixed sessions to prevent duplicate panes
-                        _kill_all_exec_sessions(proj_id)
+                        # M206: kill agent-prefixed sessions to prevent duplicate panes
+                        _kill_all_exec_sessions(proj_id, spare_children=True)  # M1656-R3
                     else:
                         # Session alive with Claude running — inject trigger if milestones need attention
                         # M160: skip stones whose last conversation entry is from claude (awaiting user reply)
@@ -8633,24 +9625,21 @@ async def execute_project(proj_id: str, request: Request):
                             if (_main_owned_q or new_pending) and not _skip_exec_sync:
                                 with _qf.open("a", encoding="utf-8") as _qh:
                                     _qh.write(_entry + "\n")
-                                # M1533 v5: OOB-first wake — pane-scrape removed (non-universal across agents).
-                                # If OOB reports busy → skip. Otherwise optimistically inject (all agent types).
+                                # M1678: busy/attached/alive gates live inside _send_exec_wake
+                                # (single choke point) — no outer pre-check needed here.
+                                # M131: force_dedup_reset=True — _main_owned_q/new_pending is
+                                # confirmed non-empty, so a stale wake_sent hold from an earlier
+                                # courtesy boot-wake (found nothing queued, went idle) must not
+                                # block this now-genuinely-needed wake.
                                 try:
-                                    if not _oob_is_busy(proj_id):  # M1574: TTL-aware
-                                        if _send_exec_wake(session_name, proj_id):
-                                            _wake_sent = True
-                                            _ns_push("session_running", proj_id=proj_id, kind="exec")
-                                            _ns_push("milestone_updated", proj_id=proj_id)  # M1649: q-badge sync on dispatch
+                                    if _send_exec_wake(session_name, proj_id, force_dedup_reset=True):
+                                        _wake_sent = True
+                                        _ns_push("session_running", proj_id=proj_id, kind="exec")
+                                        _ns_push("milestone_updated", proj_id=proj_id)  # M1649: q-badge sync on dispatch
                                 except Exception:
                                     pass
-                                # M1648: pre-set dispatch sentinel so idle detector doesn't fire
-                                # during the startup gap before get_pending_task sets the real stone_id.
-                                # get_pending_task will overwrite with the actual stone_id.
-                                # M1655: only set sentinel when there are actual queued stones.
-                                if not _session_running_stone.get(proj_id) and _main_owned_q:
-                                    _first_qid = _main_owned_q[0].get("id", "__dispatching__")
-                                    _session_running_stone[proj_id] = _first_qid
-                                    _session_running_stone_ts[proj_id] = time.time()
+                                # M1656-R: dispatch-gap coverage now lives in _send_exec_wake's
+                                # 90s dedup — no pre-set sentinel needed (removed __dispatching__).
                             _trigger_sent = True
                             # M837 fix Stage 1: wake each branched session that owns queued stones.
                             # M858 Stage 2: dead branched sessions → spawn them.
@@ -8668,7 +9657,18 @@ async def execute_project(proj_id: str, request: Request):
                             for _br_sess, _br_stones in _branched_q_by_sess.items():
                                 try:
                                     _br_check = await asyncio.to_thread(  # M1345
-                                        subprocess.run, ["tmux", "has-session", "-t", _br_sess], capture_output=True, timeout=2)
+                                        subprocess.run, ["tmux", "has-session", "-t", f"={_br_sess}"], capture_output=True, timeout=2)
+                                    if _br_check.returncode != 0 and from_badge:
+                                        # M1702: the from_badge no-spawn guard (M1096, line ~9281)
+                                        # only checked the MAIN session — this branched-session
+                                        # spawn path (M858 Stage 2, added later) had no from_badge
+                                        # check at all, so simply queuing a stone whose substar is
+                                        # assigned to a dead child session silently spawned that
+                                        # child even though the click was just a queue-toggle, not
+                                        # the explicit dispatch button. Skip exactly like the main
+                                        # session does — badge cannot spawn, only dispatch can.
+                                        _server_log_action(proj_id, "", "exec:branch_badge_no_spawn", _br_sess)
+                                        continue
                                     if _br_check.returncode != 0:
                                         # M858 Stage 2: session dead → write prompt and spawn
                                         _br_short = _br_sess[-12:]
@@ -8692,24 +9692,43 @@ async def execute_project(proj_id: str, request: Request):
                                             "-e", f"CLAUDE_CODE_TASK_LIST_ID=hub-exec-{proj_id}-{_br_short}",
                                             "-e", f"NS_HUB_URL=http://{_tailscale_interface_ip()}:{PORT}",
                                             "-e", f"NS_SESSION_KEY={_br_sess}",
+                                            "-e", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80",  # M1656-R8
                                         ]
                                         for _k, _v in _get_project_spawn_env(proj_id).items():
                                             _br_env += ["-e", f"{_k}={_v}"]
-                                        # M837: use --continue instead of --resume to avoid thinking.signature API 400 errors
-                                        _br_claude_cmd = ["claude", "--dangerously-skip-permissions", "--continue"] + _get_project_model(proj_id)
+                                        # M1656-fork: fork from MOTHER conversation (--resume <sid> --fork-session)
+                                        # so the child inherits mother context; falls back to --continue (M837-safe)
+                                        _br_resume_args = _mother_fork_args(proj_id, _br_spawn_cwd)
+                                        # M1656-R9: session-scoped spawn-info record (see assign-spawn twin fix)
+                                        _record_spawn_info(proj_id, _br_resume_args, agent="claude", session_name=_br_sess)
+                                        try:
+                                            _br_pre_files = {f.name for f in (Path.home() / ".claude" / "projects"
+                                                             / _encode_cwd_for_claude(str(_br_spawn_cwd))).glob("*.jsonl")}
+                                        except Exception:
+                                            _br_pre_files = set()
+                                        _br_claude_cmd = (["claude", "--dangerously-skip-permissions"]
+                                                          + _hub_mcp_spawn_args(proj_id, _br_sess)
+                                                          + _br_resume_args + _get_project_model(proj_id))
                                         subprocess.Popen(
                                             ["tmux", "new-session", "-d", "-s", _br_sess, "-c", _br_spawn_cwd]
                                             + _br_env + _br_claude_cmd
                                         )
+                                        _capture_live_session_id_bg(proj_id, _br_spawn_cwd, _br_sess, _br_pre_files)
                                         await asyncio.to_thread(subprocess.run, ["tmux", "set-option", "-t", _br_sess, "history-limit", "2000"], capture_output=True, timeout=2)  # M1345
-                                        await asyncio.to_thread(subprocess.run, ["tmux", "send-keys", "-t", _br_sess, "go", "Enter"], capture_output=True, timeout=2)  # M1345
+                                        # M1678: readiness-gated unified wake (was blind send-keys during boot — parked text in input box)
+                                        threading.Thread(target=_spawn_wake_when_ready,
+                                                         args=(_br_sess, proj_id), daemon=True).start()
                                         _branched_spawned.append(_br_sess)
                                         _server_log_action(proj_id, "", "exec:branch_spawned", _br_sess)
                                         continue
-                                    # M1533 v5: OOB-first — no pane-scrape for branched sessions either.
-                                    if not _oob_is_busy(proj_id):  # M1574: TTL-aware
-                                        if _send_exec_wake(_br_sess, proj_id):
-                                            _branched_wakes_sent.append(_br_sess)
+                                    # M1678: busy/attached/alive gates live inside _send_exec_wake
+                                    # (single choke point) — no outer pre-check needed here.
+                                    # M131: force_dedup_reset=True — _br_stones is confirmed
+                                    # non-empty for THIS session, so a stale wake_sent hold from
+                                    # an earlier courtesy boot-wake (found nothing queued, went
+                                    # idle) must not block this now-genuinely-needed wake.
+                                    if _send_exec_wake(_br_sess, proj_id, force_dedup_reset=True):
+                                        _branched_wakes_sent.append(_br_sess)
                                 except Exception:
                                     pass
                             _server_log_action(proj_id, "", "exec:branched_wake",
@@ -8748,7 +9767,7 @@ async def execute_project(proj_id: str, request: Request):
                         "message": f"Session spawning (age<{_spawn_grace_secs}s) — wake injected, not killed",
                     })
                 await asyncio.to_thread(  # M1345
-                    subprocess.run, ["tmux", "kill-session", "-t", session_name], capture_output=True, timeout=5)
+                    subprocess.run, ["tmux", "kill-session", "-t", f"={session_name}"], capture_output=True, timeout=5)
 
         # M250: early return if no explicitly-queued stones — skip spawning Claude entirely.
         # pending/needs_clarification stones don't need a Claude session; server already acked them.
@@ -8799,7 +9818,7 @@ async def execute_project(proj_id: str, request: Request):
                 )
                 spawn_cwd = proj_dir if Path(proj_dir).exists() else str(Path.home())
                 resume_args = _get_resume_args(proj_id, spawn_cwd, explicit_session_id, agent=agent)
-                _record_spawn_info(proj_id, resume_args, agent=agent)
+                _record_spawn_info(proj_id, resume_args, agent=agent, session_name=session_name)
                 _tmux_env = ["-e", f"NS_HUB_URL=http://{_tailscale_interface_ip()}:{PORT}"]
                 for _k, _v in _get_project_spawn_env(proj_id).items():
                     _tmux_env += ["-e", f"{_k}={_v}"]
@@ -8830,13 +9849,13 @@ async def execute_project(proj_id: str, request: Request):
                         break
                 if not _post_alive and resume_args:
                     await asyncio.to_thread(  # M1345
-                        subprocess.run, ["tmux", "kill-session", "-t", session_name], capture_output=True, timeout=5)
+                        subprocess.run, ["tmux", "kill-session", "-t", f"={session_name}"], capture_output=True, timeout=5)
                     try:
                         (PROJECTS_DIR / proj_id / ".last-session-id").unlink()
                     except Exception:
                         pass
                     resume_args = []
-                    _record_spawn_info(proj_id, resume_args, agent=agent)
+                    _record_spawn_info(proj_id, resume_args, agent=agent, session_name=session_name)
                     subprocess.Popen([
                         "tmux", "new-session", "-d", "-s", session_name,
                         "-c", spawn_cwd,
@@ -8871,7 +9890,7 @@ async def execute_project(proj_id: str, request: Request):
                         "retried": False,
                         "error": "Codex failed to start in tmux pane (pane fell back to shell).",
                     }, status_code=502)
-                subprocess.run(["tmux", "send-keys", "-t", session_name, "go", "Enter"], timeout=3)
+                _send_exec_wake(session_name, proj_id)  # M1678: unified wake (was hardcoded "go")
                 return JSONResponse({
                     "ok": True, "mode": "tmux",
                     "session": session_name,
@@ -9106,16 +10125,30 @@ async def execute_project(proj_id: str, request: Request):
                     _ss_pf = PROJECTS_DIR / proj_id / f"pending-execute-prompt-{_ss_short}.txt"
                     _ss_pf.write_text(_ss_prompt, encoding="utf-8")
 
-            # M255: kill ALL agent-prefixed sessions before spawn — prevents orphaned cross-agent sessions
+            # M255: kill agent-prefixed sessions before spawn — prevents orphaned cross-agent sessions
             # (e.g. codex-exec-FreeOS left alive when switching to claude-exec-FreeOS)
-            _kill_all_exec_sessions(proj_id)
+            # M1656-R3: children spared — cross-agent orphan children are reaped by mother-death cascade
+            _kill_all_exec_sessions(proj_id, spare_children=True)
             # M864: kill active substar sessions that have no queued work (unrelated sessions)
+            # M1656-R4: sessions ASSIGNED to a substar are deliberate children — an idle
+            # child waiting for future work must survive a mother respawn (was killed
+            # silently here with no action-log entry).
+            _assigned_now: set = set()
+            try:
+                _p864 = _db_load_project(proj_id)
+                for _ns864 in ((_p864 or {}).get("north_stars") or []):
+                    _a864 = (_ns864.get("assigned_session") or "").strip() if isinstance(_ns864, dict) else ""
+                    if _a864:
+                        _assigned_now.add(_a864)
+            except Exception:
+                pass
             _active_substars_now = _get_active_substar_sessions(proj_id)
             for _ss_short2, _ss_sname2 in _active_substars_now.items():
-                if _ss_sname2 not in _session_qs:
-                    subprocess.run(["tmux", "kill-session", "-t", _ss_sname2], capture_output=True, timeout=5)
+                if _ss_sname2 not in _session_qs and _ss_sname2 not in _assigned_now:
+                    subprocess.run(["tmux", "kill-session", "-t", f"={_ss_sname2}"], capture_output=True, timeout=5)
                     _exec_idle_count.pop(_ss_sname2, None)
                     _exec_was_running.pop(_ss_sname2, None)
+                    _server_log_action(proj_id, "", "exec:m864_stale_substar_kill", _ss_sname2)
             # M747/M792: also kill stale substar/session-key sessions before respawning
             # M824 ALIVE-BRANCH SKIP: reuse alive sessions that already have Claude running
             _alive_branch_keys: set = set()
@@ -9133,7 +10166,7 @@ async def execute_project(proj_id: str, request: Request):
                         # Session already running Claude — skip kill/respawn; will send "go" after main spawns
                         _alive_branch_keys.add(_skey)
                     else:
-                        subprocess.run(["tmux", "kill-session", "-t", _skey], capture_output=True, timeout=5)
+                        subprocess.run(["tmux", "kill-session", "-t", f"={_skey}"], capture_output=True, timeout=5)
             # Session-resume continuity (spec: docs/research/20260513-tmux-claude-session-resume-design.md MVF #2-3)
             spawn_cwd = proj_dir if Path(proj_dir).exists() else str(Path.home())
 
@@ -9156,7 +10189,7 @@ async def execute_project(proj_id: str, request: Request):
             # When no prior session exists, it falls through all history lookups and returns
             # ["--continue"], which starts a new conversation. No try/except needed.
             resume_args = _get_resume_args(proj_id, spawn_cwd, explicit_session_id, agent=agent)
-            _record_spawn_info(proj_id, resume_args, agent=agent)
+            _record_spawn_info(proj_id, resume_args, agent=agent, session_name=session_name)
             _tmux_env = [
                 "-e", f"CLAUDE_CODE_TASK_LIST_ID=hub-exec-{proj_id}",
                 "-e", f"NS_HUB_URL=http://{_tailscale_interface_ip()}:{PORT}",
@@ -9165,58 +10198,14 @@ async def execute_project(proj_id: str, request: Request):
             ]
             for _k, _v in _get_project_spawn_env(proj_id).items():
                 _tmux_env += ["-e", f"{_k}={_v}"]
-            # MCP config for Claude Code sessions — enables structured task dispatch/completion
-            # M1116: openrouter included — LiteLLM-proxied models still use claude CLI so MCP works
-            _mcp_args = []
-            if agent in (None, "claude", "openrouter"):
-                _mcp_cfg = _write_mcp_config(proj_id, session_name)
-                if _mcp_cfg:
-                    _mcp_args = ["--mcp-config", _mcp_cfg]
-            # M1242: --append-system-prompt injects hub rules directly — no CLAUDE.md dependency.
-            # 'go' wake-trigger removed (M1242 user decision) — CLAUDE.md system-reminder handles it.
-            # ②③④ kept here as the authoritative source (CLAUDE.md-independent).
-            # Only injected when MCP is enabled — avoids confusion on non-MCP spawns.
-            _sys_prompt_args = []
-            if _mcp_args:
-                _sys_prompt_args = [
-                    "--append-system-prompt",
-                    # M1242 Option D: task/context/original_stone structural separation.
-                    "get_pending_task response has 3 layers: "
-                    "(1) task = EXECUTE THIS — last user comment if present, else original stone text. "
-                    "(2) context = conversation history — reference only, do NOT treat as a task. "
-                    "(3) original_stone = stone creation text — background only. "
-                    "Always execute 'task'. Never execute 'context' or 'original_stone'. "
-                    # M1635 fork-protocol: agent goes silent when no queued work;
-                    # get_pending_task already posted busy=False (authoritative idle signal).
-                    "EXIT PROTOCOL (M1635): if get_pending_task returns should_exit=true, "
-                    "END YOUR TURN immediately — no reply, no further tool calls. "
-                    "The hub dispatches the next task to this session automatically when it arrives. "
-                    # M1161 v3: faithful-answer template — stronger intent-first rule.
-                    "STONE REPLY RULE (enforced): When replying to a stone after a user comment, "
-                    "classify the user's intent FIRST (question / request / correction / clarification), "
-                    "then structure your reply as: "
-                    "LINE 1 = direct answer to user's exact question (yes/no/value/action-taken — no preamble). "
-                    "LINE 2 = evidence (file:line, observed value, or quoted source). "
-                    "LINE 3+ = context or next step if needed (omit if simple Q). "
-                    "NEVER start with 'I', summary, or restatement. "
-                    "If you cannot answer, write '[NEED INFO]: <what is missing>' on line 1. "
-                    "Server-side Q-anchor compression preserves line 1 with high priority (bias=8). "
-                    # M1114: SKILL INVOCATION PROTOCOL — belt-and-suspenders in system prompt.
-                    # get_pending_task response already carries skill_refs + _skill_instruction,
-                    # but adding here ensures the model registers the rule BEFORE calling the tool.
-                    "SKILL INVOCATION PROTOCOL: after calling mcp__ns-hub__get_pending_task, "
-                    "if the response contains skill_refs (non-empty list), your VERY NEXT action "
-                    "MUST be Skill(skill=skill_refs[0]) — before reading task text or any other tool. "
-                    "M1565 SEQUENTIAL CHAIN: if skill_refs_remaining is present (non-empty), "
-                    "after skill_refs[0] completes call each skill in skill_refs_remaining in order. "
-                    "Skipping any skill = silent failure."
-                ]
+            # M1656-R6: shared MCP+system-prompt args (same for main and child sessions)
+            _mcp_full_args = _hub_mcp_spawn_args(proj_id, session_name, agent or "claude")
             subprocess.Popen([
                 "tmux", "new-session", "-d", "-s", session_name,
                 "-c", spawn_cwd,
                 *_tmux_env,
                 "claude", "--dangerously-skip-permissions", *_get_project_model(proj_id),
-                *_mcp_args, *_sys_prompt_args, *resume_args,
+                *_mcp_full_args, *resume_args,
             ])
             subprocess.run(["tmux", "set-option", "-t", session_name, "history-limit", "2000"], capture_output=True, timeout=2)
             import asyncio as _aio
@@ -9246,22 +10235,20 @@ async def execute_project(proj_id: str, request: Request):
             if not _post_alive and resume_args:
                 # Kill pane, clear stale .last-session-id, respawn without resume
                 await asyncio.to_thread(  # M1345
-                    subprocess.run, ["tmux", "kill-session", "-t", session_name], capture_output=True, timeout=5)
+                    subprocess.run, ["tmux", "kill-session", "-t", f"={session_name}"], capture_output=True, timeout=5)
                 try:
                     (PROJECTS_DIR / proj_id / ".last-session-id").unlink()
                 except Exception:
                     pass
                 _retried = True
                 resume_args = []  # fresh spawn — no continuity
-                _record_spawn_info(proj_id, resume_args, agent=agent)
+                _record_spawn_info(proj_id, resume_args, agent=agent, session_name=session_name)
                 _tmux_env = ["-e", f"CLAUDE_CODE_TASK_LIST_ID=hub-exec-{proj_id}", "-e", f"NS_HUB_URL=http://{_tailscale_interface_ip()}:{PORT}"]
                 for _k, _v in _get_project_spawn_env(proj_id).items():
                     _tmux_env += ["-e", f"{_k}={_v}"]
                 _mcp_args_retry = []
                 if agent in (None, "claude", "openrouter"):
-                    _mcp_cfg_retry = _write_mcp_config(proj_id, session_name)
-                    if _mcp_cfg_retry:
-                        _mcp_args_retry = ["--mcp-config", _mcp_cfg_retry]
+                    _mcp_args_retry = _hub_mcp_spawn_args(proj_id, session_name, agent or "claude")
                 subprocess.Popen([
                     "tmux", "new-session", "-d", "-s", session_name,
                     "-c", spawn_cwd,
@@ -9367,14 +10354,21 @@ async def execute_project(proj_id: str, request: Request):
             # (before Stop hook fires). Small delay to let Claude create the transcript file.
             import asyncio as _aio2
             await _aio2.sleep(2)
-            # M256: use model from .last-spawn-info.json (just written above) so the session
-            # is stored under the correct model_key (e.g. "or-owl-alpha" not "")
-            _spawn_info_path = PROJECTS_DIR / proj_id / ".last-spawn-info.json"
-            _recorded_model = ""
-            try:
-                _recorded_model = json.loads(_spawn_info_path.read_text()).get("model", "") or ""
-            except Exception:
-                _recorded_model = _get_project_model_value(proj_id) or ""
+            # M256: use model from spawn-info (just written above) so the session is stored
+            # under the correct model_key (e.g. "or-owl-alpha" not "").
+            # M1685-j fix: was reading .last-spawn-info.json (the LEGACY mirror), which
+            # _record_spawn_info only updates when _key=="_main" (server.py:5545) — but the
+            # call above passes the real session_name, so _key is never "_main" and that file
+            # goes stale the moment M1656-R9's session-scoped keying took over. Concretely:
+            # a model switch (e.g. → claude-sonnet-5) spawned a session whose OWN transcript
+            # ID then got recorded under the STALE legacy model (claude-sonnet-4-6) instead of
+            # the new one — so .session-history.json never gained a claude-sonnet-5 key, and
+            # every subsequent spawn fell through _get_resume_args's per-model lookup straight
+            # to the final --continue fallback (badge shows bare "resume" with no id, forever,
+            # until a manual model-history fixup). Read the session-scoped file instead
+            # (_read_spawn_info, the correct M1656-R9 counterpart) so the model always matches
+            # what THIS session actually spawned with.
+            _recorded_model = _read_spawn_info(proj_id, session_name).get("model", "") or _get_project_model_value(proj_id) or ""
             _new_sid = _update_session_history_from_transcript(proj_id, spawn_cwd, _recorded_model)
             # M833: capture branch session IDs for --resume continuity on next dispatch
             if _branch_substars and _newly_spawned:
@@ -9607,9 +10601,14 @@ async def backfill_tokens(proj_id: str):
 @app.delete("/api/northstar/{proj_id}")
 async def delete_project(proj_id: str):
     """Delete a project node (removes north-star.md if present)."""
-    # M1368: project dir existence check (SQLite is primary)
+    # M1694 P2 fix: was checking proj_dir.exists() despite the comment saying "SQLite is
+    # primary" — if the directory was already removed by any other path (manual cleanup,
+    # a crashed prior delete, external tooling), this 404'd and the project_meta row below
+    # was never reached, permanently orphaning it (found live via the M1694 smoke test
+    # suite's own cleanup fixture). Check the DB record instead, matching the comment's
+    # actual intent; still guard the filesystem ops below with .exists() individually.
     proj_dir = PROJECTS_DIR / proj_id
-    if not proj_dir.exists():
+    if _db_load_project(proj_id) is None:
         return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
     # M918: kill all exec sessions for this project before deletion
     try:
@@ -10139,7 +11138,7 @@ async def exec_inject(proj_id: str, request: Request):
         return JSONResponse({"ok": False, "error": "prompt required"}, status_code=400)
     exec_session = ""
     for candidate in _exec_session_names(proj_id):
-        check = subprocess.run(["tmux", "has-session", "-t", candidate], capture_output=True, timeout=2)
+        check = subprocess.run(["tmux", "has-session", "-t", f"={candidate}"], capture_output=True, timeout=2)
         if check.returncode == 0:
             exec_session = candidate
             break
@@ -10156,7 +11155,7 @@ async def kill_exec_session(proj_id: str):
     M985: now delegates to _kill_all_exec_sessions so substar assigned_session is also cleared."""
     killed_sessions = []
     for candidate in _exec_session_names(proj_id):
-        result = subprocess.run(["tmux", "kill-session", "-t", candidate], capture_output=True, timeout=5)
+        result = subprocess.run(["tmux", "kill-session", "-t", f"={candidate}"], capture_output=True, timeout=5)
         if result.returncode == 0:
             killed_sessions.append(candidate)
             _exec_idle_count.pop(candidate, None)
@@ -10223,7 +11222,7 @@ async def kill_named_tmux_session(proj_id: str, session_name: str):
 
     # Phase 2: kill all targeted sessions.
     for sname in cascade_targets:
-        result = subprocess.run(["tmux", "kill-session", "-t", sname], capture_output=True, timeout=5)
+        result = subprocess.run(["tmux", "kill-session", "-t", f"={sname}"], capture_output=True, timeout=5)
         if result.returncode == 0:
             killed.append(sname)
         _exec_idle_count.pop(sname, None)
@@ -10250,6 +11249,11 @@ async def kill_named_tmux_session(proj_id: str, session_name: str):
         pass
 
     _exec_sessions_cache["ts"] = 0.0  # M1557: invalidate cache so next poll reflects kill immediately
+    # M1663: push SSE so client clears exec-pane immediately (no poll-wait) — this endpoint
+    # was missing the push that _kill_all_exec_sessions' sibling (/exec-session DELETE) already had,
+    # so single/branched-session kills relied purely on client-side burst-poll and lagged visibly.
+    if killed:
+        _ns_push("session_idle", proj_id=proj_id, kind="exec")
     _server_log_action(proj_id, "", "exec:kill",
                        f"session:{session_name} cascade:{','.join(sorted(cascade_targets))} cleared:{len(cleared_substars)}")
     return {"ok": bool(killed), "session": session_name,
@@ -10377,7 +11381,7 @@ async def restart_session(proj_id: str):
             pass
     # Kill tmux exec session
     for exec_session in _exec_session_names(proj_id):
-        r = subprocess.run(["tmux", "kill-session", "-t", exec_session], capture_output=True, timeout=5)
+        r = subprocess.run(["tmux", "kill-session", "-t", f"={exec_session}"], capture_output=True, timeout=5)
         if r.returncode == 0:
             killed["tmux"] = True
             break
@@ -10559,11 +11563,14 @@ async def _start_exec_idle_detector():
                     session_name = parts[0] if parts else ""
                     if not any(session_name.startswith(p) for p in ("claude-exec-", "codex-exec-", "openrouter-exec-", "dsk-exec-")):
                         continue
-                    proj_id = ""
-                    for pfx in ("claude-exec-", "codex-exec-", "openrouter-exec-", "dsk-exec-"):
-                        if session_name.startswith(pfx):
-                            proj_id = session_name[len(pfx):]
-                            break
+                    # M1681: was a naive prefix strip (session_name[len(pfx):]) — for a branched
+                    # child like "claude-exec-FromScratch-5752fa2c" this yielded proj_id=
+                    # "FromScratch-5752fa2c" (branch suffix included), which then leaked into the
+                    # ntfy notification title/body below ("FromScratch-5752fa2c exec idle" instead
+                    # of "FromScratch exec idle"). _parse_exec_session_name does the same
+                    # longest-prefix-match against known project dirs used everywhere else
+                    # (get_exec_sessions, poller) — use it here too for a correctly resolved proj_id.
+                    _agent_eid, proj_id = _parse_exec_session_name(session_name)
                     if not proj_id:
                         continue
                     alive.add(session_name)
@@ -10581,7 +11588,9 @@ async def _start_exec_idle_detector():
                     # M1533 v5: OOB-first idle detection — pane-scrape removed.
                     # OOB busy state is authoritative; fall back to file-idle + idle_count (set by stop-hook / 2-cycle).
                     # M1574: TTL-aware — _oob_is_busy returns False when stale (>120s) → idle=True
-                    idle = not _oob_is_busy(proj_id)
+                    # M1656-fix (option②): pass session_name — this session's own report is authoritative,
+                    # so an idle branched session no longer shows busy just because a sibling is running.
+                    idle = not _oob_is_busy(proj_id, session_name)
                     return session_name, proj_id, idle
 
                 _results = await _aio.gather(*[_check_one(sn, pid) for sn, pid in _session_entries])
@@ -10627,11 +11636,9 @@ async def _start_exec_idle_detector():
                         _exec_idle_count.pop(k, None)
                         if was_running:
                             # Session died while running → fire missed idle notification
-                            _proj = ""
-                            for pfx in ("claude-exec-", "codex-exec-", "openrouter-exec-", "dsk-exec-"):
-                                if k.startswith(pfx):
-                                    _proj = k[len(pfx):]
-                                    break
+                            # M1681: same naive-strip bug as above — use _parse_exec_session_name
+                            # so branched session names resolve to the bare proj_id, not proj+suffix.
+                            _agent_dc, _proj = _parse_exec_session_name(k)
                             if _proj:
                                 _push_session_idle(k, _proj)
                                 if not _has_queued_stones(_proj):
@@ -10693,6 +11700,10 @@ def _push_session_idle(session_name: str, proj_id: str) -> bool:
     if now - last < _IDLE_PUSH_COOLDOWN:
         return False  # suppress duplicate
     _last_idle_push[session_name] = now
+    # M1677: invalidate exec-sessions cache on state transition — SSE-triggered client
+    # refresh must not receive a pre-transition snapshot (cache is fork-cost protection
+    # for steady-state polling, not a freshness ceiling).
+    _exec_sessions_cache["ts"] = 0.0
     _ns_push("session_idle", proj_id=proj_id, kind="exec")
     return True
 
@@ -10726,17 +11737,12 @@ async def get_exec_sessions():
         _ls_out = ""
 
     # Parse session lines and filter to exec sessions only
+    # M1656-④: _parse_exec_session_name does longest-prefix match for branched child names
     _session_lines = []
     for line in _ls_out.splitlines():
         parts = line.split(":", 2)
         session_name = parts[0] if parts else ""
-        agent = ""
-        proj_id = ""
-        for prefix, prefix_agent in (("claude-exec-", "claude"), ("codex-exec-", "codex"), ("openrouter-exec-", "openrouter"), ("dsk-exec-", "dsk")):
-            if session_name.startswith(prefix):
-                agent = prefix_agent
-                proj_id = session_name[len(prefix):]
-                break
+        agent, proj_id = _parse_exec_session_name(session_name)
         if not proj_id:
             continue
         created_ts = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
@@ -10770,23 +11776,36 @@ async def get_exec_sessions():
                 _send_ntfy_notification(f"{proj_id} exec done", f"Exec session for {proj_id} finished/exited", priority="high")
             return None
 
-        # M1574: TTL-aware OOB-first idle detection — _oob_is_busy returns False when stale (>120s)
-        idle = not _oob_is_busy(proj_id)
+        # M1656-R: DISPLAY is strictly per-session — a busy sibling must not make this
+        # session look busy. Session has a record → its own state; no record → the
+        # pane-activity / at-prompt heuristics below decide.
+        if session_name in _agent_busy_sessions:
+            idle = not _session_is_busy(session_name)
+        else:
+            idle = not _oob_is_busy(proj_id, session_name)
         # M1609: harness at prompt → force idle=True regardless of OOB (harness is alive but not executing)
-        # M1635: skip idle=True override when _session_running_stone active (MCP stone in progress)
-        if _harness_at_prompt and not _session_running_stone.get(proj_id):
+        # M1635/M1656-R: skip override when THIS session has an in-flight stone
+        # M1677: also skip for explicit busy signals (wake_sent/compacting/tool_start/
+        # subagent_running) — pane_current_command is ALWAYS the harness binary for
+        # claude sessions, so _harness_at_prompt cannot distinguish working from
+        # at-prompt; without this exemption the pane showed idle from wake until the
+        # stone claim (~14s), and (M131-d) showed idle while a background subagent
+        # was still computing on the session's behalf.
+        _own_rec = _agent_busy_sessions.get(session_name) or {}
+        _own_busy_hold = _session_is_busy(session_name) and (
+            _own_rec.get("stone_id")
+            or _own_rec.get("reason") in ("wake_sent", "compacting", "tool_start", "subagent_running"))
+        if _harness_at_prompt and not _own_busy_hold:
             _oob_chk = _agent_busy_state.get(proj_id)
             _oob_fresh = _oob_chk and _oob_chk.get("busy") and (time.time() - _oob_chk.get("ts", 0)) < _OOB_STALE_SECS
             if not _oob_fresh:
                 idle = True
 
-        # M1602 v2: pane-active fallback — only when OOB was recently busy (within 15min).
-        # Prevents false-running for sessions where agent exited but non-shell processes exist
-        # in the pane for unrelated reasons (node servers, bg scripts, etc.).
-        # If OOB has no record or was last set >15min ago, pane-active alone is not authoritative.
-        # M1604 fix: skip pane-active override when OOB explicitly says busy=False (task_complete).
-        # Only override when OOB record is busy=True or is a stale (TTL-expired) True record.
-        if idle and runtime_running:
+        # M1602 v2: pane-active fallback — only when OOB was recently busy (within TTL).
+        # M1656-R: applies ONLY to sessions with NO own record — a session that reports
+        # its own state must not be flipped busy by the proj-level record (which reflects
+        # whichever sibling posted last, e.g. a busy child's heartbeat).
+        if idle and runtime_running and session_name not in _agent_busy_sessions:
             _oob_rec = _agent_busy_state.get(proj_id)
             _oob_age = (time.time() - _oob_rec.get("ts", 0)) if _oob_rec else float("inf")
             _oob_explicit_idle = _oob_rec and not _oob_rec.get("busy", True)
@@ -10802,23 +11821,15 @@ async def get_exec_sessions():
         spawn_mode = None
         spawn_from = None
         spawn_model = ""
-        spawn_info_file = PROJECTS_DIR / proj_id / ".last-spawn-info.json"
-        if spawn_info_file.exists():
-            try:
-                si = json.loads(spawn_info_file.read_text())
-                si_at = si.get("at", "")
-                si_epoch = 0
-                if si_at:
-                    try:
-                        si_epoch = int(_dt.fromisoformat(si_at).timestamp())
-                    except Exception:
-                        pass
-                if si_epoch and abs(si_epoch - created_ts) <= 120:
-                    spawn_mode = si.get("mode")
-                    spawn_from = si.get("from_id") or None
-                spawn_model = si.get("model") or ""
-            except Exception:
-                pass
+        # M1656-R9: session-scoped lookup — exact key match, no epoch-proximity guessing.
+        # The old single-file-per-project design meant only whichever session spawned
+        # LAST (within a 120s guess window) ever showed real data; every sibling
+        # session (mother vs children) displayed "— unknown" regardless of reality.
+        si = _read_spawn_info(proj_id, session_name)
+        if si:
+            spawn_mode = si.get("mode")
+            spawn_from = si.get("from_id") or None
+            spawn_model = si.get("model") or ""
         if not spawn_model:
             try:
                 # M1493: lightweight model-only query — skip full _db_load_project (loads all milestones)
@@ -10867,23 +11878,31 @@ async def get_exec_sessions():
             _exec_idle_count.pop(session_name, None)
             _ns_push("session_running", proj_id=proj_id, kind="exec")
 
-        # M365: live session id from transcript
-        _live_session_id = ""
-        try:
-            _base = Path.home() / ".claude" / "projects"
-            _candidates = [d for d in _base.iterdir() if d.name.lower().endswith(f"-project-{proj_id.lower()}")]
-            if not _candidates:
-                _candidates = [d for d in _base.iterdir() if proj_id.lower() in d.name.lower() and "project" in d.name.lower()]
-            if _candidates:
-                _transcript_dir = sorted(_candidates, key=lambda d: len(d.name))[0]
-                _all = sorted(_transcript_dir.glob("*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)
-                for _f in _all:
-                    if _f.stat().st_mtime > created_ts:
-                        _live_session_id = _f.stem
-                        break
-        except Exception:
-            pass
+        # M365/M1656-R9: live session id — prefer the session-scoped value captured at
+        # spawn time (unambiguous diff-based detection, see _capture_live_session_id_bg).
+        # Directory-scan fallback ("newest mtime file") is kept ONLY for sessions spawned
+        # before this fix / where the diff was ambiguous — it is known to mis-attribute a
+        # SIBLING session's transcript when multiple exec sessions share one project
+        # directory and write concurrently (root cause of the mother/child pane mismatch).
+        _live_session_id = (si or {}).get("live_session_id", "")
+        if not _live_session_id:
+            try:
+                _base = Path.home() / ".claude" / "projects"
+                _candidates = [d for d in _base.iterdir() if d.name.lower().endswith(f"-project-{proj_id.lower()}")]
+                if not _candidates:
+                    _candidates = [d for d in _base.iterdir() if proj_id.lower() in d.name.lower() and "project" in d.name.lower()]
+                if _candidates:
+                    _transcript_dir = sorted(_candidates, key=lambda d: len(d.name))[0]
+                    _all = sorted(_transcript_dir.glob("*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)
+                    for _f in _all:
+                        if _f.stat().st_mtime > created_ts:
+                            _live_session_id = _f.stem
+                            break
+            except Exception:
+                pass
 
+        # M1656-R: expose accurate per-session state for UI (what stone, why busy)
+        _rec = _agent_busy_sessions.get(session_name) or {}
         return {
             "session": session_name,
             "proj_id": proj_id,
@@ -10891,6 +11910,8 @@ async def get_exec_sessions():
             "created": _dt.fromtimestamp(created_ts).isoformat() if created_ts else "",
             "alive": True,
             "idle": idle,
+            "busy_reason": _rec.get("reason", "") if not idle else "",
+            "running_stone": (_validate_stone_hold(session_name, _rec) if _session_is_busy(session_name) else None),
             "spawn_mode": spawn_mode,
             "spawn_from": spawn_from,
             "live_session_id": _live_session_id,
@@ -11114,8 +12135,10 @@ async def get_resumable_sessions(proj_id: str, agent: str = "", model: str = "")
                 {"key": "claude-haiku-4-5-20251001", "label": "Haiku 4.5"},
                 {"key": "claude-sonnet-4-5-20250929", "label": "Sonnet 4.5"},
                 {"key": "claude-sonnet-4-6", "label": "Sonnet 4.6"},
+                {"key": "claude-sonnet-5", "label": "Sonnet 5"},
                 {"key": "claude-opus-4-7", "label": "Opus 4.7"},
                 {"key": "claude-opus-4-8", "label": "Opus 4.8"},
+                {"key": "claude-fable-5", "label": "Fable 5"},
             ]
 
         # Filter by model if specified
@@ -11217,7 +12240,7 @@ async def get_resumable_sessions(proj_id: str, agent: str = "", model: str = "")
                     # — prevents claude transcript leaking into openrouter group when OR spawns after claude
                     _agent_prefix_chk = {"claude": "claude-exec-", "codex": "codex-exec-", "openrouter": "openrouter-exec-", "dsk": "dsk-exec-"}.get(ag, "claude-exec-")
                     _live_sess_name = f"{_agent_prefix_chk}{proj_id}"
-                    _live_sess_exists = bool(subprocess.run(["tmux", "has-session", "-t", _live_sess_name], capture_output=True, timeout=2).returncode == 0)
+                    _live_sess_exists = bool(subprocess.run(["tmux", "has-session", "-t", f"={_live_sess_name}"], capture_output=True, timeout=2).returncode == 0)
                     _detect_unknown = _live_model and _live_model not in _known_keys and _live_sess_exists
                     if _bucket_match or _detect_unknown:
                         # M283: include tmux_session name so UI can attach directly

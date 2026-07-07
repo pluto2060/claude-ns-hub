@@ -1,0 +1,581 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Hub</title>
+<link rel="icon" type="image/png" sizes="32x32" href="/static/icons/favicon-32.png" />
+<link rel="icon" type="image/png" sizes="16x16" href="/static/icons/favicon-16.png" />
+<link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png" />
+<link rel="manifest" href="/static/manifest.json" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-title" content="NS Hub" />
+<meta name="theme-color" content="#1a1916" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:wght@400;500&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #faf9f6; --bg-deep: #f0ede7; --panel: #fff; --panel-border: #e4dfd5;
+  --panel-soft: #f5f2ec; --text: #1f1c1a; --text-soft: #4a4540; --text-dim: #8a8278;
+  --accent: #cc785c; --accent-deep: #a34b2c; --accent-soft: #f5e6de;
+  --green: #3d8b5e; --green-soft: #e8f5ee;
+  --red: #c0392b; --red-soft: #fdf0ef;
+  --yellow: #b8860b;
+  --serif: "Fraunces", Georgia, serif;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+  --nav-h: 50px;
+}
+[data-theme="dark"] {
+  --bg: #181614; --bg-deep: #111009; --panel: #222019; --panel-border: #333028;
+  --panel-soft: #1e1c1a; --text: #e8e0d6; --text-soft: #b0a89e; --text-dim: #6b6358;
+  --accent: #cc785c; --accent-deep: #e8926e; --accent-soft: #2a1e17;
+  --green: #4caf78; --green-soft: #0e2318;
+  --red: #e05252; --red-soft: #250e0e;
+  --yellow: #d4a017;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; overflow: hidden; }
+body { background: var(--bg); color: var(--text-soft); font: 14px/1.55 var(--sans);
+  -webkit-font-smoothing: antialiased; }
+
+/* ── Nav ── */
+nav {
+  height: var(--nav-h); display: flex; align-items: stretch;
+  border-bottom: 1px solid var(--panel-border); background: var(--bg);
+  position: relative; z-index: 10; padding: 0 24px 0 20px;
+}
+
+.brand {
+  display: flex; align-items: center; gap: 10px;
+  padding-right: 24px; border-right: 1px solid var(--panel-border);
+  margin-right: 4px; flex-shrink: 0;
+}
+.brand-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
+.brand-name { font-family: var(--serif); font-weight: 500; font-size: 18px; color: var(--text); }
+
+/* ── Tabs ── */
+.tabs { display: flex; align-items: stretch; flex: 1; }
+.tab {
+  display: flex; align-items: center; gap: 9px;
+  padding: 0 18px; cursor: pointer;
+  border-bottom: 2px solid transparent;
+  color: var(--text-dim); font-size: 13px;
+  transition: color 0.12s, border-color 0.12s;
+  user-select: none; white-space: nowrap; position: relative;
+}
+.tab:hover { color: var(--text-soft); }
+.tab.active { color: var(--text); border-bottom-color: var(--accent); }
+.tab-name { font-family: var(--serif); font-size: 15px; font-weight: 500; }
+
+.status-dot {
+  width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
+  background: var(--text-dim); transition: background 0.4s;
+}
+.status-dot.ok    { background: var(--green); }
+.status-dot.fail  { background: var(--red); }
+.status-dot.check { background: var(--yellow); animation: blink 1.2s ease-in-out infinite; }
+@keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+/* ── Nav right ── */
+.nav-right { display: flex; align-items: center; gap: 12px; margin-left: auto; }
+.open-btn {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 11px; font-family: var(--mono); color: var(--text-dim);
+  background: none; border: 1px solid var(--panel-border); border-radius: 4px;
+  padding: 4px 10px; cursor: pointer; transition: all 0.12s; line-height: 1;
+}
+.open-btn:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.open-btn svg { opacity: 0.6; }
+.open-label { }
+.clock { font-family: var(--mono); font-size: 11px; color: var(--text-dim);
+  letter-spacing: 0.02em; }
+
+/* ── Mobile responsive ── */
+@media (max-width: 600px) {
+  :root { --nav-h: 44px; }
+  .brand { padding-right: 14px; margin-right: 2px; }
+  .brand-name { font-size: 15px; }
+  .tab { padding: 0 10px; gap: 5px; }
+  .tab-name { font-size: 13px; }
+  .open-label { display: none; }
+  .clock { font-size: 10px; }
+  .open-btn { padding: 4px 7px; }
+  .nav-right { gap: 6px; }
+}
+
+@media (max-width: 420px) {
+  .brand { display: none; }
+  .tab { padding: 0 8px; }
+  .tab-name { font-size: 12px; }
+  .status-dot { width: 5px; height: 5px; }
+}
+
+/* M1068: pill-tab nav horizontal scroll on mobile */
+@media (max-width: 640px) {
+  nav { padding: 0 12px 0 12px; overflow: hidden; }
+  .tabs {
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    flex-shrink: 1;
+    min-width: 0;
+  }
+  .tabs::-webkit-scrollbar { height: 0; }
+  .tab { flex-shrink: 0; }
+  .nav-right { flex-shrink: 0; }
+}
+
+/* ── Pane container ── */
+.content { height: calc(100vh - var(--nav-h)); position: relative; overflow: hidden; }
+.wrap {
+  position: absolute; inset: 0; display: none;
+}
+.wrap.active { display: block; }
+.wrap iframe {
+  position: absolute; inset: 0; width: 100%; height: 100%; border: none; display: block;
+}
+
+/* ── Offline overlay ── */
+.offline-overlay {
+  display: none; position: absolute; inset: 0; z-index: 5;
+  background: var(--bg);
+  align-items: center; justify-content: center;
+  flex-direction: column; gap: 12px;
+}
+.offline-overlay.show { display: flex; }
+.offline-icon { font-size: 32px; margin-bottom: 4px; opacity: 0.3; }
+.offline-title { font-family: var(--serif); font-size: 19px; color: var(--text); font-weight: 500; }
+.offline-hint {
+  font-family: var(--mono); font-size: 12px; color: var(--text-dim);
+  background: var(--bg-deep); padding: 5px 14px; border-radius: 4px;
+  border: 1px solid var(--panel-border);
+}
+.retry-btn {
+  margin-top: 6px; font-size: 12px; font-family: var(--mono);
+  background: none; border: 1px solid var(--panel-border); border-radius: 4px;
+  padding: 5px 16px; cursor: pointer; color: var(--text-soft); transition: all 0.12s;
+}
+.retry-btn:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+
+/* ── Corpus skill/agent list — hub-native, no external iframe ── */
+.corpus-list {
+  position: absolute; inset: 0; overflow: auto; background: var(--bg);
+  padding: 28px 32px 40px; display: block; z-index: 1;
+}
+.corpus-list .head { display: flex; align-items: baseline; gap: 14px; margin-bottom: 18px; }
+.corpus-list h2 { font-family: var(--serif); font-weight: 500; font-size: 22px; color: var(--text); }
+.corpus-list .head-hint {
+  font-family: var(--mono); font-size: 11px; color: var(--text-dim);
+}
+.corpus-list .filter-row {
+  display: flex; gap: 8px; margin-bottom: 18px; align-items: center;
+}
+.corpus-list .search {
+  flex: 1; max-width: 360px;
+  background: var(--panel); border: 1px solid var(--panel-border); border-radius: 4px;
+  padding: 7px 12px; font: 13px var(--sans); color: var(--text);
+  outline: none; transition: border-color 0.12s;
+}
+.corpus-list .search:focus { border-color: var(--accent); }
+.corpus-list .filter-btn {
+  font: 12px var(--mono); padding: 6px 12px; border-radius: 4px; cursor: pointer;
+  background: var(--panel); border: 1px solid var(--panel-border); color: var(--text-soft);
+  transition: all 0.12s;
+}
+.corpus-list .filter-btn.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-deep); }
+.corpus-list .section { margin-bottom: 22px; }
+.corpus-list .section-title {
+  font-family: var(--serif); font-size: 13px; color: var(--text-dim);
+  text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 10px;
+}
+.corpus-list .grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px;
+}
+.corpus-list .card {
+  background: var(--panel); border: 1px solid var(--panel-border); border-radius: 5px;
+  padding: 11px 13px; transition: border-color 0.12s, background 0.12s;
+}
+.corpus-list .card:hover { border-color: var(--accent); background: var(--panel-soft); }
+.corpus-list .card .name {
+  font-family: var(--mono); font-size: 12.5px; color: var(--text);
+  font-weight: 500; margin-bottom: 3px; word-break: break-word;
+}
+.corpus-list .card .kind { font-family: var(--mono); font-size: 10px; color: var(--text-dim); }
+.corpus-list .card .desc {
+  font-size: 12px; color: var(--text-soft); line-height: 1.5; margin-top: 6px;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+}
+.corpus-list .empty {
+  text-align: center; padding: 40px 0; color: var(--text-dim);
+  font-family: var(--mono); font-size: 12px;
+}
+.corpus-list .live-link {
+  font: 11px var(--mono); color: var(--text-dim); margin-left: auto;
+}
+.corpus-list .live-link a { color: var(--accent); text-decoration: none; }
+.corpus-list .live-link a:hover { text-decoration: underline; }
+</style>
+<script>
+(function(){const s=localStorage.getItem('hub-theme');if(s==='dark'||(s==null&&matchMedia('(prefers-color-scheme:dark)').matches))document.documentElement.setAttribute('data-theme','dark')})();
+</script>
+</head>
+<body>
+
+<nav>
+  <div class="brand">
+    <div class="brand-dot"></div>
+    <span class="brand-name">Hub</span>
+  </div>
+
+  <div class="tabs">
+    <div class="tab active" data-tab="northstar">
+      <div class="status-dot check" id="dot-northstar"></div>
+      <span class="tab-name">North Star</span>
+    </div>
+    <div class="tab" data-tab="corpus">
+      <div class="status-dot check" id="dot-corpus"></div>
+      <span class="tab-name">Corpus</span>
+    </div>
+    <div class="tab" data-tab="market-signals">
+      <div class="status-dot check" id="dot-market-signals"></div>
+      <span class="tab-name">Market</span>
+    </div>
+  </div>
+
+  <div class="nav-right">
+    <!-- M292: update badge with version text -->
+    <span id="hub-update-badge" title="" style="display:none;font-family:monospace;font-size:9px;font-weight:600;padding:2px 6px;border-radius:10px;background:#1a3a1a;color:#7fcf7f;border:1px solid #4a9a4a;cursor:pointer;white-space:nowrap;flex-shrink:0;letter-spacing:.02em"
+      onclick="alert(this.title)">⟳ update</span>
+    <button class="open-btn" id="theme-toggle" onclick="hubToggleTheme()" title="Toggle dark mode" style="padding:0 8px;font-size:13px">◑</button>
+    <button class="open-btn" id="open-standalone" title="Open in new tab">
+      <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+        <path d="M1 9L9 1M9 1H4M9 1V6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+      </svg>
+      <span class="open-label">open</span>
+    </button>
+    <span class="clock" id="clock">—</span>
+  </div>
+</nav>
+
+
+<div class="content">
+  <div class="wrap" id="wrap-corpus">
+    <div class="corpus-list" id="corpus-list">
+      <div class="head">
+        <h2>Corpus</h2>
+        <span class="head-hint" id="corpus-list-status">loading…</span>
+        <span class="live-link" id="corpus-live-link"></span>
+      </div>
+      <div class="filter-row">
+        <input class="search" id="corpus-search" type="search" placeholder="Filter by name or description…" />
+        <button class="filter-btn active" data-kind="all">All</button>
+        <button class="filter-btn" data-kind="skill">Skills</button>
+        <button class="filter-btn" data-kind="agent">Agents</button>
+        <button class="filter-btn" data-kind="doc">Docs</button>
+      </div>
+      <div id="corpus-skill-section" class="section">
+        <div class="section-title" id="corpus-skill-title">Skills</div>
+        <div class="grid" id="corpus-skill-grid"></div>
+      </div>
+      <div id="corpus-agent-section" class="section">
+        <div class="section-title" id="corpus-agent-title">Agents</div>
+        <div class="grid" id="corpus-agent-grid"></div>
+      </div>
+      <div id="corpus-doc-section" class="section">
+        <div class="section-title" id="corpus-doc-title">Docs</div>
+        <div class="grid" id="corpus-doc-grid"></div>
+      </div>
+      <div class="empty" id="corpus-empty" style="display:none">No matches.</div>
+    </div>
+  </div>
+
+  <div class="wrap" id="wrap-market-signals">
+    <iframe id="frame-market-signals" src="about:blank"></iframe>
+  </div>
+
+  <div class="wrap active" id="wrap-northstar">
+    <div class="offline-overlay" id="offline-northstar">
+      <div class="offline-icon">◌</div>
+      <div class="offline-title">Hub restarting…</div>
+      <div class="offline-hint">reconnects automatically</div>
+    </div>
+    <iframe id="frame-northstar" src="about:blank"></iframe>
+  </div>
+</div>
+
+<script>
+const TABS = {
+  corpus:           { standalone: '/corpus-hub',   healthUrl: null },
+  northstar:        { standalone: '/northstar',     healthUrl: '/health/northstar' },
+  'market-signals': { standalone: '/market-signals', healthUrl: '/health/market-signals' },
+};
+let activeTab = 'northstar';
+
+// ── Config (resolves Corpus to real bound IP) ────────────────────────────────────
+async function initConfig() {
+  try {
+    const cfg = await fetch('/config').then(r => r.json());
+    const theme = document.documentElement.getAttribute('data-theme') || 'light';
+    // Bake theme into URL so cross-origin iframes read it synchronously (no flash)
+    const themeQ = theme === 'dark' ? '?theme=dark' : '';
+    const pushTheme = (frameId, src, addParam = false) => {
+      const f = document.getElementById(frameId);
+      const fullSrc = addParam ? src + themeQ : src;
+      // Also postMessage after load (handles live toggle without page reload)
+      f.addEventListener('load', () => {
+        try { f.contentWindow.postMessage({type:'hub-theme', value:theme}, '*'); } catch(_) {}
+      }, {once: true});
+      f.src = fullSrc;
+    };
+    pushTheme('frame-northstar',      cfg.northstar_url);
+    pushTheme('frame-market-signals', cfg.market_signals_url || '/market-signals');
+  } catch (_) {}
+}
+initConfig();
+
+// ── Tab switching ─────────────────────────────────────────────────────────────
+document.querySelectorAll('.tab').forEach(tab =>
+  tab.addEventListener('click', () => switchTab(tab.dataset.tab)));
+
+function switchTab(name) {
+  activeTab = name;
+  document.querySelectorAll('.tab').forEach(t =>
+    t.classList.toggle('active', t.dataset.tab === name));
+  document.querySelectorAll('.wrap').forEach(w =>
+    w.classList.toggle('active', w.id === `wrap-${name}`));
+}
+
+// ── Open standalone ───────────────────────────────────────────────────────────
+document.getElementById('open-standalone').addEventListener('click', () =>
+  window.open(TABS[activeTab].standalone, '_blank'));
+
+// ── Health checks ─────────────────────────────────────────────────────────────
+// M229: grace period — only show offline overlay after 3 consecutive failures
+// (hub restarts take ~5s; at 3s poll that's 2 checks. 3 failures = 9s grace)
+const _healthFailCount = {};
+async function checkHealth(name) {
+  if (!TABS[name].healthUrl) return; // corpus: hub-native, no health check needed
+  const dot     = document.getElementById(`dot-${name}`);
+  const overlay = document.getElementById(`offline-${name}`);
+  try {
+    const d = await fetch(TABS[name].healthUrl).then(r => r.json());
+    _healthFailCount[name] = 0;
+    dot.className = 'status-dot ' + (d.ok ? 'ok' : 'fail');
+    if (overlay) overlay.classList.toggle('show', !d.ok);
+  } catch {
+    _healthFailCount[name] = (_healthFailCount[name] || 0) + 1;
+    dot.className = 'status-dot fail';
+    if (_healthFailCount[name] >= 3) {
+      if (overlay) overlay.classList.add('show');
+    }
+  }
+}
+
+async function retryLoad(name) {
+  document.getElementById(`offline-${name}`)?.classList.remove('show');
+  const frame = document.getElementById(`frame-${name}`);
+  frame.src = frame.src;
+  await checkHealth(name);
+}
+
+// ── Corpus skill/agent list — hub-native, always rendered ──
+let _corpusData = null;
+let _corpusFilter = { kind: 'all', q: '' };
+
+async function loadCorpusList() {
+  const statusEl = document.getElementById('corpus-list-status');
+  try {
+    const r = await fetch('/api/corpus/skills-agents');
+    _corpusData = await r.json();
+    const c = _corpusData.counts;
+    statusEl.textContent =
+      `${c.skills} skills · ${c.agents} agents · ${c.docs || 0} docs`;
+    document.getElementById('corpus-live-link').innerHTML = '';
+    document.getElementById('dot-corpus').className = 'status-dot ok';
+    renderCorpusList();
+  } catch (e) {
+    statusEl.textContent = 'failed to load';
+    document.getElementById('dot-corpus').className = 'status-dot fail';
+  }
+}
+loadCorpusList();
+
+function renderCorpusList() {
+  if (!_corpusData) return;
+  const q = (_corpusFilter.q || '').toLowerCase().trim();
+  const match = it => !q ||
+    (it.name || '').toLowerCase().includes(q) ||
+    (it.description || '').toLowerCase().includes(q);
+
+  const skillGrid = document.getElementById('corpus-skill-grid');
+  const agentGrid = document.getElementById('corpus-agent-grid');
+  const docGrid   = document.getElementById('corpus-doc-grid');
+  const skillSec  = document.getElementById('corpus-skill-section');
+  const agentSec  = document.getElementById('corpus-agent-section');
+  const docSec    = document.getElementById('corpus-doc-section');
+  const skillTitle = document.getElementById('corpus-skill-title');
+  const agentTitle = document.getElementById('corpus-agent-title');
+  const docTitle   = document.getElementById('corpus-doc-title');
+  const empty = document.getElementById('corpus-empty');
+
+  const showSkills = _corpusFilter.kind === 'all' || _corpusFilter.kind === 'skill';
+  const showAgents = _corpusFilter.kind === 'all' || _corpusFilter.kind === 'agent';
+  const showDocs   = _corpusFilter.kind === 'all' || _corpusFilter.kind === 'doc';
+
+  const matchDoc = it => !q ||
+    (it.name || '').toLowerCase().includes(q) ||
+    (it.project || '').toLowerCase().includes(q);
+
+  const skills = showSkills ? (_corpusData.skills || []).filter(match) : [];
+  const agents = showAgents ? (_corpusData.agents || []).filter(match) : [];
+  const docs   = showDocs   ? (_corpusData.docs   || []).filter(matchDoc) : [];
+
+  const DEL_BTN_STYLE = "margin-left:auto;flex-shrink:0;font-family:var(--mono);font-size:9px;padding:1px 6px;border-radius:3px;border:1px solid rgba(192,57,43,.3);background:none;color:var(--red,#c0392b);cursor:pointer;opacity:.6";
+  const card = (it, type) => {
+    const desc = (it.description || '').replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+    const name = (it.name || '').replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+    const key = (it.dir || it.name || '').replace(/'/g, "\\'");
+    const isPlugin = (it.source || '').startsWith('plugin:');
+    const delBtn = isPlugin ? '' :
+      `<button onclick="event.stopPropagation();_corpusDelete('${key}','${name.replace(/'/g,"\\'")}','${type}')" style="${DEL_BTN_STYLE}" title="Delete ${type}">✕</button>`;
+    return `<div class="card" style="position:relative;cursor:pointer" onclick="_showCorpusDetail('${key}','${name.replace(/'/g,"\\'")}')">
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:2px"><div class="name" style="margin-bottom:0">${name}</div>${delBtn}</div>
+      <div class="desc">${desc || '—'}</div>
+    </div>`;
+  };
+  async function _showCorpusDetail(key, displayName) {
+    const res = await fetch(`/api/skill-content/${encodeURIComponent(key)}`).then(r=>r.json()).catch(()=>null);
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:10500;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.55)';
+    overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+    const panel = document.createElement('div');
+    panel.style.cssText = 'background:var(--panel,#222);border:1px solid var(--panel-border,#333);border-radius:10px;padding:16px;width:580px;max-width:95vw;max-height:82vh;display:flex;flex-direction:column;box-shadow:0 8px 32px rgba(0,0,0,.45);font-family:monospace';
+    panel.addEventListener('click', e => e.stopPropagation());
+    const hdr = document.createElement('div');
+    hdr.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-shrink:0';
+    hdr.innerHTML = `<span style="font-size:11px;font-weight:700;color:#cc7852">${displayName}</span>`;
+    const closeBtn = document.createElement('button');
+    closeBtn.textContent = '×';
+    closeBtn.style.cssText = 'background:none;border:none;color:#888;font-size:16px;cursor:pointer;padding:2px 6px;line-height:1';
+    closeBtn.onclick = () => overlay.remove();
+    hdr.appendChild(closeBtn);
+    panel.appendChild(hdr);
+    const body = document.createElement('pre');
+    body.style.cssText = 'flex:1;overflow-y:auto;overflow-x:hidden;font-size:9px;color:#ccc;background:#111;padding:10px 12px 10px 10px;border-radius:5px;border:1px solid #333;white-space:pre-wrap;word-break:break-word;margin:0;scrollbar-width:thin;scrollbar-color:#444 #111';
+    body.textContent = (res && res.ok) ? res.content : (res?.error || 'Content not found.');
+    panel.appendChild(body);
+    if (res && res.ok && res.path) {
+      const pathEl = document.createElement('div');
+      pathEl.style.cssText = 'font-size:8px;color:#666;margin-top:6px;flex-shrink:0';
+      pathEl.textContent = res.path;
+      panel.appendChild(pathEl);
+    }
+    overlay.appendChild(panel);
+    document.body.appendChild(overlay);
+  }
+  window._showCorpusDetail = _showCorpusDetail;
+  async function _corpusDelete(key, displayName, type) {
+    const endpoint = type === 'skill' ? `/api/skill/${encodeURIComponent(key)}` : `/api/agent/${encodeURIComponent(key)}`;
+    if (!confirm(`Delete ${type} "${displayName}"?\nFile will be renamed to .bak (recoverable).`)) return;
+    const r = await fetch(endpoint, {method:'DELETE'});
+    if (r.ok) { _corpusData = null; await loadCorpusList(); }
+    else alert('Delete failed: ' + (await r.text()));
+  }
+  window._corpusDelete = _corpusDelete;
+
+  const docCard = it => {
+    const name = (it.name || '').replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+    const proj = (it.project || '').replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+    const kb = it.size ? `${Math.round(it.size/1024)}kb` : '';
+    return `<div class="card" title="${name}">
+      <div class="name" style="font-size:11px;word-break:break-all">${name}</div>
+      <div class="desc" style="display:flex;gap:6px"><span style="opacity:.55">${proj}</span><span style="opacity:.4">${kb}</span></div>
+    </div>`;
+  };
+
+  skillGrid.innerHTML = skills.map(it => card(it, 'skill')).join('');
+  agentGrid.innerHTML = agents.map(it => card(it, 'agent')).join('');
+  docGrid.innerHTML   = docs.map(docCard).join('');
+  skillTitle.textContent = `Skills · ${skills.length}`;
+  agentTitle.textContent = `Agents · ${agents.length}`;
+  docTitle.textContent   = `Docs · ${docs.length}`;
+  skillSec.style.display = showSkills ? '' : 'none';
+  agentSec.style.display = showAgents ? '' : 'none';
+  docSec.style.display   = showDocs   ? '' : 'none';
+  empty.style.display = (skills.length + agents.length + docs.length === 0) ? '' : 'none';
+}
+
+document.getElementById('corpus-search').addEventListener('input', e => {
+  _corpusFilter.q = e.target.value;
+  renderCorpusList();
+});
+document.querySelectorAll('.corpus-list .filter-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.corpus-list .filter-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    _corpusFilter.kind = btn.dataset.kind;
+    renderCorpusList();
+  });
+});
+
+// M292 v2: compact update badge on brand dot (replaces banner)
+(async function _hubUpdateCheck() {
+  try {
+    const d = await fetch('/api/hub/update-check').then(r => r.json());
+    if (d.update_available) {
+      const badge = document.getElementById('hub-update-badge');
+      if (badge) {
+        badge.title = `claude-ns-hub ${d.current} → ${d.latest} — ${d.pip_cmd}`;
+        badge.textContent = '⟳ ' + d.latest;
+        badge.style.display = 'block';
+      }
+    }
+  } catch(_) {}
+})();
+
+Object.keys(TABS).forEach(checkHealth);
+setInterval(() => {
+  if (document.hidden) return; // M1581: skip health+iframe refresh when tab hidden — reduces mobile background CPU/radio
+  Object.keys(TABS).forEach(checkHealth);
+  // M135: drive northstar iframe refresh in sync with hub health cycle
+  const nsFrame = document.getElementById('frame-northstar');
+  if (nsFrame && nsFrame.contentWindow) {
+    try { nsFrame.contentWindow.postMessage({type:'hub-refresh'}, '*'); } catch(_) {}
+  }
+}, 15000); // M1418-C: 3s→15s — reduces TX ~80% (246KB×25/min→5/min)
+
+// ── Clock ─────────────────────────────────────────────────────────────────────
+const clockEl = document.getElementById('clock');
+const tick = () => { if (!document.hidden) clockEl.textContent = new Date().toLocaleTimeString('en-GB', { hour12: false }); }; // M1581: skip clock DOM update when hidden
+tick(); setInterval(tick, 1000);
+
+// ── M140: receive watching count from northstar iframe ────────────────────────
+window.addEventListener('message', e => {
+  if (e.data?.type === 'ns-watch-count') {
+    const badge = document.getElementById('ns-watch-badge');
+    if (!badge) return;
+    const n = e.data.count || 0;
+    badge.textContent = n;
+    badge.style.display = n > 0 ? '' : 'none';
+  }
+});
+
+// ── Theme toggle — propagates to all iframes ──────────────────────────────────
+function hubToggleTheme() {
+  const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+  const next = isDark ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('hub-theme', next);
+  // Same-origin: postMessage only
+  ['frame-northstar','frame-market-signals','frame-ctx'].forEach(id => {
+    const f = document.getElementById(id);
+    if (f && f.contentWindow) f.contentWindow.postMessage({type:'hub-theme',value:next}, '*');
+  });
+  // corpus tab is hub-native — no cross-origin iframe to theme
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8">
+<style>
+  body { font-family: 'Segoe UI', sans-serif; background: #0d0f12; color: #e2e8f0;
+         max-width: 900px; margin: 0 auto; padding: 32px 40px; font-size: 13px; line-height: 1.65; }
+  h1,h2,h3 { color: #f8fafc; border-bottom: 1px solid #334155; padding-bottom: 6px; margin-top: 28px; }
+  h2 { font-size: 16px; color: #93c5fd; }
+  h3 { font-size: 14px; color: #86efac; }
+  code { background: #1e293b; color: #f97316; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+  pre { background: #1e293b; border: 1px solid #334155; border-radius: 6px; padding: 12px 16px;
+         overflow-x: auto; font-size: 11px; color: #cbd5e1; }
+  li { margin: 4px 0; }
+  strong { color: #f1f5f9; }
+  blockquote { border-left: 3px solid #475569; margin: 0; padding-left: 14px; color: #94a3b8; }
+  hr { border: none; border-top: 1px solid #334155; margin: 20px 0; }
+  .header { display: flex; align-items: center; gap: 12px; margin-bottom: 28px;
+             padding-bottom: 16px; border-bottom: 1px solid #334155; }
+  .header-badge { background: #1e40af; color: #bfdbfe; font-size: 10px; padding: 3px 8px;
+                   border-radius: 4px; font-family: monospace; letter-spacing: .06em; }
+  .line-count { color: #64748b; font-size: 11px; font-family: monospace; }
+</style>
+</head><body>
+<div class="header">
+  <div class="header-badge">~/.claude/CLAUDE.md</div>
+  <span class="line-count">188 lines — Language Rule deleted (M591)</span>
+</div>
+<br>
+<p><!-- CLAUDE.md | last updated: 2026-05-22 --></p>
+<br>
+<h2>Git Init Rule (M387)</h2>
+<br>
+<p>Every project directory tracked by the NS hub **must be git initialized** (`git init`).</p>
+<p>When Claude works in an exec session (claude-exec-{proj}):</p>
+<li>If the project dir is NOT git initialized → run `git init` first before any file changes.</li>
+<li>After implementing a milestone, make an atomic commit: `git add -A && git commit -m "feat: <MID> <summary>"`.</li>
+<li>Commits are how the work persists and can be reviewed/rolled back. No commit = work is untracked.</li>
+<br>
+<p>New project dirs added to `proj_dirs` in `server.py` must also have `git init` run.</p>
+<br>
+<h2>E2E Completion Screenshot Rule</h2>
+<p>**Completion screenshots MUST be real UI screenshots** (browser showing the working feature), NOT code snippet captures or terminal output. For backend-only changes (edge functions, API fixes), show the UI where the feature is triggered successfully.</p>
+<br>
+<h2>"Prove with img" Rule (M295)</h2>
+<p>When user says "prove with img", "share the shot", "completion shot", or similar: take a Playwright screenshot of the relevant working UI, upload to `gdrive:claude-shared/Moat/outbox/`, and share the GDrive link.</p>
+<br>
+<h2>Screenshot Path Rule (M357)</h2>
+<p>**NEVER use relative filenames for Playwright screenshots** — always use absolute paths under the project root:</p>
+<p>`filename="<project-root>/.playwright-mcp/screenshot-name.png"`</p>
+<p>Relative paths save to session CWD and clutter home dir.</p>
+<br>
+<br>
+<h2>Service Binding Rule: dev servers may bind to `0.0.0.0` for local LAN/Tailscale access. Use `127.0.0.1` for strictly local-only services.</h2>
+<br>
+<h2>Google Drive Share Protocol</h2>
+<br>
+<p>**Rule**: Always upload to `gdrive:claude-shared/<project>/outbox/`. Never use the top-level `claude-shared/outbox/`.</p>
+<br>
+<p>**Upload command**:</p>
+<pre>rclone copy &lt;local-file> "gdrive:claude-shared/&lt;project>/outbox/"
+rclone link "gdrive:claude-shared/&lt;project>/outbox/&lt;filename>"</pre>
+<br>
+<p>**If project folder missing**: `rclone mkdir "gdrive:claude-shared/<project>/inbox" && rclone mkdir "gdrive:claude-shared/<project>/outbox"`</p>
+<br>
+<p>**[DEFAULT] Hub doc sharing — always docx table**: When sharing any document result from a hub stone (research, guide, comparison, analysis, screenshot summary, etc.), default format is **python-docx with styled tables** — even without explicit "docx" request. Styled table spec: header row dark bg (#1F2937) white text, alternating row shading (#F3F4F6 / white), `Table Grid` style. Upload via rclone to outbox, share link in stone comment.</p>
+<br>
+<p>**Inbox usage** (read from user): `gdrive:claude-shared/<project>/inbox/` — user places files here for Claude to read.</p>
+<p>Read with: `rclone ls "gdrive:claude-shared/<project>/inbox/"` then `rclone copy <remote-file> /tmp/` to download.</p>
+<p>On "make into docx" / "표/테이블 docx로" / any tabular-output request: emit **HTML with styled tables** (borders, header bg, alternating row shading, priority highlights) — never markdown pipe-tables. Upload as `text/html` so Drive preview shows real tables.</p>
+<br>
+<hr>
+<h2>Private Keys / Token</h2>
+<br>
+<p>Full inventory and quick-reference scripts: `~/.claude/env/README.md`</p>
+<p>Usage: `source ~/.claude/env/shared.env && <command>`</p>
+<br>
+<h2>Tailscale Host Registry</h2>
+<br>
+<p>IPs and hostnames are dynamic — always query at runtime:</p>
+<br>
+<pre>tailscale status --json | python3 -m json.tool | grep -E "HostName|TailscaleIPs|OS"</pre>
+<br>
+<br>
+<h2>Remote Notify Client Registry (Tailscale)</h2>
+<br>
+<p>Full reference: `~/.claude/tool-hints/tailscale-notify.md`</p>
+<p>Bootstrap: `irm http://<WSL2-tailscale-ip>:9955/bootstrap | iex` (admin PS + Tailscale). All clients port 6789. Use `wsl-expose <port>` / `wsl-unexpose <port>` for dev-server mirroring.</p>
+<br>
+<h2>G1/G2/CM Hook Display Rule</h2>
+<br>
+<p>When `additionalContext` contains G1/G2/CM headers: output the `> **XX**` header lines verbatim as the first lines of the response (before any other content), then skip if none present.</p>
+<br>
+<h2>Memory Persistence — Immediate Write Rule</h2>
+<br>
+<p>**MANDATORY**: When **[MEMORY TRIGGER]** appears in context, immediately Edit the MEMORY.md file shown in the trigger and add the decision in the SAME response turn — do NOT defer to session end.</p>
+<br>
+<p>Also write immediately on: person/project status changes, kills/pauses, finalized decisions, or explicit "기억해"/"저장해".</p>
+<br>
+<p>MEMORY.md path: `~/.claude/projects/{cwd-with-slashes-as-dashes}/memory/MEMORY.md`</p>
+<br>
+<hr>
+<br>
+<h2>Skill & Agent Files</h2>
+<br>
+<li>✅ Write in **English** (name, description, prompts) — Korean frontmatter causes silent load failures</li>
+<li>✅ Structure: `~/.claude/skills/<name>/SKILL.md` (directory, not a flat `.md` file)</li>
+<li>Frontmatter: `name` + `description` only (no `type: skill`)</li>
+<br>
+<br>
+<h2>Login Priority</h2>
+<br>
+<p>When an external site (Zoom, Notion, Figma, etc.) presents multiple SSO options, prefer **Google SSO with `be2jay67@gmail.com`** — this is the user's primary account and has the highest chance of being already authenticated.</p>
+<br>
+<hr>
+<br>
+<h2>Prohibited Patterns</h2>
+<br>
+<p>Never do the following under any circumstances:</p>
+<br>
+<p>1. ❌ **`npm run build` while dev server is running** — use `npx tsc --noEmit` for type-check only; deploy via `vercel --prod` directly</p>
+<p>2. ❌ **Killing Node.js processes without authorization** (`taskkill /IM node.exe`, `pkill node`, etc.)</p>
+<p>   - Never kill `node.exe` processes without user approval</p>
+<p>   - On port conflict: use different port or inform user instead of killing</p>
+<br>
+<p>3. ❌ **Running git commit without authorization** — only run when user explicitly says "commit"</p>
+<br>
+<p>4. ❌ **Running git checkout/restore without authorization** (reverting file changes)</p>
+<p>   - Must confirm before `git checkout <file>` or `git restore <file>` — uncommitted changes will be lost</p>
+<p>   - `git checkout -b` (branch creation) is exempt</p>
+<br>
+<p>5. ❌ **Korean/multibyte filenames** — minimize Korean in filenames/branch names (prefer ASCII). Use `--name-only` for git output parsing.</p>
+<br>
+<p>6. ❌ **Tool output truncation** — for Korean content, set generous `head_limit`; process line by line if needed.</p>
+<br>
+<p>7. ❌ **Killing the hub server process directly** (`pkill uvicorn`, `kill -9 <pid>`, `lsof -ti:9000 | xargs kill`, etc.)</p>
+<p>   - The hub at port 9000 is managed by systemd and is the exec session's own communication channel.</p>
+<p>   - To restart hub after code changes: `POST http://<hub-ip>:9000/api/hub/restart`</p>
+<p>   - Direct kill disconnects the exec session from the hub — losing task context.</p>
+<br>
+<hr>
+<h3>Document Location Rules</h3>
+<br>
+<li>❌ No `.md` files in root (except `README.md`, `CONTRIBUTING.md`)</li>
+<li>❌ No docs in `src/`, `scripts/`, `tests/` code folders</li>
+<li>✅ Always save under `docs/<category>/`</li>
+<li>✅ After moving files: run `index_directory(project_path, incremental=True)`</li>
+<li>✅ **[Required] Update `docs/DOC_INDEX.md` on every doc create/move/delete**</li>
+<p>  (PostToolUse hook enforces this)</p>
+<br>
+<hr>
+<br>
+<h2>External Services Safety</h2>
+<br>
+<p>**Never mix up projects in a multi-project environment.** Always verify `.env.local` matches the target project before any connection.</p>
+<br>
+<blockquote>**Past incident**: "table not found" → was connected to wrong Supabase project.</blockquote>
+<br>
+<p>Full checklists (Supabase / Vercel / Railway): `~/.claude/tool-hints/external-services.md`</p>
+<br>
+<p>**Supabase Edge Functions errors**: Always check logs directly at [Supabase Dashboard → Edge Functions → Logs](https://supabase.com/dashboard/project/_/functions) before guessing the cause.</p>
+<br>
+<br>
+<h3>Browser RPA & Playwright Rules</h3>
+<br>
+<p>When browser work gets stuck or needs verification — use Playwright instead of guessing.</p>
+<br>
+<p>**Tool priority:** `mcp__playwright-session-*` → `playwright` CLI (`~/.local/bin/playwright`, always available)</p>
+<br>
+<p>**Session vs Remote:** Use `mcp__playwright-session-*` for non-interactive checks (snapshots, scraping, URL verification). Use `mcp__playwright-mcp-remote__*` only when user interaction is needed (login, file upload, clicking visible UI) — remote shows in noVNC so user can watch/intervene.</p>
+<br>
+<p>**Session rules:** Check `browser_tabs` first (session-1→2→3→4), use `about:blank` = idle session. **If session-N fails or is busy (non-blank tabs, tool error), immediately try session-(N+1) — exhaust all 4 before giving up.** ❌ Never create new sessions without authorization. ❌ Never auto-proceed on login required — stop and ask.</p>
+<br>
+<p>**Selector strategy (MANDATORY):** `getByRole` / `getByLabel` / `getByText` / `getByPlaceholder` — ❌ no CSS/ID selectors.</p>
+<br>
+<p>**Smoke test:** `node ~/.claude/snippets/pw-smoke.js` (template: `~/.claude/snippets/pw-smoke.js`)</p>
+<br>
+<hr>
+<br>
+<h3>Tool Substitution for Non-Anthropic Models</h3>
+<li>When using non-Anthropic models (MiniMax, Gemini, Qwen, GLM, etc.), replace websearch tools with `mcp__websearch__search_web` and `mcp__websearch__fetch_url`.</li>
+<br>
+<h3>Dev Server Restart</h3>
+<p>On port conflict: kill process (`lsof -ti:<port> | xargs kill`) → delete `.next` → restart</p>
+<p>**Note**: If the process is Node.js-based (Next.js, etc.), confirm with user first (Prohibited Patterns #7). For non-Node servers (Python, Go, etc.): kill without confirmation.</p>
+<br>
+<hr>
+<br>
+<br>
+<h2>UI Design Rules</h2>
+<br>
+<h3>No AI Model Names in UI</h3>
+<li>❌ **Never expose AI model names in UI code** (Gemini, Claude, GPT, Flash, Sonnet, etc.)</li>
+<li>Use generic terms like "AI", "AI Analysis" instead</li>
+<li>Scope: all user-visible text in `.tsx`, `.jsx`, `.html` files</li>
+<li>Exception: admin-only internal pages, dev tools, server logs</li>
+<br>
+<h3>No Emojis in UI Code</h3>
+<li>❌ **Never use emojis in TSX/HTML UI code** (text labels, buttons, headers, icons, etc.)</li>
+<li>Use text, SVG icons, or Unicode symbols (←, →, ↑, ↓, ✓) instead</li>
+<li>Scope: strings inside JSX/HTML elements in `.tsx`, `.jsx`, `.html` files</li>
+<li>Exception: only when explicitly requested by user</li>
+<br>
+<h2>NS Hub Protocol (auto-injected by hub install-global)</h2>
+<p><!-- NS_HUB_GLOBAL_START --></p>
+<p>Stone lifecycle: queued → pending_confirmation → done.</p>
+<p>COMPLETION PROTOCOL: PATCH status=pending_confirmation + append_message.role=claude + star_relation + exec_start + exec_end + model_used (all in one PATCH).</p>
+<p>COMMENT RULE: append_message ≤3 lines. Longer detail → docs/ns-replies/<DATE>-<MID>.md then reference link in comment.</p>
+<p>PARALLEL DISPATCH: 2+ independent queued stones → emit multiple Agent calls in ONE message.</p>
+<p>NO-OP PROTOCOL: if skipping a stone, post 1-line reason via append_message. Silent skip forbidden.</p>
+<p>TOKEN DISCIPLINE: after completion post ONLY the 1-line summary. No follow-up questions.</p>
+<p><!-- NS_HUB_GLOBAL_END --></p>
+<br></body></html>

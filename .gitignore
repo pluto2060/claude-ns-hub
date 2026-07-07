@@ -9,19 +9,50 @@ certs/
 *.crt
 *.pem
 
-# ── Core implementation (distributed via PyPI only — M1064) ──────────────
-server.py
-install-hooks.sh
-task-worker.sh
+# ── M1608: converted to full open-source (2026-07-06) — core implementation
+# (server.py, static/northstar.html, static/hooks/*.py, scripts/) is now tracked
+# and pushed to GitHub alongside PyPI, per the "hub=product, monetize via data
+# not code" decision. entity/ and corpus/corpora/ (data-pipeline working dirs,
+# not source) stay excluded.
 entity/
-scripts/
-hooks/
 corpus/
 corpora/
 
-# ── Frontend assets (distributed via PyPI only) ──────────────────────────
-static/
-static/claude-md-preview.html
+# ── M1608-c: REVERTED the /hooks/ exclusion from M1608-b (2026-07-06). It was
+# wrong: ~/.claude/settings.json hardcodes hook commands as
+# "python3 $HOME/.hub/hooks/northstar-*.py" — the top-level hooks/ symlinks are
+# NOT redundant duplication, they're the actual path Claude Code's hook runner
+# invokes. Excluding them from git would mean a fresh `git clone` + pip install
+# ships a settings.json that points at a directory that doesn't exist until
+# someone manually recreates the symlinks — breaking every hook silently.
+# static/hooks/*.py (canonical real files) stay tracked either way.
+
+# Demo/test/scratch HTML pages and personal marketing card mockups — no
+# adoption value to a first-time visitor, just noise in the public tree.
+static/*-test.html
+static/*-test2.html
+static/gc-test.html
+static/waterfall-test.html
+static/ns-table-test.html
+static/m1355-test.html
+static/ns-test2.html
+static/landing.html
+static/market-signals.html
+static/linkedin-card*.html
+static/ns-hub-linkedin-card*.html
+static/ns-hub-card.html
+static/detail-card-v1.html
+static/model-char.html
+static/characters/
+
+# Dead code — kept locally for reference, never wired into anything live.
+hooks/_deprecated/
+static/hooks/_deprecated/
+
+# M1608-e: explicitly-disabled hooks (orphaned, not wired into settings.json/server.py)
+# kept locally for reference but excluded from the public push — not deploy targets.
+hooks/.disabled/
+static/hooks/.disabled/
 
 # ── Internal data/docs ────────────────────────────────────────────────────
 dataset/
@@ -54,6 +85,8 @@ task-locks/
 task-queue/
 task-results/
 *.log
+*.log.*
+logs/
 _archive-from-claude-*/
 
 # ── Caches / build / browser dumps ───────────────────────────────────────
