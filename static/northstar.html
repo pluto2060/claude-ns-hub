@@ -6634,45 +6634,87 @@ async function _loadEfficiencyMetrics() {
 
 // M1699-fork: fork the currently-picked session onto the model selected in the
 // dropdown (claude / openrouter only — both run the Claude Code CLI, so a forked
-// M1699-fork: fork a SPECIFIC session row onto the model selected in the dropdown
-// (claude / openrouter only — both run the Claude Code CLI, so a forked session
-// composes --fork-session with a per-model --model/env override). The source row's
+// M1699-fork: open an agent×model picker popup for forking a session row.
+// Only claude / openrouter are offered (both run the Claude Code CLI, so a fork
+// composes --fork-session with a per-model --model/env override). The source
 // session is left untouched and remains resumable after switching back.
-async function forkSessionFromRow(projId, sourceId) {
+function openForkDialog(projId, sourceId, defaultAgent, defaultModel) {
   if (!sourceId || sourceId === 'fresh') {
     _hubAlert('No source session to fork from this row.');
     return;
   }
-  const modelSel = document.getElementById('dm-model-select');
-  const targetModel = (modelSel ? modelSel.value : '') || '';
-  // Restrict to claude / openrouter (CLI-based); reject codex/dsk for now.
-  if (targetModel && !targetModel.startsWith('claude-') && !targetModel.startsWith('or-') && targetModel !== 'haiku' && targetModel !== 'sonnet' && targetModel !== 'opus' && targetModel !== 'fable') {
-    _nsConfirm('Fork not supported for this model',
-      `${targetModel} is not a Claude-Code-based model.\nFork supports claude-* and or-* only.`,
-      null);
+  const overlayId = '_fork-dialog-overlay';
+  document.getElementById(overlayId)?.remove();
+  const ov = document.createElement('div');
+  ov.id = overlayId;
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:10300;display:flex;align-items:center;justify-content:center';
+  // Build agent options (claude + openrouter only).
+  const _agents = [
+    ['claude', 'Claude Code'],
+    ['openrouter', 'OpenRouter'],
+  ];
+  const _agentOpts = _agents.map(([v, lbl]) =>
+    `<option value="${esc(v)}"${v === (defaultAgent || 'claude') ? ' selected' : ''}>${esc(lbl)}</option>`).join('');
+  // Build model options for the default agent from MODEL_CATALOG.
+  const _mkModelOpts = (agent) => {
+    const cat = (typeof MODEL_CATALOG !== 'undefined' ? MODEL_CATALOG[agent] : null) || [];
+    return cat.map(([v, lbl]) =>
+      `<option value="${esc(v)}"${v === (defaultModel || '') ? ' selected' : ''}>${esc(lbl)}</option>`).join('');
+  };
+  const box = document.createElement('div');
+  box.style.cssText = 'background:var(--panel);border:1px solid var(--panel-border);border-radius:10px;padding:18px 20px;width:min(340px,92vw);box-shadow:0 10px 40px rgba(0,0,0,.5);font-family:var(--mono)';
+  box.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <span style="font-size:13px;font-weight:700;color:var(--text)">Fork session</span>
+      <button id="_fork-close" style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:15px;line-height:1">✕</button>
+    </div>
+    <div style="font-size:9px;color:var(--text-dim);margin-bottom:10px;word-break:break-all">source: ${esc(sourceId)}</div>
+    <label style="display:block;font-size:10px;color:var(--text-dim);margin-bottom:3px">agent</label>
+    <select id="_fork-agent" style="width:100%;background:var(--bg-deep);border:1px solid var(--panel-border);color:var(--text);font-family:var(--mono);font-size:11px;padding:5px 8px;border-radius:5px;margin-bottom:10px;color-scheme:dark">${_agentOpts}</select>
+    <label style="display:block;font-size:10px;color:var(--text-dim);margin-bottom:3px">model</label>
+    <select id="_fork-model" style="width:100%;background:var(--bg-deep);border:1px solid var(--panel-border);color:var(--text);font-family:var(--mono);font-size:11px;padding:5px 8px;border-radius:5px;margin-bottom:14px;color-scheme:dark">${_mkModelOpts(defaultAgent || 'claude')}</select>
+    <div style="display:flex;justify-content:flex-end;gap:8px">
+      <button id="_fork-cancel" style="font-size:11px;padding:5px 14px;border-radius:5px;border:1px solid var(--panel-border);background:transparent;color:var(--text-dim);cursor:pointer">Cancel</button>
+      <button id="_fork-confirm" style="font-size:11px;padding:5px 16px;border-radius:5px;border:1px solid var(--accent);background:var(--accent);color:#000;font-weight:600;cursor:pointer">Fork</button>
+    </div>`;
+  ov.appendChild(box);
+  document.body.appendChild(ov);
+  const _agentSel = box.querySelector('#_fork-agent');
+  const _modelSel = box.querySelector('#_fork-model');
+  _agentSel.onchange = () => { _modelSel.innerHTML = _mkModelOpts(_agentSel.value); };
+  const _close = () => ov.remove();
+  ov.onclick = e => { if (e.target === ov) _close(); };
+  box.querySelector('#_fork-close').onclick = _close;
+  box.querySelector('#_fork-cancel').onclick = _close;
+  box.querySelector('#_fork-confirm').onclick = () => {
+    const targetAgent = _agentSel.value;
+    const targetModel = _modelSel.value;
+    _close();
+    doForkSession(projId, sourceId, targetAgent, targetModel);
+  };
+}
+
+async function doForkSession(projId, sourceId, targetAgent, targetModel) {
+  // Reject non-CLI agents (codex/dsk) — fork needs the Claude Code CLI.
+  if (targetAgent && targetAgent !== 'claude' && targetAgent !== 'openrouter') {
+    _hubAlert(`Fork only supports claude / openrouter (got ${targetAgent}).`);
     return;
   }
-  const btn = event && event.target && event.target.closest('span');
-  const origTxt = btn ? btn.textContent : '';
-  if (btn) { btn.style.pointerEvents = 'none'; btn.textContent = '◌ Forking…'; }
   try {
     const r = await fetch(`/api/northstar/${encodeURIComponent(projId)}/fork-session`, {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ source_session_id: sourceId, target_model: targetModel }),
+      body: JSON.stringify({ source_session_id: sourceId, target_model: targetModel, agent: targetAgent }),
     });
     const d = await r.json().catch(() => ({}));
     if (!r.ok || !d.ok) {
       _hubAlert('Fork failed: ' + (d.error || r.status));
       return;
     }
-    _hubAlert(`Forked onto ${d.target_model} → ${d.session}. Original session intact.`);
-    // Refresh session pane + exec pill so the new forked row appears immediately.
+    _hubAlert(`Forked onto ${d.target_model} (${targetAgent}) → ${d.session}. Original session intact.`);
     if (typeof window._renderResumableSessions === 'function') window._renderResumableSessions();
     if (typeof window._refreshExecState === 'function') window._refreshExecState();
   } catch (e) {
     _hubAlert('Fork error: ' + e.message);
-  } finally {
-    if (btn) { btn.style.pointerEvents = ''; btn.textContent = origTxt; }
   }
 }
 
@@ -14041,13 +14083,13 @@ function renderRight(p) {
               + (isExecLive && _tmuxSession ? `<span class="ns-node-term live" style="font-size:8px;padding:1px 6px;cursor:pointer;flex-shrink:0;margin-left:3px"
                   title="Open in browser terminal (ttyd — mobile-friendly with virtual keyboard)"
                   onclick="event.stopPropagation();openTtydTerminal('${esc(_tmuxSession)}','${esc(_projId)}')">↗_</span>` : '');
-            // M1699-fork: per-row ⑂ Fork button — forks THIS row's source session onto the
-            // model currently selected in the dropdown (claude / openrouter only). Hidden on
-            // fresh rows (no source to inherit) and exec_live (already a running process).
+            // M1699-fork: per-row ⑂ Fork button (placed LEFT of the tmux terminal button).
+            // Opens an agent×model picker popup; forks THIS row's source session onto the
+            // chosen target. Hidden on fresh rows (no source) and exec_live (already running).
             const _forkRowBtn = (!isFresh && !isExecLive && s.id && s.id !== 'fresh')
               ? `<span class="ns-node-term" style="font-size:8px;padding:1px 6px;cursor:pointer;flex-shrink:0;color:var(--blue,#7b9fd4);border:1px solid rgba(123,159,212,.4);background:rgba(123,159,212,.1);border-radius:3px"
-                  title="Fork this session onto the selected model (claude / openrouter) — source stays intact"
-                  onclick="event.stopPropagation();forkSessionFromRow('${esc(_projId)}','${esc(s.id)}')">⑂ Fork</span>`
+                  title="Fork this session onto a target agent/model — source stays intact"
+                  onclick="event.stopPropagation();openForkDialog('${esc(_projId)}','${esc(s.id)}','${esc(agent)}','${esc(model_key)}')">⑂ Fork</span>`
               : '';
             // M253: for fresh rows, use current dropdown agent/model so switching to openrouter
             // then clicking "new session" doesn't reset dropdowns back to claude default.
@@ -14080,8 +14122,8 @@ function renderRight(p) {
               <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 0;min-width:0">${label}</span>
               ${isExecLive ? `<span style="font-size:8px;color:var(--green);font-weight:600;flex-shrink:0">live</span>` : (!isFresh && _liveExecSid && s.id === _liveExecSid ? `<span style="font-size:8px;color:var(--green);opacity:.7;flex-shrink:0">cur</span>` : '')}
               ${subLabel}
-              ${_ptyRowBtn}
               ${_forkRowBtn}
+              ${_ptyRowBtn}
             </div>`;
           }
           // M257: include PTY state in hash so color/label changes force re-render

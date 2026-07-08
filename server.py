@@ -10535,16 +10535,15 @@ async def fork_session(proj_id: str, request: Request):
     if not src_t.exists() or src_t.stat().st_size == 0:
         return JSONResponse({"ok": False, "error": "source session not found"}, status_code=404)
 
-    # Auto-correct agent from model prefix (mirror execute handler)
-    if target_model.startswith("or-") and agent != "openrouter":
-        agent = "openrouter"
-    elif target_model and not target_model.startswith("or-") and agent == "openrouter":
-        agent = "claude"
-    if agent not in _ALLOWED_PTY_AGENTS or agent in ("codex", "dsk"):
-        agent = "claude"
-    # Fork is claude/openrouter only
+    # Agent resolution for fork (claude / openrouter only — both CLI-based):
+    # or-* models MUST run under openrouter (LiteLLM proxy); non-or models use the
+    # explicitly requested agent (default claude) when valid, else fall back to claude.
     if target_model.startswith("or-"):
         agent = "openrouter"
+    elif agent in ("claude", "openrouter"):
+        pass  # respect explicit valid agent
+    elif agent in _ALLOWED_PTY_AGENTS:
+        agent = "claude"  # codex/dsk not supported for fork
     else:
         agent = "claude"
 
