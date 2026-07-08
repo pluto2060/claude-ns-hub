@@ -6634,13 +6634,13 @@ async function _loadEfficiencyMetrics() {
 
 // M1699-fork: fork the currently-picked session onto the model selected in the
 // dropdown (claude / openrouter only — both run the Claude Code CLI, so a forked
-// session composes --fork-session with a per-model --model/env override). The
-// source session is left untouched and remains resumable after switching back.
-async function forkCurrentSession(projId) {
-  const sel = window._selectedSession || {};
-  const sourceId = sel.session_id || '';
-  if (!sourceId) {
-    _hubAlert('Select a session to fork first (click a session row).');
+// M1699-fork: fork a SPECIFIC session row onto the model selected in the dropdown
+// (claude / openrouter only — both run the Claude Code CLI, so a forked session
+// composes --fork-session with a per-model --model/env override). The source row's
+// session is left untouched and remains resumable after switching back.
+async function forkSessionFromRow(projId, sourceId) {
+  if (!sourceId || sourceId === 'fresh') {
+    _hubAlert('No source session to fork from this row.');
     return;
   }
   const modelSel = document.getElementById('dm-model-select');
@@ -6652,9 +6652,9 @@ async function forkCurrentSession(projId) {
       null);
     return;
   }
-  const btn = event && event.target && event.target.closest('button');
+  const btn = event && event.target && event.target.closest('span');
   const origTxt = btn ? btn.textContent : '';
-  if (btn) { btn.disabled = true; btn.textContent = '◌ Forking…'; }
+  if (btn) { btn.style.pointerEvents = 'none'; btn.textContent = '◌ Forking…'; }
   try {
     const r = await fetch(`/api/northstar/${encodeURIComponent(projId)}/fork-session`, {
       method: 'POST', headers: {'Content-Type':'application/json'},
@@ -6672,7 +6672,7 @@ async function forkCurrentSession(projId) {
   } catch (e) {
     _hubAlert('Fork error: ' + e.message);
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = origTxt; }
+    if (btn) { btn.style.pointerEvents = ''; btn.textContent = origTxt; }
   }
 }
 
@@ -13554,10 +13554,6 @@ function renderRight(p) {
         <div class="dm-toggle-pane" id="dm-session-pane">
           <div class="dm-pane-header" onclick="toggleDmPane('dm-session-pane')">
             <span class="dm-pane-label">session</span>
-            <button type="button" onclick="event.stopPropagation();forkCurrentSession('${esc(p.id)}')"
-              title="Fork the currently picked session onto the selected model (claude / openrouter) — original session stays intact"
-              style="margin-left:6px;font-family:var(--mono);font-size:9px;padding:1px 7px;border-radius:3px;cursor:pointer;line-height:1.3;white-space:nowrap;
-                     background:rgba(123,159,212,.1);color:var(--blue,#7b9fd4);border:1px solid rgba(123,159,212,.4)">⑂ Fork</button>
             <span class="dm-pane-caret" id="dm-session-caret">▾</span>
           </div>
           <div class="dm-pane-body" id="dm-session-pane-body" style="display:none;
@@ -14045,6 +14041,14 @@ function renderRight(p) {
               + (isExecLive && _tmuxSession ? `<span class="ns-node-term live" style="font-size:8px;padding:1px 6px;cursor:pointer;flex-shrink:0;margin-left:3px"
                   title="Open in browser terminal (ttyd — mobile-friendly with virtual keyboard)"
                   onclick="event.stopPropagation();openTtydTerminal('${esc(_tmuxSession)}','${esc(_projId)}')">↗_</span>` : '');
+            // M1699-fork: per-row ⑂ Fork button — forks THIS row's source session onto the
+            // model currently selected in the dropdown (claude / openrouter only). Hidden on
+            // fresh rows (no source to inherit) and exec_live (already a running process).
+            const _forkRowBtn = (!isFresh && !isExecLive && s.id && s.id !== 'fresh')
+              ? `<span class="ns-node-term" style="font-size:8px;padding:1px 6px;cursor:pointer;flex-shrink:0;color:var(--blue,#7b9fd4);border:1px solid rgba(123,159,212,.4);background:rgba(123,159,212,.1);border-radius:3px"
+                  title="Fork this session onto the selected model (claude / openrouter) — source stays intact"
+                  onclick="event.stopPropagation();forkSessionFromRow('${esc(_projId)}','${esc(s.id)}')">⑂ Fork</span>`
+              : '';
             // M253: for fresh rows, use current dropdown agent/model so switching to openrouter
             // then clicking "new session" doesn't reset dropdowns back to claude default.
             // M271: fresh rows use dropdown's actual current value to preserve user selection
@@ -14077,6 +14081,7 @@ function renderRight(p) {
               ${isExecLive ? `<span style="font-size:8px;color:var(--green);font-weight:600;flex-shrink:0">live</span>` : (!isFresh && _liveExecSid && s.id === _liveExecSid ? `<span style="font-size:8px;color:var(--green);opacity:.7;flex-shrink:0">cur</span>` : '')}
               ${subLabel}
               ${_ptyRowBtn}
+              ${_forkRowBtn}
             </div>`;
           }
           // M257: include PTY state in hash so color/label changes force re-render
