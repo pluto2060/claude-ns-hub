@@ -6682,6 +6682,13 @@ function openForkDialog(projId, sourceId, defaultAgent, defaultModel) {
   const _agentSel = box.querySelector('#_fork-agent');
   const _modelSel = box.querySelector('#_fork-model');
   _agentSel.onchange = () => { _modelSel.innerHTML = _mkModelOpts(_agentSel.value); };
+  // Auto-sync agent when a model is picked (or-* → openrouter, else claude) so the
+  // popup selection stays internally consistent with the fork backend constraints.
+  _modelSel.onchange = () => {
+    const _v = _modelSel.value || '';
+    if (_v.startsWith('or-') && _agentSel.value !== 'openrouter') _agentSel.value = 'openrouter';
+    else if (!_v.startsWith('or-') && _agentSel.value !== 'claude') _agentSel.value = 'claude';
+  };
   const _close = () => ov.remove();
   ov.onclick = e => { if (e.target === ov) _close(); };
   box.querySelector('#_fork-close').onclick = _close;
