@@ -2524,8 +2524,12 @@ def _derive_outcome_label(stone: dict) -> str | None:
 import re as _re_pii
 _PII_PATTERNS = [
     (_re_pii.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"), "<EMAIL>"),
-    (_re_pii.compile(r"\b\+?\d{1,3}[-\s.]?\(?\d{2,4}\)?[-\s.]?\d{3,4}[-\s.]?\d{3,4}\b"), "<PHONE>"),
+    # M1732: IP must run BEFORE phone — the phone regex's loose \d{1,3}[.]?\d{2,4}...
+    # shape matches the first 3 octets of an IPv4 address (e.g. "100.110.117" out of
+    # "100.110.117.8"), consuming it before the IP pattern ever runs and leaving a
+    # malformed "<PHONE>.8" residue instead of a clean "<IP>". Verified via direct test.
     (_re_pii.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "<IP>"),
+    (_re_pii.compile(r"\b\+?\d{1,3}[-\s.]?\(?\d{2,4}\)?[-\s.]?\d{3,4}[-\s.]?\d{3,4}\b"), "<PHONE>"),
     (_re_pii.compile(r"Bearer\s+[A-Za-z0-9\-._~+/]+=*", _re_pii.IGNORECASE), "Bearer <TOKEN>"),
     (_re_pii.compile(r"sk-[A-Za-z0-9]{20,}"), "<API_KEY>"),
 ]
@@ -3938,7 +3942,10 @@ async def _startup_telemetry():
 async def _expose_ports_to_tailscale():
     """Auto-expose hub ports to all online Tailscale Windows clients on startup."""
     import subprocess
-    for port in [9000]:
+    # M1694b: was hardcoded [9000], drifted from actual runtime HUB_PORT (9001 in this
+    # deployment) — wsl-expose was silently opening the wrong port. Use the same PORT
+    # constant the server itself binds to (module-level, reads HUB_PORT env var).
+    for port in [PORT]:
         try:
             subprocess.run(
                 [str(Path.home() / ".local/bin/wsl-expose"), str(port)],
@@ -4985,6 +4992,7 @@ _ALLOWED_MODELS = {
     "or-deepseek-v4-flash",
     "or-kimi-k2",
     "or-hy3-preview",
+    "or-hy3",
     "or-owl-alpha",
     "or-grok-3",
     "or-grok-3-mini",
@@ -5004,6 +5012,7 @@ _OPENROUTER_MODELS = {
     "or-deepseek-v4-flash",
     "or-kimi-k2",
     "or-hy3-preview",
+    "or-hy3",
     "or-owl-alpha",
     "or-grok-3",
     "or-grok-3-mini",
@@ -5075,12 +5084,14 @@ def _get_project_model_value(proj_id: str) -> str:
     return cfg_model if cfg_model in _ALLOWED_MODELS else ""
 
 
-def _get_project_model(proj_id: str) -> list:
+def _get_project_model(proj_id: str, override_model: str = None) -> list:
     """Return ['--model', value] if frontmatter has a valid model, else [].
     Spliced into PTY + tmux spawn argv.
     Rewrites or-* aliases to openrouter-* to match the LiteLLM proxy's
-    exposed model IDs (seen via GET /v1/models)."""
-    model = _get_project_model_value(proj_id)
+    exposed model IDs (seen via GET /v1/models).
+    M1699-fork: override_model lets a fork session apply a target model without
+    mutating the project's stored model (source session stays on its own model)."""
+    model = override_model if override_model is not None else _get_project_model_value(proj_id)
     if model.startswith("or-"):
         model = "openrouter-" + model[3:]
     return ["--model", model] if model else []
@@ -5150,7 +5161,7 @@ def _get_agent_spawn_cmd(proj_id: str) -> list:
                         cfg_claude = str(_bin); break
                 if cfg_claude: break
     claude_bin = cfg_claude or "claude"
-    return [claude_bin, "--dangerously-skip-permissions", *_get_project_model(proj_id)]
+    return [claude_bin, "--dangerously-skip-permissions", *_DISALLOWED_TOOLS_ARGS, *_get_project_model(proj_id)]
 
 
 def _get_pty_spawn_cmd(proj_id: str, agent: str | None = None) -> list:
@@ -5171,14 +5182,16 @@ def _get_pty_spawn_cmd(proj_id: str, agent: str | None = None) -> list:
         return ["codex", "--dangerously-bypass-approvals-and-sandbox"]
     # openrouter = Claude Code CLI + LiteLLM/OpenRouter env (handled by _get_project_spawn_env)
     claude_bin = _shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude")
-    return [claude_bin, "--dangerously-skip-permissions", *_get_project_model(proj_id)]
+    return [claude_bin, "--dangerously-skip-permissions", *_DISALLOWED_TOOLS_ARGS, *_get_project_model(proj_id)]
 
 
-def _get_project_spawn_env(proj_id: str) -> dict:
+def _get_project_spawn_env(proj_id: str, override_model: str = None) -> dict:
     """Return extra env vars to splice into the Claude spawn for this project.
     For OSK/GPT: routes to LiteLLM proxy. For OpenRouter: routes via LiteLLM proxy.
-    Otherwise {}."""
-    model = _get_project_model_value(proj_id)
+    Otherwise {}.
+    M1699-fork: override_model lets a fork session route the proxy env to a target
+    model independent of the project's stored model."""
+    model = override_model if override_model is not None else _get_project_model_value(proj_id)
     if model in _OSK_MODELS:
         # Route to LiteLLM proxy on 127.0.0.1:4100 (GPT)
         return {
@@ -5270,6 +5283,16 @@ _HUB_EXEC_SYS_PROMPT = (
     "after skill_refs[0] completes call each skill in skill_refs_remaining in order. "
     "Skipping any skill = silent failure."
 )
+
+
+# M1712-b: Group-A (mechanical) block on AskUserQuestion for all hub-spawned exec sessions.
+# The Group-B prompt hint (_option_choice_hint in get_pending_task's response) only reduces
+# the odds of AskUserQuestion firing — proven insufficient live this session (fired twice
+# despite the hint being loaded and delivered on every task fetch). --disallowedTools is a
+# genuine CLI-level deny-list, distinct from --dangerously-skip-permissions (which only
+# bypasses the interactive approval prompt for tools that ARE available) — a denied tool is
+# never offered to the model at all. Spliced into every spawn command below.
+_DISALLOWED_TOOLS_ARGS = ["--disallowedTools", "AskUserQuestion"]
 
 
 def _hub_mcp_spawn_args(proj_id: str, session_name: str, agent: str = "claude") -> list:
@@ -6494,7 +6517,7 @@ async def update_north_star(proj_id: str, ns_id: str, request: Request):
                                      / _encode_cwd_for_claude(str(_spawn_cwd))).glob("*.jsonl")}
                 except Exception:
                     _sp_pre_files = set()
-                _sp_cmd = (["claude", "--dangerously-skip-permissions"]
+                _sp_cmd = (["claude", "--dangerously-skip-permissions"] + _DISALLOWED_TOOLS_ARGS
                            + _hub_mcp_spawn_args(proj_id, _new_assigned)
                            + _sp_resume_args + _get_project_model(proj_id))
                 subprocess.Popen(["tmux", "new-session", "-d", "-s", _new_assigned, "-c", _spawn_cwd]
@@ -7730,18 +7753,32 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                         # ("is this a real direct answer") stay unenforced by design (M1706:
                         # Group B, would need a second LLM judge call, not worth the FP rate).
                         # allow_long_reply:true overrides for legitimate long analyses.
-                        # M1709-b: temporarily disabled per user request — the pure line-count
-                        # gate was proven to false-positive on legitimate well-structured replies
-                        # (RobotAI spot_voice_pipeline example: 8 real lines, clean per-item
-                        # bullets, blocked identically to unstructured prose since the gate only
-                        # counts newlines and has no concept of bullet/list markers). Re-enable
-                        # by flipping this flag once a marker-aware exception is designed, or
-                        # remove entirely if the length-only approach is abandoned.
-                        _LINE_GATE_ENABLED = False
+                        # M1709-c: re-enabled with a marker-aware exception. The pure line-count
+                        # gate (M1709-b) was disabled after proving it false-positives on
+                        # legitimate well-structured replies (RobotAI spot_voice_pipeline example:
+                        # 8 real lines, clean per-item bullets, blocked identically to unstructured
+                        # prose since raw newline-count has no concept of bullet/list/table
+                        # markers). Root complaint was never "too many lines" — it was unbroken
+                        # PROSE walls (M1709 screenshot: one long paragraph, zero structure).
+                        # Fix: exempt replies where at least half the non-blank lines carry a
+                        # structural marker (bullet -/•/*, numbered 1./①, or a markdown table
+                        # row with |) — allows a one-line header/intro before a bulleted body
+                        # (the RobotAI example: 1 header + 7 bullets = 7/8 marked, exempted).
+                        # A reply that's just N short unmarked lines (plain prose broken by
+                        # newlines, no real structure) still gets blocked, matching the actual
+                        # complaint (unbroken/unstructured walls, not raw line count).
+                        _LINE_GATE_ENABLED = False  # M1709-d: temp disabled per user request (token cost concern)
                         _len_text = str(msg.get("text", ""))
                         _len_lines = [l for l in _len_text.split("\n") if l.strip()]
                         _allow_long_reply = bool(data.get("allow_long_reply"))
-                        if _LINE_GATE_ENABLED and len(_len_lines) > 3 and not _allow_long_reply:
+                        import re as _re_gate
+                        _marker_re = _re_gate.compile(
+                            r'^\s*([-•*]|\d+[.)]|[①②③④⑤⑥⑦⑧⑨⑩]|\|.*\|)\s'
+                        )
+                        _marked_count = sum(1 for l in _len_lines if _marker_re.match(l))
+                        _is_structured = len(_len_lines) >= 2 and _marked_count >= max(2, len(_len_lines) // 2)
+                        if (_LINE_GATE_ENABLED and len(_len_lines) > 3
+                                and not _allow_long_reply and not _is_structured):
                             try:
                                 _server_log_action(proj_id, mid, "reply_line_limit_blocked",
                                                    f"{len(_len_lines)} lines")
@@ -7752,9 +7789,11 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                                 "error": "reply_line_limit_blocked",
                                 "line_count": len(_len_lines),
                                 "detail": (
-                                    f"Reply has {len(_len_lines)} lines — max 3 lines for stone "
-                                    f"chat replies (M172/M270 convention). Condense, or set "
-                                    f"\"allow_long_reply\":true in the body to override (M1709)."
+                                    f"Reply has {len(_len_lines)} lines of unstructured prose — "
+                                    f"max 3 lines unless using bullets/numbered-list/table markers "
+                                    f"(M172/M270 convention). Condense or restructure with "
+                                    f"-/1./| markers, or set \"allow_long_reply\":true to override "
+                                    f"(M1709)."
                                 ),
                             }, status_code=422)
                     # M185/M1064 v2: line-summary — extract key lines, skip blanks
@@ -9706,7 +9745,7 @@ async def execute_project(proj_id: str, request: Request):
                                                              / _encode_cwd_for_claude(str(_br_spawn_cwd))).glob("*.jsonl")}
                                         except Exception:
                                             _br_pre_files = set()
-                                        _br_claude_cmd = (["claude", "--dangerously-skip-permissions"]
+                                        _br_claude_cmd = (["claude", "--dangerously-skip-permissions"] + _DISALLOWED_TOOLS_ARGS
                                                           + _hub_mcp_spawn_args(proj_id, _br_sess)
                                                           + _br_resume_args + _get_project_model(proj_id))
                                         subprocess.Popen(
@@ -10059,7 +10098,7 @@ async def execute_project(proj_id: str, request: Request):
                 + _stone_impl_steps
                 + f"ORCHESTRATOR — after all waves complete:\n"
                 f"  Post ONE consolidated 1-line summary listing completed MIDs.\n\n"
-                f"COMMENT RULE: append_message MUST be ≤3 lines. 1 line preferred.\n\n"
+                f"COMMENT RULE: append_message MUST be ≤3 lines.\n\n"
                 f"TOKEN DISCIPLINE: NO progress comments during work. ONE past-tense summary at completion.\n\n"
                 f"CAVEMAN LITE MODE (M582): Terse output — drop filler/politeness, keep technical precision. ~60% fewer output tokens.\n\n"
                 + (
@@ -10204,7 +10243,7 @@ async def execute_project(proj_id: str, request: Request):
                 "tmux", "new-session", "-d", "-s", session_name,
                 "-c", spawn_cwd,
                 *_tmux_env,
-                "claude", "--dangerously-skip-permissions", *_get_project_model(proj_id),
+                "claude", "--dangerously-skip-permissions", *_DISALLOWED_TOOLS_ARGS, *_get_project_model(proj_id),
                 *_mcp_full_args, *resume_args,
             ])
             subprocess.run(["tmux", "set-option", "-t", session_name, "history-limit", "2000"], capture_output=True, timeout=2)
@@ -10253,7 +10292,7 @@ async def execute_project(proj_id: str, request: Request):
                     "tmux", "new-session", "-d", "-s", session_name,
                     "-c", spawn_cwd,
                     *_tmux_env,
-                    "claude", "--dangerously-skip-permissions", *_get_project_model(proj_id), *_mcp_args_retry,
+                    "claude", "--dangerously-skip-permissions", *_DISALLOWED_TOOLS_ARGS, *_get_project_model(proj_id), *_mcp_args_retry,
                 ])
                 subprocess.run(["tmux", "set-option", "-t", session_name, "history-limit", "2000"], capture_output=True, timeout=2)
                 elapsed = 0
@@ -10341,7 +10380,7 @@ async def execute_project(proj_id: str, request: Request):
                         "tmux", "new-session", "-d", "-s", _ss_sname,
                         "-c", spawn_cwd,
                         *_ss_env,
-                        "claude", "--dangerously-skip-permissions", *_mother_model_args,  # M1166
+                        "claude", "--dangerously-skip-permissions", *_DISALLOWED_TOOLS_ARGS, *_mother_model_args,  # M1166
                         *_ss_resume_args,
                     ])
                     subprocess.run(["tmux", "set-option", "-t", _ss_sname, "history-limit", "2000"], capture_output=True, timeout=2)
@@ -10948,7 +10987,9 @@ _NOTIFY_COOLDOWN_SEC = 60              # same title within 60s → drop
 
 def _has_queued_stones(proj_id: str) -> bool:
     """M1171 v2: True if project still has stones waiting to execute (status='queued', not held).
-    Used to suppress idle notifications when back-to-back stones are running."""
+    Used to suppress idle notifications when back-to-back stones are running.
+    M1718-b: project-wide — see _session_has_queued_stones for the session-scoped variant
+    that should be used wherever the caller has a specific session_name in hand."""
     try:
         conn = sqlite3.connect(str(_NS_EVENTS_DB), timeout=2)
         count = conn.execute(
@@ -10959,6 +11000,37 @@ def _has_queued_stones(proj_id: str) -> bool:
         return count > 0
     except Exception:
         return False  # fail-open: if DB unreachable, allow notification
+
+
+def _session_has_queued_stones(proj_id: str, session_name: str) -> bool:
+    """M1718-b: session-scoped idle-notify suppression check. _has_queued_stones counted
+    ANY queued stone project-wide, so a child session (e.g. claude-exec-MOAT-b5756107)
+    going genuinely idle had its Telegram notification suppressed just because an
+    unrelated stone was queued for a DIFFERENT session (e.g. the mother's own queue, or
+    a sibling child's substar) — verified live: MOAT mother went idle 2026-07-07 09:59:40
+    while cg_하네스's M1712 sat queued for child -b5756107, and the mother's idle
+    notification never fired (no [tg] log line, no cooldown-file entry — the call was
+    gated off before _send_ntfy_notification was ever invoked). Reuses
+    _session_claimable_queued_count (M1676) — same "could THIS session claim it" logic
+    already used for wake-eligibility, so a session with zero claimable work is treated
+    as genuinely idle regardless of what other sessions still have queued."""
+    try:
+        return _session_claimable_queued_count(proj_id, session_name) > 0
+    except Exception:
+        return False  # fail-open: if check fails, allow notification (same fail-open as _has_queued_stones)
+
+
+def _idle_notify_label(session_name: str, proj_id: str) -> str:
+    """M1718-c: display label for idle-notify title — strips the "{agent}-exec-" prefix
+    so the mother session shows just "HugwartsBanana" (clean, same as before M1718-c) while
+    a branched child shows "HugwartsBanana-b5756107" (distinguishable from the mother).
+    First attempt at this (using the raw session_name including the exec- prefix) was too
+    noisy per user feedback ("claude-exec-HugwartsBanana exec idle" / full sentence body) —
+    this strips the redundant agent+exec prefix and keeps the body short like the original."""
+    for prefix in ("claude-exec-", "codex-exec-", "openrouter-exec-", "dsk-exec-"):
+        if session_name.startswith(prefix):
+            return session_name[len(prefix):]
+    return session_name or proj_id
 
 _TG_COOLDOWN_FILE = _HUB_DATA_DIR / ".tg-last-sent.json"  # M1171 v3: cross-process cooldown
 
@@ -11564,12 +11636,16 @@ async def _start_exec_idle_detector():
                     if not any(session_name.startswith(p) for p in ("claude-exec-", "codex-exec-", "openrouter-exec-", "dsk-exec-")):
                         continue
                     # M1681: was a naive prefix strip (session_name[len(pfx):]) — for a branched
-                    # child like "claude-exec-FromScratch-5752fa2c" this yielded proj_id=
-                    # "FromScratch-5752fa2c" (branch suffix included), which then leaked into the
-                    # ntfy notification title/body below ("FromScratch-5752fa2c exec idle" instead
-                    # of "FromScratch exec idle"). _parse_exec_session_name does the same
-                    # longest-prefix-match against known project dirs used everywhere else
-                    # (get_exec_sessions, poller) — use it here too for a correctly resolved proj_id.
+                    # child like "claude-exec-FromScratch-5752fa2c" this yielded a WRONG proj_id of
+                    # "FromScratch-5752fa2c" (branch suffix included), breaking DB/ownership lookups
+                    # keyed on proj_id. _parse_exec_session_name does the same longest-prefix-match
+                    # against known project dirs used everywhere else (get_exec_sessions, poller) —
+                    # use it here too for a correctly resolved proj_id.
+                    # M1718-c: the notification TITLE below intentionally uses the full session_name
+                    # (not this resolved proj_id) so a child's idle notification is distinguishable
+                    # from the mother's — e.g. "FromScratch-5752fa2c exec idle" vs "FromScratch exec
+                    # idle" is the desired/correct display now, by user request. Not a regression of
+                    # this fix — proj_id here still must stay correctly resolved for DB lookups.
                     _agent_eid, proj_id = _parse_exec_session_name(session_name)
                     if not proj_id:
                         continue
@@ -11619,10 +11695,15 @@ async def _start_exec_idle_detector():
                             _exec_notified[session_name] = time.time()  # M1171 Fix B: prevent browser-poll duplicate
                             _push_session_idle(session_name, proj_id)  # SSE toast
                             # M1171 v2: only notify when queue is empty — suppress mid-batch notifications
-                            if not _has_queued_stones(proj_id):
+                            # M1718-b: session-scoped, not project-wide — a child session with no
+                            # claimable work left is genuinely idle even if a sibling/mother queue isn't.
+                            # M1718-c: label strips exec- prefix — mother shows "HugwartsBanana"
+                            # (clean, unchanged), child shows "HugwartsBanana-b5756107" (distinguishable).
+                            if not _session_has_queued_stones(proj_id, session_name):
+                                _lbl = _idle_notify_label(session_name, proj_id)
                                 _send_ntfy_notification(
-                                    f"{proj_id} exec idle",
-                                    f"Exec session for {proj_id} just went idle",
+                                    f"{_lbl} exec idle",
+                                    f"Exec session for {_lbl} just went idle",
                                     priority="default"
                                 )
                         elif session_name not in _exec_notified:
@@ -11641,10 +11722,13 @@ async def _start_exec_idle_detector():
                             _agent_dc, _proj = _parse_exec_session_name(k)
                             if _proj:
                                 _push_session_idle(k, _proj)
-                                if not _has_queued_stones(_proj):
+                                # M1718-b: session-scoped (k = the session that just died)
+                                # M1718-c: clean label (see _idle_notify_label)
+                                if not _session_has_queued_stones(_proj, k):
+                                    _lbl2 = _idle_notify_label(k, _proj)
                                     _send_ntfy_notification(
-                                        f"{_proj} exec idle",
-                                        f"Exec session for {_proj} just went idle",
+                                        f"{_lbl2} exec idle",
+                                        f"Exec session for {_lbl2} just went idle",
                                         priority="default"
                                     )
             except Exception:
@@ -11869,8 +11953,11 @@ async def get_exec_sessions():
         if idle and (_was_running and _consec_idle >= 2 or _consec_idle >= 3):
             if session_name not in _exec_notified:
                 _push_session_idle(session_name, proj_id)
-                if not _has_queued_stones(proj_id):
-                    _send_ntfy_notification(f"{proj_id} exec idle", f"Exec session for {proj_id} just went idle", priority="default")
+                # M1718-b: session-scoped suppression check (see _session_has_queued_stones)
+                # M1718-c: clean label (see _idle_notify_label) — distinguishes children, mother unchanged
+                if not _session_has_queued_stones(proj_id, session_name):
+                    _lbl3 = _idle_notify_label(session_name, proj_id)
+                    _send_ntfy_notification(f"{_lbl3} exec idle", f"Exec session for {_lbl3} just went idle", priority="default")
                 _exec_notified[session_name] = time.time()
         elif not idle:
             _exec_notified.pop(session_name, None)
@@ -12119,6 +12206,7 @@ async def get_resumable_sessions(proj_id: str, agent: str = "", model: str = "")
         elif ag == "openrouter":
             agent_models = [
                 {"key": "or-hy3-preview", "label": "hy3-preview"},
+                {"key": "or-hy3", "label": "hy3 (free)"},
                 {"key": "or-owl-alpha", "label": "owl-alpha (free)"},
                 {"key": "or-grok-3", "label": "grok-3"},
                 {"key": "or-grok-3-mini", "label": "grok-3-mini"},
@@ -13009,15 +13097,78 @@ def _hub_deploy_hooks():
     if changed:
         settings_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False))
 
+_SYSTEMD_UNIT_TEMPLATE = """\
+[Unit]
+Description=Claude Hub Dashboard (code+data in ~/.hub)
+After=network-online.target
+
+[Service]
+Environment=PATH={bin_dir}:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/hub/env
+EnvironmentFile=-%h/.config/hub/env.host
+Type=simple
+WorkingDirectory=%h/.hub
+# M1160: KillMode=process so `systemctl restart hub` does NOT terminate the tmux server
+# (which spawns inside hub.service cgroup on first session). Without this, default
+# KillMode=control-group SIGKILLs the entire cgroup on restart, dropping every exec session.
+KillMode=process
+KillSignal=SIGINT
+# M488: wait up to 60s for Tailscale IP before binding — prevents bind failure when hub
+# starts before tailscaled assigns the 100.x.x.x address (race at WSL boot without VS Code)
+# M1253: bind 0.0.0.0 (all interfaces) so local clients on 127.0.0.1 — MCP server, hooks,
+# curl — also work. Binding a single Tailscale IP refused 127.0.0.1:9001 (MCP "Connection
+# refused"). The TS-IP wait below is kept only as a readiness gate, not as the bind host.
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do ip addr show tailscale0 2>/dev/null | grep -q "100\\." && exit 0; sleep 2; done; exit 0'
+ExecStart={uvicorn_bin} server:app --host 0.0.0.0 --port ${{HUB_PORT}} --log-level info --access-log --no-server-header
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def _hub_generate_systemd_unit():
+    """M1694b: render ~/.config/systemd/user/hub.service from shutil.which("uvicorn")
+    instead of a hardcoded absolute path + username — the old unit baked in the installing
+    user's home dir literally (/home/desk-1/.local/bin/...), breaking for any other install.
+    Idempotent: skips if a unit already exists with the correct uvicorn path (avoids
+    clobbering hand-tuned units on existing installs); does NOT reload/restart the service —
+    that's the operator's call (`systemctl --user daemon-reload && systemctl --user restart hub`)."""
+    import shutil as _shutil_su
+    uvicorn_bin = _shutil_su.which("uvicorn")
+    if not uvicorn_bin:
+        print("uvicorn not found on PATH — skipping systemd unit generation.")
+        return
+    unit_dir = Path.home() / ".config" / "systemd" / "user"
+    unit_path = unit_dir / "hub.service"
+    rendered = _SYSTEMD_UNIT_TEMPLATE.format(
+        bin_dir=str(Path(uvicorn_bin).parent), uvicorn_bin=uvicorn_bin,
+    )
+    if unit_path.exists():
+        existing = unit_path.read_text(encoding="utf-8")
+        if f"ExecStart={uvicorn_bin} " in existing:
+            print(f"{unit_path} already points at the correct uvicorn path — skipping.")
+            return
+        print(f"{unit_path} exists with a different uvicorn path — not overwriting "
+              f"(regenerate manually if intentional: rm {unit_path} && rerun hub install-global).")
+        return
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    unit_path.write_text(rendered, encoding="utf-8")
+    print(f"Wrote {unit_path} (uvicorn={uvicorn_bin}). Run 'systemctl --user daemon-reload "
+          f"&& systemctl --user enable --now hub' to activate.")
+
+
 def _hub_install_global():
     """Write NS Hub global protocol block to ~/.claude/CLAUDE.md (once) and deploy hooks.
-    CTX hooks (bm25-memory, chat-memory, utility-rate, etc.) are bundled in _HUB_SETTINGS_HOOKS
-    and registered from ~/.hub/hooks/ — external ctx-install is NOT called (hub-ctx-install path)."""
+    M1694b: CTX (bm25-memory, chat-memory, vec-daemon, etc.) is a fully independent,
+    separately-installed project — hub does NOT own, bundle, or deploy CTX hooks. The only
+    hub-owned hook here is northstar-action-log.py (tool_trace causality dataset collection,
+    _HUB_SETTINGS_HOOKS above). stone-ctx-hook.py (static/hooks/) is a hub-owned BRIDGE that
+    reads FROM an already-installed CTX, and remains hub's responsibility — but it does not
+    imply hub deploys or requires CTX itself."""
     _hub_deploy_hooks()
-    # NOTE: ctx-install (external) intentionally removed — CTX hooks are now owned by hub
-    # and registered directly from ~/.hub/hooks/ via _HUB_SETTINGS_HOOKS above.
-    # This prevents the duplicate-path issue where ctx-install registered ~/.claude/hooks/
-    # variants alongside the hub's ~/.hub/hooks/ variants (M1090 root cause fix).
+    _hub_generate_systemd_unit()
     global_md = Path.home() / ".claude" / "CLAUDE.md"
     if not global_md.parent.exists():
         global_md.parent.mkdir(parents=True, exist_ok=True)
@@ -13109,6 +13260,15 @@ def _maybe_queue_compress(proj_id: str, parent: dict, milestones: list, reason_o
     Skip if a [compress] child already exists for this parent (in-flight idempotency).
     """
     try:
+        # M1724-b: never compress a compress-child itself. Making compress children real
+        # queued/dispatched stones (M1724) exposed a self-trigger loop: handle_attach_artifact's
+        # auto-close PATCH appends a "압축 완료." message to the child, which runs this same
+        # function against the child — and the child's own instruction text contains the
+        # literal "[compress]" tag, matching trigger 4 (explicit) regardless of conv_len,
+        # spawning a grandchild .cmp.cmp.cmp... forever. Compress children are meta-only;
+        # they never need their own summary.
+        if str(parent.get("category") or "").startswith("meta/compress"):
+            return
         reason = reason_override or _compress_trigger_reason(parent)
         if not reason:
             return
@@ -13122,10 +13282,18 @@ def _maybe_queue_compress(proj_id: str, parent: dict, milestones: list, reason_o
             if sib.get("parent_id") == parent_id and str(sib.get("text", "")).startswith("[compress]"):
                 if sib.get("status") in ("queued", "pending", "pending_confirmation", "needs_clarification") and not sib.get("done"):
                     return
-        # M1655-fix: create compress child as done=True immediately — M1253 auto-confirm logic
-        # only fires on pending_confirmation PATCH, but if dispatch fails the stone gets stuck
-        # in queued forever, locking _session_running_stone for 7200s (busy false-positive).
-        # compress stones are meta-only; there is no need to actually dispatch them to an agent.
+        # M1724: re-enabled real dispatch — M1655-fix made this child done=True at birth to
+        # avoid a stuck-queue busy-lock, but that also meant NO agent was ever dispatched to
+        # actually read the conversation and write a summary: compress_summary/attach_artifact
+        # was never called, parent.conversation_summary/summary_state stayed None forever
+        # (confirmed live: M1608 had 28 dead .cmp children, all born done, zero summaries).
+        # The stuck-queue risk M1655-fix worried about is already covered without a new
+        # timeout tier: _validate_stone_hold (server.py ~657) re-checks this child's DB status
+        # on every busy check and clears the hold the instant it leaves "queued" — independent
+        # of the 7200s crash-safety cap, which is a last-resort ceiling, not the expected path.
+        # Also fixes the tool-name bug: the instruction previously told the agent to call a
+        # nonexistent "attach_summary" — the real registered tool is compress_summary
+        # (aliased attach_artifact in hub-mcp-server.py's dispatcher).
         import datetime as _dt
         child_id = f"{parent_id}.cmp{int(_dt.datetime.now().timestamp()) % 10000}"
         now_c = _dt.datetime.utcnow().isoformat()
@@ -13136,14 +13304,11 @@ def _maybe_queue_compress(proj_id: str, parent: dict, milestones: list, reason_o
             "substar_id": parent.get("substar_id") or None,  # inherit parent's group — avoids Ungrouped
             "text": (
                 f"[compress] (trigger: {reason}) Read stone {parent_id}'s full conversation, write a 3-8 line summary "
-                f"of key decisions/constraints/open items, then call attach_summary(task_id='{parent_id}', summary='<your-summary>'). "
+                f"of key decisions/constraints/open items, then call compress_summary(task_id='{parent_id}', summary='<your-summary>'). "
                 f"Do NOT touch other status fields. This is a meta task — keep it brief."
             ),
-            "status": "done",
-            "done": True,
-            "done_at": now_c,
-            "completion_status": "success",
-            "claude_ack": now_c,
+            "status": "queued",
+            "done": False,
             "category": "meta/compress",
             "created_at": now_c,
         }
@@ -13411,8 +13576,10 @@ def _upload_raw_tables(state: dict) -> dict:
                         "id": row[0], "ts": row[1],
                         "proj_id": row[2] or "", "stone_id": row[3] or "",
                         "session_id": row[4] or "", "tool_name": row[5] or "",
-                        "input_summary": (row[6] or "")[:200],
-                        "output_summary": (row[7] or "")[:200],
+                        # M1732: PII scrub was never wired into this path (docstring claimed
+                        # "stripped of raw text" but no _scrub_pii call existed) — added.
+                        "input_summary": _scrub_pii((row[6] or "")[:200]),
+                        "output_summary": _scrub_pii((row[7] or "")[:200]),
                         "duration_ms": int(row[8] or 0),
                     })
             except Exception:
@@ -13432,7 +13599,11 @@ def _upload_raw_tables(state: dict) -> dict:
                     al_rows.append({
                         "id": row[0], "ts": row[1],
                         "proj_id": row[2] or "", "stone_id": row[3] or "",
-                        "action": row[4] or "", "detail": (row[5] or "")[:200],
+                        "action": row[4] or "",
+                        # M1732: detail carries raw client IP + User-Agent for at least the
+                        # update_milestone endpoint (confirmed via live DB read) — scrub before
+                        # sending, matching the docstring's original (unenforced) claim.
+                        "detail": _scrub_pii((row[5] or "")[:200]),
                         "session_id": row[6] or "",
                     })
             except Exception:
@@ -13466,9 +13637,11 @@ def _upload_raw_tables(state: dict) -> dict:
                         "rowid": row[0], "stone_id": row[1] or "", "proj_id": row[2] or "",
                         "outcome_label": (row[3] or "")[:64],
                         "counterfactual_pair_id": (row[4] or "")[:64],
-                        "goal_tree_snapshot": (row[5] or "")[:2000],
-                        "prompt_provenance": (row[6] or "")[:500],
-                        "confounder": (row[7] or "")[:500],
+                        # M1732: these 3 free-text fields (can contain arbitrary stone/project
+                        # content) were never scrubbed before upload — added.
+                        "goal_tree_snapshot": _scrub_pii((row[5] or "")[:2000]),
+                        "prompt_provenance": _scrub_pii((row[6] or "")[:500]),
+                        "confounder": _scrub_pii((row[7] or "")[:500]),
                         "done_at": row[8] or "",
                     })
             except Exception:
@@ -13496,7 +13669,12 @@ def _upload_raw_tables(state: dict) -> dict:
                         continue
                     st_rows.append({
                         "rowid": row[0], "stone_id": row[1] or "", "proj_id": row[2] or "",
-                        "text": _text,
+                        # M1732 CRITICAL: this field was sent FULL/UNTRUNCATED despite the
+                        # docstring above claiming "text truncated to 1000 chars" — confirmed
+                        # via live DB read to contain real user content including health
+                        # (Art.9 special-category) and financial details. Now scrubbed AND
+                        # actually truncated to match the docstring's original intent.
+                        "text": _scrub_pii(_text)[:1000],
                         "status": (row[4] or "")[:32],
                         "done_at": row[5] or "",
                         "model_used": (row[6] or "")[:64],
