@@ -5532,7 +5532,7 @@ def _transcript_too_large(proj_id: str) -> bool:
     return False
 
 
-def _record_spawn_info(proj_id: str, resume_args: list, agent: str = "claude", session_name: str = "") -> None:
+def _record_spawn_info(proj_id: str, resume_args: list, agent: str = "claude", session_name: str = "", model: str = None) -> None:
     """Snapshot what resume flag we used when spawning Claude for this project/session.
 
     Surfaces to the UI via /api/exec-sessions so users can see whether the
@@ -5577,15 +5577,20 @@ def _record_spawn_info(proj_id: str, resume_args: list, agent: str = "claude", s
     # M189: add model to spawn info so UI can display it in the session pane
     # M1131: when no explicit model is set for the project, read the effective
     # default from ~/.claude/settings.json so _execModel is never empty.
-    _proj_model = _get_project_model_value(proj_id) or ""
-    if not _proj_model:
-        try:
-            import json as _json
-            _cc_settings = Path.home() / ".claude" / "settings.json"
-            if _cc_settings.exists():
-                _proj_model = _json.loads(_cc_settings.read_text()).get("model", "") or ""
-        except Exception:
-            pass
+    # M1699-fork: explicit model param (fork passes the target model, not the
+    # project's stored model) takes priority when provided.
+    if model is not None:
+        _proj_model = model
+    else:
+        _proj_model = _get_project_model_value(proj_id) or ""
+        if not _proj_model:
+            try:
+                import json as _json
+                _cc_settings = Path.home() / ".claude" / "settings.json"
+                if _cc_settings.exists():
+                    _proj_model = _json.loads(_cc_settings.read_text()).get("model", "") or ""
+            except Exception:
+                pass
     info["model"] = _proj_model
     _key = session_name or "_main"
     try:
@@ -5678,10 +5683,12 @@ def _read_spawn_info(proj_id: str, session_name: str) -> dict:
     return {}
 
 
-def _update_session_history_from_transcript(proj_id: str, proj_dir: str, model_key: str = "") -> str | None:
+def _update_session_history_from_transcript(proj_id: str, proj_dir: str, model_key: str = "", preserve_current: bool = False) -> str | None:
     """Scan the transcript directory for the newest .jsonl file and record it in session-history.
     Returns the session ID if found, else None. Called after a fresh tmux spawn so the new
-    session appears in the resume list immediately (before Stop hook fires)."""
+    session appears in the resume list immediately (before Stop hook fires).
+    M1699-fork: preserve_current=True (fork sessions) leaves the source session's _current/
+    _default anchors untouched so the original model's session can still be resumed."""
     try:
         encoded = _encode_cwd_for_claude(str(proj_dir))
         transcripts_dir = Path.home() / ".claude" / "projects" / encoded
@@ -5701,7 +5708,7 @@ def _update_session_history_from_transcript(proj_id: str, proj_dir: str, model_k
         _is_agent_specific = bool(model_key) and (
             model_key.startswith("or-") or model_key.startswith("codex-")
         )
-        if not _is_agent_specific:
+        if not _is_agent_specific and not preserve_current:
             hist["_current"] = new_sid
         if model_key:
             # M316: preserve previous session — save old ID as {model_key}_prev before overwriting
@@ -10484,6 +10491,126 @@ async def execute_project(proj_id: str, request: Request):
         mode = "work"
         return JSONResponse({"ok": True, "mode": mode, "tasks_created": tasks_created,
                              "message": f"Dispatched {tasks_created} stone tasks to worker (no user message needed)"})
+
+
+@app.post("/api/northstar/{proj_id}/fork-session")
+async def fork_session(proj_id: str, request: Request):
+    """M1699-fork: spawn a NEW independent tmux session that inherits a SOURCE session's
+    full conversation (via --resume <sid> --fork-session) but runs on a TARGET cross-provider
+    model. The source session is never touched — its transcript, session-history anchor
+    (_current/_default), and live tmux process all stay intact, so the user can resume the
+    original model's work at any time after switching back.
+
+    claude / openrouter only (both run the Claude Code CLI, so --fork-session + per-model
+    --model/env override composes cleanly). codex/dsk not supported (different runtimes).
+
+    body: { source_session_id: str, target_model: str, agent?: str }
+      - source_session_id: the .jsonl session id to fork from (from /resumable-sessions)
+      - target_model: any _ALLOWED_MODELS value (claude-* / or-*); "" → CLI default
+      - agent: optional; auto-derived from target_model prefix (or-* → openrouter)
+    """
+    import json as _json_fork, uuid as _uuid_fork, asyncio as _aio_fork
+    _raw = await request.body()
+    data = {}
+    if _raw:
+        try:
+            _parsed = _json_fork.loads(_raw.decode("utf-8"))
+            if isinstance(_parsed, dict):
+                data = _parsed
+        except Exception:
+            data = {}
+    source_sid = (data.get("source_session_id") or "").strip()
+    target_model = (data.get("target_model") or "").strip()
+    agent = (data.get("agent") or "").strip().lower() or None
+
+    # Validate source session exists as a transcript
+    proj = _db_load_project(proj_id)
+    if not proj:
+        return JSONResponse({"ok": False, "error": "project not found"}, status_code=404)
+    proj_dir = _get_project_dir(proj_id) or str(Path.home())
+    if not source_sid:
+        return JSONResponse({"ok": False, "error": "source_session_id required"}, status_code=400)
+    encoded = _encode_cwd_for_claude(str(proj_dir))
+    src_t = Path.home() / ".claude" / "projects" / encoded / f"{source_sid}.jsonl"
+    if not src_t.exists() or src_t.stat().st_size == 0:
+        return JSONResponse({"ok": False, "error": "source session not found"}, status_code=404)
+
+    # Auto-correct agent from model prefix (mirror execute handler)
+    if target_model.startswith("or-") and agent != "openrouter":
+        agent = "openrouter"
+    elif target_model and not target_model.startswith("or-") and agent == "openrouter":
+        agent = "claude"
+    if agent not in _ALLOWED_PTY_AGENTS or agent in ("codex", "dsk"):
+        agent = "claude"
+    # Fork is claude/openrouter only
+    if target_model.startswith("or-"):
+        agent = "openrouter"
+    else:
+        agent = "claude"
+
+    spawn_cwd = proj_dir if Path(proj_dir).exists() else str(Path.home())
+
+    # Branched session name — distinct tmux session so the source (mother) session is
+    # never killed by dispatch/restart (M1656-R3 spare_children already spares these).
+    suffix = _uuid_fork.uuid4().hex[:8]
+    session_name = f"{agent}-exec-{proj_id}-{suffix}"
+
+    # Fork argv: inherit source conversation, write to OWN new session id.
+    resume_args = ["--resume", source_sid, "--fork-session"]
+    # Target model override (does NOT mutate project's stored model).
+    model_args = _get_project_model(proj_id, override_model=target_model if target_model else None)
+
+    _record_spawn_info(proj_id, resume_args, agent=agent, session_name=session_name,
+                       model=target_model if target_model else _get_project_model_value(proj_id) or "")
+
+    # Env: splice target-model proxy routing (openrouter → LiteLLM proxy).
+    _tmux_env = ["-e", f"NS_HUB_URL=http://{_tailscale_interface_ip()}:{PORT}"]
+    for _k, _v in _get_project_spawn_env(proj_id, override_model=target_model if target_model else None).items():
+        _tmux_env += ["-e", f"{_k}={_v}"]
+
+    # M1116: write per-session MCP config for claude/openrouter fork (hub-mcp-server bridge)
+    try:
+        _write_mcp_config(proj_id, session_name)
+        model_args = [*model_args, "--mcp-config",
+                      str(Path("/tmp/hub/mcp") / f"{session_name}.json")]
+    except Exception:
+        pass
+
+    subprocess.Popen([
+        "tmux", "new-session", "-d", "-s", session_name,
+        "-c", spawn_cwd,
+        *_tmux_env,
+        *_get_agent_spawn_cmd(proj_id),
+        *model_args,
+        *resume_args,
+    ])
+    subprocess.run(["tmux", "set-option", "-t", session_name, "history-limit", "2000"],
+                   capture_output=True, timeout=2)
+    _exec_idle_file(proj_id).unlink(missing_ok=True)
+    _server_log_action(proj_id, "", "exec:fork",
+                       f"session:{session_name} from:{source_sid} model:{target_model or 'default'}")
+    _ns_push("session_running", proj_id=proj_id, kind="exec")
+
+    # Capture the fork's live session id without clobbering the source's _current anchor.
+    pre_existing = set()
+    try:
+        _d = (Path.home() / ".claude" / "projects" / encoded).glob("*.jsonl")
+        pre_existing = {p.stem for p in _d}
+    except Exception:
+        pass
+    _capture_live_session_id_bg(proj_id, spawn_cwd, session_name, pre_existing, timeout=20.0)
+    # M1699-fork: record fork result under its OWN target model key in session-history,
+    # preserving the source model's _current/_default anchor (preserve_current=True).
+    threading.Thread(target=_update_session_history_from_transcript,
+                     args=(proj_id, spawn_cwd, target_model),
+                     kwargs={"preserve_current": True}, daemon=True).start()
+
+    _send_exec_wake(session_name, proj_id)  # M1678: unified wake
+    return JSONResponse({
+        "ok": True, "mode": "fork", "session": session_name,
+        "source_session_id": source_sid, "target_model": target_model or "(default)",
+        "message": f"Forked session {source_sid} → {session_name} on {target_model or 'default model'}",
+    })
 
 
 @app.post("/api/northstar/create")

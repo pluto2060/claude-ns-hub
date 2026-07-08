@@ -1564,6 +1564,8 @@ header {
    plus a darker outer shadow ring for separation against light backgrounds too. */
 .ns-sess-mini-avatar { position:absolute; inset:0; width:100%; height:100%; border-radius:50%; object-fit:cover; border:2px solid rgba(255,255,255,.85); box-shadow:0 0 0 1px rgba(0,0,0,.6), 0 1px 4px rgba(0,0,0,.5); background:var(--bg-deep); }
 .ns-sess-mini-avatar.ns-sess-nested { inset:auto; bottom:3.93px; right:3.93px; width:18px; height:18px; border-width:1.5px; box-shadow:0 0 0 1px rgba(0,0,0,.6), 0 1px 2px rgba(0,0,0,.5); }
+/* M1729: mirrors .avatar-ring.status-active (border=accent + sess-pulse) for running child sessions */
+.ns-sess-mini-avatar.ns-sess-mini-active { border-color:var(--accent); animation:sess-pulse 3s ease-in-out infinite; }
 .ns-sess-mini-fallback { display:flex; align-items:center; justify-content:center; font-family:var(--mono); font-size:11px; font-weight:700; color:var(--text-dim); }
 .card-name { font-family:var(--sans); font-size:11px; font-weight:600; color:var(--text); text-align:center; line-height:1.3; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100px; margin-top:28px; }
 .card-name-stats { display:block; font-family:var(--mono); font-size:7px; font-weight:400; color:var(--text-dim); margin-top:1px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -1626,7 +1628,7 @@ header {
       </div>
       <div class="header-right">
         <!-- M1002: account usage bars (5h / 7d / 7d-model) — left of + node. M1535: always visible. -->
-        <span id="usage-badge" class="usage-badge" onclick="_showUsageResetPopup(this);_loadClaudeUsage(true)" title="Account usage" style="display:inline-flex"><span style="opacity:.6;font-size:8px">usage —</span></span>
+        <span id="usage-badge" class="usage-badge" onclick="_showUsageResetPopup(this);_loadClaudeUsage(true)" style="display:inline-flex"><span style="opacity:.6;font-size:8px">usage —</span></span>
         <button class="refresh-btn" onclick="showAddProject()" style="background:var(--accent-soft);color:var(--accent-deep);border-color:var(--accent)">+ node</button>
         <!-- M950: align/sort button removed per user request -->
         <button class="refresh-btn" onclick="_showModelAvatarSettings()" title="Configure per-model avatar images">◎ avatar</button>
@@ -2234,6 +2236,7 @@ const MODEL_CATALOG = {
   ],
   openrouter: [
     ['or-hy3-preview',                'hy3-preview'],
+    ['or-hy3',                        'hy3 (free)'],
     ['or-owl-alpha',                  'owl-alpha (free)'],
     ['or-kimi-k2',                    'kimi-k2.6'],
     ['or-gemini3-flash',              'gemini-3-flash'],
@@ -2963,6 +2966,12 @@ function renderMilestoneCreator(projId, milestones) {
         if (m.status === 'pending' && !m.claude_ack && !_hasMsgBadge(m)) return 2.5; // review badge
         if (m.status === 'pending' && m.claude_ack && !_hasMsgBadge(m)) return 2;
         if (!m.status && !m.claude_ack && !_hasMsgBadge(m)) return 2.5; // null-status unacked → review position
+        // M1718: `pending` + acked + HAS a msg badge (M687 Q&A follow-up reply via reply_to_stone
+        // leaves status as "pending", not "pending_confirmation") had no dedicated rank — fell
+        // through all the way to the `return 0` default, landing at the very bottom (same tier
+        // as an untouched stone) despite being an actively answered, still-open conversation.
+        // User wants this class ranked above all pending_confirmation tiers (below queued/review).
+        if ((m.status === 'pending' || !m.status) && m.claude_ack && _hasMsgBadge(m)) return 1.8;
         // M846: ALL non-watching PC above ALL watching PC (was: last-turn watching 1.4 could sit above regular non-watching 1.0)
         if (m.status === 'pending_confirmation' && !m.watching && _isLastTurn(m)) return 1.5; // last-turn non-watching (top of PC group)
         if (m.status === 'pending_confirmation' && !m.watching) return 1.2; // regular non-watching
@@ -5665,10 +5674,13 @@ async function _ntDropHandler(ev) {
   ev.stopPropagation();
   const el = ev.currentTarget;
   el.classList.remove('drag-over');
-  // Synthesize a fake clipboard event with the dropped text/file so _ntPasteHandler can reuse
-  const text = ev.dataTransfer?.getData('text') || ev.dataTransfer?.getData('text/plain') || '';
   const files = Array.from(ev.dataTransfer?.files || []);
-  if (text) {
+  // M1733: check files FIRST — some browsers/OSes also populate text/plain with the
+  // dragged file's name/path during a native file-drag, which previously made the text
+  // branch swallow file drops as plain pasted text (no chip) instead of reaching the
+  // upload path below, matching the bug report ("배지 안생기고 텍스트 입력을 치환됨").
+  const text = ev.dataTransfer?.getData('text') || ev.dataTransfer?.getData('text/plain') || '';
+  if (!files.length && text) {
     // Route through paste chip logic
     const fakeEv = { preventDefault: () => {}, target: el,
       clipboardData: { getData: () => text } };
@@ -5744,36 +5756,74 @@ async function _commentInputDrop(ev, projId) {
   const inp = ev.currentTarget;
   inp.style.borderColor = 'var(--panel-border)';
   inp.style.background = 'var(--panel-soft)';
-  const text = ev.dataTransfer?.getData('text') || ev.dataTransfer?.getData('text/plain') || '';
   const files = Array.from(ev.dataTransfer?.files || []);
-  if (text) {
-    inp.value = (inp.value ? inp.value + ' ' : '') + text;
+  // M1733: check files FIRST — some browsers/OSes also populate text/plain with the
+  // file's name/path during a native file drag, which previously made the text branch
+  // swallow file drops into raw input text (no badge) instead of reaching the upload path.
+  if (files.length) {
+    // M1733: route through the same _commentPendingAttachments/status-chip pipeline as
+    // the working "attach" button (_commentFileUpload, M890) instead of writing raw
+    // [PASTE...] text into inp.value — that old behavior produced no visible chip and
+    // silently overwrote/appended into the plain-text input, matching the bug report
+    // ("배지 안생기고 텍스트 입력을 치환됨").
+    const statusEl = document.getElementById('comment-upload-status');
+    for (const file of files) {
+      const sizeErr = _uploadSizeCheck(file);
+      if (sizeErr) {
+        if (inp) inp.value = (inp.value ? inp.value + ' ' : '') + sizeErr;
+        continue;
+      }
+      let itemEl = null;
+      if (statusEl) {
+        itemEl = document.createElement('span');
+        itemEl.className = 'comment-upload-item';
+        itemEl.innerHTML = `<span class="cup-spin"></span>${esc(file.name)}`;
+        statusEl.appendChild(itemEl);
+        statusEl.classList.add('active');
+      }
+      try {
+        const fd = new FormData();
+        fd.append('file', file);
+        fd.append('proj_id', projId || '');
+        const r = await fetch('/api/upload-comment-file', {method:'POST', body: fd});
+        if (itemEl) itemEl.remove();
+        if (r.ok) {
+          const d = await r.json();
+          const link = d.url || d.path || d.filename || file.name;
+          const pasteToken = _PASTE_OPEN + link + _PASTE_CLOSE;
+          window._commentPendingAttachments = window._commentPendingAttachments || [];
+          window._commentPendingAttachments.push(pasteToken);
+          if (statusEl) {
+            const chip = document.createElement('span');
+            const fname = link.split('/').pop() || file.name;
+            const isImg = /\.(png|jpg|jpeg|gif|webp|svg)$/i.test(fname);
+            const isVideo = /\.(mp4|webm|mov|avi|mkv|ogg)$/i.test(fname);
+            chip.style.cssText = 'display:inline-flex;align-items:center;gap:4px;padding:2px 6px;border-radius:3px;background:var(--accent-soft);border:1px solid var(--accent);color:var(--accent);font-size:9px;font-family:var(--mono);cursor:pointer;margin:2px 2px 0 0';
+            chip.title = isImg||isVideo ? 'Click to preview' : link;
+            chip.onclick = (e) => { if (!e.target.matches('span[data-remove]')) _showAttachmentPreview(link, isImg, isVideo); };
+            chip.innerHTML = `${esc(fname)} <span data-remove="1" onclick="event.stopPropagation();this.parentElement.remove();window._commentPendingAttachments=(window._commentPendingAttachments||[]).filter(t=>t!==_PASTE_OPEN+'${link.replace(/'/g,"\\'")}'+_PASTE_CLOSE)" style="cursor:pointer;margin-left:2px;opacity:.6">✕</span>`;
+            statusEl.appendChild(chip);
+            statusEl.classList.add('active');
+          }
+        } else {
+          if (statusEl) { const e=document.createElement('span'); e.style.cssText='color:var(--red);font-size:9px;font-family:var(--mono)'; e.textContent=`upload failed: ${file.name}`; statusEl.appendChild(e); }
+        }
+      } catch(_) {
+        if (itemEl) itemEl.remove();
+        if (statusEl) { const e=document.createElement('span'); e.style.cssText='color:var(--red);font-size:9px;font-family:var(--mono)'; e.textContent=`error: ${file.name}`; statusEl.appendChild(e); }
+      }
+    }
+    if (statusEl && !statusEl.children.length) statusEl.classList.remove('active');
     inp.dispatchEvent(new Event('input'));
     inp.focus();
     return;
   }
-  if (!files.length) return;
-  // Reuse file-upload logic from _handleCommentDrop
-  for (const file of files) {
-    try {
-      const fd = new FormData();
-      fd.append('file', file);
-      fd.append('proj_id', projId || '');
-      const r = await fetch('/api/upload-comment-file', {method:'POST', body: fd});
-      if (r.ok) {
-        const d = await r.json();
-        const link = d.url || d.path || d.filename || file.name;
-        // M579: wrap in PASTE format for rich rendering in comment thread
-        inp.value = (inp.value ? inp.value + ' ' : '') + _PASTE_OPEN + link + _PASTE_CLOSE;
-      } else {
-        inp.value = (inp.value ? inp.value + ' ' : '') + `[file:${file.name}]`;
-      }
-    } catch(_) {
-      inp.value = (inp.value ? inp.value + ' ' : '') + `[file:${file.name}]`;
-    }
+  const text = ev.dataTransfer?.getData('text') || ev.dataTransfer?.getData('text/plain') || '';
+  if (text) {
+    inp.value = (inp.value ? inp.value + ' ' : '') + text;
+    inp.dispatchEvent(new Event('input'));
+    inp.focus();
   }
-  inp.dispatchEvent(new Event('input'));
-  inp.focus();
 }
 
 // M340: mobile upload button handler for stone text pane
@@ -6582,6 +6632,50 @@ async function _loadEfficiencyMetrics() {
   } catch(_) { el.textContent = 'Load failed'; }
 }
 
+// M1699-fork: fork the currently-picked session onto the model selected in the
+// dropdown (claude / openrouter only — both run the Claude Code CLI, so a forked
+// session composes --fork-session with a per-model --model/env override). The
+// source session is left untouched and remains resumable after switching back.
+async function forkCurrentSession(projId) {
+  const sel = window._selectedSession || {};
+  const sourceId = sel.session_id || '';
+  if (!sourceId) {
+    _hubAlert('Select a session to fork first (click a session row).');
+    return;
+  }
+  const modelSel = document.getElementById('dm-model-select');
+  const targetModel = (modelSel ? modelSel.value : '') || '';
+  // Restrict to claude / openrouter (CLI-based); reject codex/dsk for now.
+  if (targetModel && !targetModel.startsWith('claude-') && !targetModel.startsWith('or-') && targetModel !== 'haiku' && targetModel !== 'sonnet' && targetModel !== 'opus' && targetModel !== 'fable') {
+    _nsConfirm('Fork not supported for this model',
+      `${targetModel} is not a Claude-Code-based model.\nFork supports claude-* and or-* only.`,
+      null);
+    return;
+  }
+  const btn = event && event.target && event.target.closest('button');
+  const origTxt = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '◌ Forking…'; }
+  try {
+    const r = await fetch(`/api/northstar/${encodeURIComponent(projId)}/fork-session`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ source_session_id: sourceId, target_model: targetModel }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || !d.ok) {
+      _hubAlert('Fork failed: ' + (d.error || r.status));
+      return;
+    }
+    _hubAlert(`Forked onto ${d.target_model} → ${d.session}. Original session intact.`);
+    // Refresh session pane + exec pill so the new forked row appears immediately.
+    if (typeof window._renderResumableSessions === 'function') window._renderResumableSessions();
+    if (typeof window._refreshExecState === 'function') window._refreshExecState();
+  } catch (e) {
+    _hubAlert('Fork error: ' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = origTxt; }
+  }
+}
+
 function _selectSession(agent, model, sessionId) {
   window._selectedSession = { agent, model, session_id: sessionId };
   window.curAgent = agent;
@@ -7383,8 +7477,9 @@ document.addEventListener('DOMContentLoaded', () => { _initTailscaleBtn(); });
 // Permanent on nsbar. On fetch failure / empty payload, retain last good render (across page
 // reloads via localStorage) instead of hiding or flashing placeholder.
 const _USAGE_LS_KEY = 'claude_usage_last_good_v1';
-let _lastUsagePayload = null; // M1674: reset times live only in title="" (hover tooltip) — invisible
-                               // on mobile (no hover state). Cache raw payload so tap can show a popup.
+let _lastUsagePayload = null; // M1674/M1719: cache raw payload so click/tap can show a popup with
+                               // reset times — the hover title="" tooltip was removed (redundant
+                               // with the click popup, per explicit user request).
 function _showUsageResetPopup(anchorEl) {
   const d = _lastUsagePayload;
   if (!d) return;
@@ -7424,10 +7519,8 @@ function _renderUsageFromPayload(d) {
   };
   const parts = [seg('5h', d.five_hour), seg('7d', d.seven_day), seg('Snt', d.seven_day_sonnet)].filter(Boolean);
   if (!parts.length) return null;
-  const rt = o => (o && o.resets_at) ? new Date(o.resets_at).toLocaleString() : '?';
   return {
     html: parts.join(''),
-    title: `Account usage (used %) — 5h resets ${rt(d.five_hour)} · 7d resets ${rt(d.seven_day)} · Snt(7d) resets ${rt(d.seven_day_sonnet)} · click to refresh`,
   };
 }
 async function _loadClaudeUsage(force) {
@@ -7443,10 +7536,9 @@ async function _loadClaudeUsage(force) {
     if (!render) return;       // empty payload — keep last good
     _lastUsagePayload = d;     // M1674: cache for tap-to-view reset popup (mobile has no hover)
     el.innerHTML = render.html;
-    el.title = render.title;
     el.dataset.lastGood = '1';
     el.style.display = 'inline-flex';
-    try { localStorage.setItem(_USAGE_LS_KEY, JSON.stringify({html: render.html, title: render.title, ts: Date.now()})); } catch(_) {}
+    try { localStorage.setItem(_USAGE_LS_KEY, JSON.stringify({html: render.html, ts: Date.now()})); } catch(_) {}
   } catch(_) {
     el.style.opacity = '1';     // network error — keep last good
   }
@@ -7462,7 +7554,6 @@ document.addEventListener('DOMContentLoaded', () => {
         const cached = JSON.parse(raw);
         if (cached && cached.html) {
           el.innerHTML = cached.html;
-          el.title = (cached.title || 'Account usage') + ' · cached ' + (cached.ts ? new Date(cached.ts).toLocaleTimeString() : '');
           el.dataset.lastGood = '1';
           el.style.display = 'inline-flex';
         }
@@ -7831,14 +7922,21 @@ function nodeCard(p, idx) {
   // recurses one level: main-ring contains 2nd-avatar exactly as 2nd-avatar contains 3rd-avatar.
   // State conveyed by opacity (1=running, 0.3=idle), matching the main avatar's own
   // _avatarOpacity convention per explicit user request ("상태구분은 아바타 선명도로").
+  // M1729: opacity difference kept as-is (idle state), but running now ALSO gets the
+  // same border+pulse animation the mother's avatar-ring.status-active gets — user
+  // explicitly asked for child avatars to carry the same blink logic as mother's.
   const _sessList = (window._execSessionList || {})[p.id||p.name] || [];
   // _mkMiniAvatarInner: the raw image/fallback content (no positioning), reused for both the
   // 2nd-session box and the 3rd-session box nested inside it.
   const _mkMiniAvatarInner = (st, extraCls) => {
     const _op = st === 'running' ? '1' : '0.3';
+    // M1729: running child sessions pulse the same way the main avatar ring does
+    // (.avatar-ring.status-active — border + sess-pulse) so child busy-state is
+    // visually consistent with mother's, not just distinguished by static opacity.
+    const _runCls = st === 'running' ? ' ns-sess-mini-active' : '';
     return _avatarUrl
-      ? `<img class="ns-sess-mini-avatar ${extraCls}" style="opacity:${_op}" src="${esc(_avatarUrl)}" alt="">`
-      : `<div class="ns-sess-mini-avatar ns-sess-mini-fallback ${extraCls}" style="opacity:${_op}">${esc(_initials)}</div>`;
+      ? `<img class="ns-sess-mini-avatar${_runCls} ${extraCls}" style="opacity:${_op}" src="${esc(_avatarUrl)}" alt="">`
+      : `<div class="ns-sess-mini-avatar ns-sess-mini-fallback${_runCls} ${extraCls}" style="opacity:${_op}">${esc(_initials)}</div>`;
   };
   // 3rd session's avatar is a DOM child of the 2nd session's own wrapper (not a sibling), so its
   // `position:absolute;bottom/right` resolves against the 2nd avatar's own box — this is what
@@ -12421,6 +12519,10 @@ function _refreshCommentThread(mid) {
   // auto-scroll to bottom so latest message is visible
   const scrollArea = area.parentElement;
   if (scrollArea) scrollArea.scrollTop = scrollArea.scrollHeight;
+  // M1732: re-evaluate the AI∑ badge on every live refresh — a background compress can
+  // complete while this popup is already open (conversation_summary written server-side),
+  // and without this the badge stayed stale until close/reopen or a page reload.
+  _updateSummaryBadge(mid);
 }
 
 function _closeCommentPopupNow() {
@@ -12750,8 +12852,43 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
       if (_stone?.verify_flag) { _verifyChip.textContent='verify ✓'; _verifyChip.style.color='var(--green,#3d8b5e)'; _verifyChip.style.background='rgba(61,139,94,.15)'; _verifyChip.style.borderColor='rgba(61,139,94,.4)'; }
     }
   }
+  _updateSummaryBadge(mid);
+  // M263: restore click-outside auto-close (user wants swimlane click to dismiss the
+  // chat history popup). M255 sticky-popup intent was actually about OS notifications,
+  // which already persist via requireInteraction (M255 v1). ESC also dismisses.
+  const _escClose = (e) => {
+    if (e.key === 'Escape') {
+      popup.remove();
+      _openCommentMid = null; // M222
+      document.removeEventListener('keydown', _escClose);
+      document.removeEventListener('click', _hComment);
+      document.removeEventListener('touchstart', _hComment);
+    }
+  };
+  document.addEventListener('keydown', _escClose);
+  function _hComment(e) {
+    // M258: skip close if skill/agent picker modal is open
+    if (window._skillModalActive) return;
+    if (!popup.contains(e.target)) {
+      popup.remove();
+      _openCommentMid = null; // M222
+      document.removeEventListener('click', _hComment);
+      document.removeEventListener('touchstart', _hComment);
+      document.removeEventListener('keydown', _escClose);
+    }
+  }
+  setTimeout(() => {
+    document.addEventListener('click', _hComment);
+    document.addEventListener('touchstart', _hComment, {passive: true});
+  }, 100);
+}
+// M1732: extracted from showCommentPopup so the SSE-driven live refresh path
+// (_refreshCommentThread) can also re-evaluate the badge — previously this only ran once at
+// popup-open, so a background compress that completed while the popup was already open left
+// the AI∑ badge stale until the user closed/reopened the popup or reloaded the page.
+function _updateSummaryBadge(mid) {
   // M1253 v3: AI∑ badge — LLM summary (conversation_summary) takes priority; fallback to extractive ∑N.
-  { const _conv = (_msConversations[mid]||[]); const _badge = popup.querySelector('#comment-summary-badge'); const _detail = popup.querySelector('#comment-summary-detail');
+  { const _conv = (_msConversations[mid]||[]); const _badge = document.getElementById('comment-summary-badge'); const _detail = document.getElementById('comment-summary-detail');
     if (_badge) {
       const _stoneData = Object.values(_msCacheByProject||{}).flatMap(v=>v||[]).find(m=>m.id===mid);
       const _llmConvSum = _stoneData?.conversation_summary;
@@ -12813,34 +12950,6 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
       }
     }
   }
-  // M263: restore click-outside auto-close (user wants swimlane click to dismiss the
-  // chat history popup). M255 sticky-popup intent was actually about OS notifications,
-  // which already persist via requireInteraction (M255 v1). ESC also dismisses.
-  const _escClose = (e) => {
-    if (e.key === 'Escape') {
-      popup.remove();
-      _openCommentMid = null; // M222
-      document.removeEventListener('keydown', _escClose);
-      document.removeEventListener('click', _hComment);
-      document.removeEventListener('touchstart', _hComment);
-    }
-  };
-  document.addEventListener('keydown', _escClose);
-  function _hComment(e) {
-    // M258: skip close if skill/agent picker modal is open
-    if (window._skillModalActive) return;
-    if (!popup.contains(e.target)) {
-      popup.remove();
-      _openCommentMid = null; // M222
-      document.removeEventListener('click', _hComment);
-      document.removeEventListener('touchstart', _hComment);
-      document.removeEventListener('keydown', _escClose);
-    }
-  }
-  setTimeout(() => {
-    document.addEventListener('click', _hComment);
-    document.addEventListener('touchstart', _hComment, {passive: true});
-  }, 100);
 }
 
 // M138: compact skill/agent picker for comment popup
@@ -13445,6 +13554,10 @@ function renderRight(p) {
         <div class="dm-toggle-pane" id="dm-session-pane">
           <div class="dm-pane-header" onclick="toggleDmPane('dm-session-pane')">
             <span class="dm-pane-label">session</span>
+            <button type="button" onclick="event.stopPropagation();forkCurrentSession('${esc(p.id)}')"
+              title="Fork the currently picked session onto the selected model (claude / openrouter) — original session stays intact"
+              style="margin-left:6px;font-family:var(--mono);font-size:9px;padding:1px 7px;border-radius:3px;cursor:pointer;line-height:1.3;white-space:nowrap;
+                     background:rgba(123,159,212,.1);color:var(--blue,#7b9fd4);border:1px solid rgba(123,159,212,.4)">⑂ Fork</button>
             <span class="dm-pane-caret" id="dm-session-caret">▾</span>
           </div>
           <div class="dm-pane-body" id="dm-session-pane-body" style="display:none;
@@ -14375,8 +14488,23 @@ document.addEventListener('input', e => {
       fetch('/api/exec-sessions').then(r => r.json()).then(d => {
         const mine = (d.sessions || []).filter(s => s.proj_id === projId);
         if (!mine.length) return; // no live sessions at all — leave as-is (idle is correct)
-        const anyRunning = mine.some(s => !s.idle);
+        // M1717-b: was any-running-wins (`mine.some(s => !s.idle)`), same bug class as
+        // refreshSessionStatus's now-fixed poll aggregate — a child's SSE transition alone
+        // would flip the WHOLE project (including an idle mother) to 'running' here, since
+        // this correction function ran on every session_running/session_idle SSE event
+        // regardless of which session fired it. Now mirrors the mother-only rule: prefer the
+        // mother session's own state; only fall back to any-running-wins if no mother record
+        // exists yet (orphaned children only).
+        const mother = mine.find(s => s.session === `${s.agent||'claude'}-exec-${projId}`);
+        const anyRunning = mother ? !mother.idle : mine.some(s => !s.idle);
         const correctKey = anyRunning ? 'running' : 'idle';
+        // M1717-b: the M388 spawn-grace period (refreshSessionStatus ~7586) force-preserves
+        // 'running' for 30s after a session_running SSE event, regardless of mother/child —
+        // only extend that grace here when the MOTHER is actually the one running (or no
+        // mother record exists yet), otherwise a child's spawn would grace-period-lock an
+        // idle mother's avatar into showing 'running' for up to 30s even after this fetch
+        // correctly identified it as idle.
+        if (!anyRunning && window._execSpawnTime) delete window._execSpawnTime[projId];
         if (_execStatus[projId] !== correctKey) {
           _execStatus[projId] = correctKey;
           const cardNode = document.querySelector(`.ns-node[data-pid="${CSS.escape(projId)}"]`);
@@ -14429,18 +14557,18 @@ document.addEventListener('input', e => {
       try {
         const d = JSON.parse(e.data);
         if (d.proj_id && d.kind === 'exec') {
-          _execStatus[d.proj_id] = 'running';
-          window._execSpawnTime[d.proj_id] = Date.now();  // start grace period
-          // Direct DOM update immediately
-          const cardNode = document.querySelector(`.ns-node[data-pid="${CSS.escape(d.proj_id)}"]`);
-          if (cardNode) {
-            cardNode.classList.remove('exec-idle');
-            cardNode.classList.add('exec-live');
-            _syncCardBadge(d.proj_id);  // M1649: sync q-badge on session_running
-          }
-          // M976 fix: clear fingerprint before render so nodeCard() rebuilds with updated opacity
-          Object.keys(_swimlaneLaneFp).forEach(k => delete _swimlaneLaneFp[k]);
-          if (typeof render === 'function') render();
+          // M1717-b: this payload carries only proj_id/kind — no session identity — so we
+          // can't tell here whether it was the MOTHER or a CHILD that just went busy. Blindly
+          // setting _execStatus[proj_id]='running' (old behavior) made a child's very first
+          // busy transition flip the whole project — including an idle mother — to running
+          // the instant this event fired, before the next 8s poll could correct it. This was
+          // the exact "처음 자녀 세션 busy 전환시 mother avatar도 busy로 보임" report (M1717).
+          // Fix: skip the optimistic blind-set entirely and go straight to the fetch-based
+          // mother-aware correction — small latency cost (one fetch) in exchange for never
+          // showing a wrong transient state.
+          window._execSpawnTime[d.proj_id] = Date.now();  // start grace period (unconditional — harmless if mother, needed if mother)
+          _correctExecStatusFor(d.proj_id);
+          _syncCardBadge(d.proj_id);  // M1649: sync q-badge on session_running
           // M374: if detail card open for this proj_id, refresh exec pane immediately
           if (d.proj_id === window._detailModalOpenProjId && typeof window._refreshExecState === 'function') {
             window._refreshExecState();
@@ -17503,12 +17631,13 @@ function _cgOpenNodeDetail(node) {
   const _cgNsId = 'cg_' + node.id;
   localStorage.setItem(`ss_mg_${_cgProj}_${_cgNsId}`, '1');
   // If detail is already open for this project, just force re-render with filter
+  // M1730: bust cache in BOTH branches — openDetail() also reuses _nsStarsCache when
+  // non-empty (L12144-12147), so a node created while the card was closed hits the
+  // same staleness the M1651 fix only patched for the "already open" branch.
+  const _lmProjId = projects[projIdx].id || projects[projIdx].name;
+  delete _nsStarsCache[_lmProjId];  // bust cache so ensureProjectHydrated / openDetail re-fetch
+  delete _msRenderFingerprint[_lmProjId];
   if (window._openDetailProjId === (projects[projIdx].id || projects[projIdx].name)) {
-    // M1651: force north-stars refresh — newly created node may not be in stale _nsStarsCache.
-    // loadMilestones() uses _nsStarsCache to match _cgActiveNodeFilter → stale = empty stones.
-    const _lmProjId = projects[projIdx].id || projects[projIdx].name;
-    delete _nsStarsCache[_lmProjId];  // bust cache so ensureProjectHydrated re-fetches
-    delete _msRenderFingerprint[_lmProjId];
     loadMilestones(_lmProjId);
   } else {
     openDetail(projIdx);
