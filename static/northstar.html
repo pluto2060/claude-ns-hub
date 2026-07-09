@@ -6632,84 +6632,6 @@ async function _loadEfficiencyMetrics() {
   } catch(_) { el.textContent = 'Load failed'; }
 }
 
-// M1733: restored agent/model picker before fork — forkSessionFromRow previously read
-// whatever was left in the ambient #dm-model-select dropdown with zero confirmation, so a
-// dropdown left on a stale/unrelated model (e.g. or-owl-alpha from browsing a different
-// project) silently forked onto that model. Now shows a small picker; the actual fork moved
-// to _doForkSession.
-function forkSessionFromRow(projId, sourceId, sourceAgent) {
-  if (!sourceId || sourceId === 'fresh') {
-    _hubAlert('No source session to fork from this row.');
-    return;
-  }
-  const modelSel = document.getElementById('dm-model-select');
-  const defaultModel = (modelSel ? modelSel.value : '') || '';
-  const btn = event && event.target && event.target.closest('span');
-  _showForkPicker(projId, sourceId, sourceAgent || 'claude', defaultModel, btn);
-}
-
-function _showForkPicker(projId, sourceId, sourceAgent, defaultModel, btn) {
-  document.getElementById('fork-picker-modal')?.remove();
-  const agents = ['claude', 'openrouter'];
-  const m = document.createElement('div');
-  m.id = 'fork-picker-modal';
-  m.style.cssText = 'position:fixed;inset:0;z-index:10100;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.5)';
-  const _buildModelOpts = (agent, selected) => (MODEL_CATALOG[agent] || []).map(([v, lbl]) =>
-    `<option value="${esc(v)}"${v === selected ? ' selected' : ''}>${esc(lbl)}</option>`
-  ).join('');
-  const _initialAgent = agents.includes(sourceAgent) ? sourceAgent : (defaultModel.startsWith('or-') ? 'openrouter' : 'claude');
-  m.innerHTML = `<div style="background:var(--panel);border:1px solid var(--panel-border);border-radius:8px;padding:12px 14px;max-width:260px;width:92%;font-family:var(--mono)">
-    <div style="font-size:9px;font-weight:600;color:var(--accent);margin-bottom:8px;letter-spacing:.04em">FORK SESSION — CHOOSE AGENT / MODEL</div>
-    <div style="font-size:9px;color:var(--text-dim);margin-bottom:3px">Agent</div>
-    <select id="fp-agent-select" style="width:100%;background:var(--panel-soft);border:1px solid var(--panel-border);border-radius:4px;padding:4px 7px;font-family:var(--mono);font-size:9px;color:var(--text);box-sizing:border-box;margin-bottom:8px">
-      ${agents.map(a => `<option value="${a}"${a === _initialAgent ? ' selected' : ''}>${a}</option>`).join('')}
-    </select>
-    <div style="font-size:9px;color:var(--text-dim);margin-bottom:3px">Model</div>
-    <select id="fp-model-select" style="width:100%;background:var(--panel-soft);border:1px solid var(--panel-border);border-radius:4px;padding:4px 7px;font-family:var(--mono);font-size:9px;color:var(--text);box-sizing:border-box;margin-bottom:10px">
-      ${_buildModelOpts(_initialAgent, defaultModel)}
-    </select>
-    <div style="display:flex;gap:6px">
-      <button id="fp-cancel-btn" style="flex:1;font-family:var(--mono);font-size:9px;padding:4px 0;border-radius:3px;border:1px solid var(--panel-border);background:none;color:var(--text-dim);cursor:pointer">Cancel</button>
-      <button id="fp-fork-btn" style="flex:1;font-family:var(--mono);font-size:9px;padding:4px 0;border-radius:3px;border:1px solid var(--accent);background:var(--accent-soft);color:var(--accent);cursor:pointer">⑂ Fork</button>
-    </div>
-  </div>`;
-  const agentSel = m.querySelector('#fp-agent-select');
-  const modelSel = m.querySelector('#fp-model-select');
-  agentSel.onchange = () => { modelSel.innerHTML = _buildModelOpts(agentSel.value, ''); };
-  m.querySelector('#fp-cancel-btn').onclick = () => m.remove();
-  m.querySelector('#fp-fork-btn').onclick = () => {
-    const chosenAgent = agentSel.value;
-    const chosenModel = modelSel.value;
-    m.remove();
-    _doForkSession(projId, sourceId, chosenAgent, chosenModel, btn);
-  };
-  m.addEventListener('click', e => { if (e.target === m) m.remove(); });
-  document.body.appendChild(m);
-}
-
-async function _doForkSession(projId, sourceId, targetAgent, targetModel, btn) {
-  const origTxt = btn ? btn.textContent : '';
-  if (btn) { btn.style.pointerEvents = 'none'; btn.textContent = '◌ Forking…'; }
-  try {
-    const r = await fetch(`/api/northstar/${encodeURIComponent(projId)}/fork-session`, {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ source_session_id: sourceId, target_model: targetModel, agent: targetAgent }),
-    });
-    const d = await r.json().catch(() => ({}));
-    if (!r.ok || !d.ok) {
-      _hubAlert('Fork failed: ' + (d.error || r.status));
-      return;
-    }
-    // M1744: success alert removed per user request
-    if (typeof window._renderResumableSessions === 'function') window._renderResumableSessions();
-    if (typeof window._refreshExecState === 'function') window._refreshExecState();
-  } catch (e) {
-    _hubAlert('Fork error: ' + e.message);
-  } finally {
-    if (btn) { btn.style.pointerEvents = ''; btn.textContent = origTxt; }
-  }
-}
-
 function _selectSession(agent, model, sessionId) {
   window._selectedSession = { agent, model, session_id: sessionId };
   window.curAgent = agent;
@@ -14073,15 +13995,9 @@ function renderRight(p) {
               + (isExecLive && _tmuxSession ? `<span class="ns-node-term live" style="font-size:8px;padding:1px 6px;cursor:pointer;flex-shrink:0;margin-left:3px"
                   title="Open in browser terminal (ttyd — mobile-friendly with virtual keyboard)"
                   onclick="event.stopPropagation();openTtydTerminal('${esc(_tmuxSession)}','${esc(_projId)}')">↗_</span>` : '');
-            // M1699-fork/M1733: per-row ⑂ Fork button (placed LEFT of the tmux terminal button).
-            // Opens a small agent/model picker (_showForkPicker), then forks THIS row's source
-            // session onto the chosen model (claude / openrouter). Hidden on fresh rows
-            // (no source) and exec_live (already running).
-            const _forkRowBtn = (!isFresh && !isExecLive && s.id && s.id !== 'fresh')
-              ? `<span class="ns-node-term" style="font-size:8px;padding:1px 4px;cursor:pointer;flex-shrink:0;color:var(--blue,#7b9fd4);border:1px solid rgba(123,159,212,.4);background:rgba(123,159,212,.1);border-radius:3px"
-                  title="Fork this session onto a chosen model (claude / openrouter) — source stays intact"
-                  onclick="event.stopPropagation();forkSessionFromRow('${esc(_projId)}','${esc(s.id)}','${esc(agent)}')">⑂ Fork</span>`
-              : '';
+            // M1745: per-row ⑂ Fork button removed — superseded by the substar sess-badge
+            // Assign panel's agent/model picker (M1745), which now covers the same
+            // "start a new session on a chosen model" need via the Assign flow.
             // M253: for fresh rows, use current dropdown agent/model so switching to openrouter
             // then clicking "new session" doesn't reset dropdowns back to claude default.
             // M271: fresh rows use dropdown's actual current value to preserve user selection
@@ -14116,7 +14032,7 @@ function renderRight(p) {
               }
               ${isExecLive ? `<span style="font-size:8px;color:var(--green);font-weight:600;flex-shrink:0">live</span>` : ''}
               ${subLabel}
-              <span style="margin-left:auto;display:flex;align-items:center;gap:3px;flex-shrink:0">${_forkRowBtn}${_ptyRowBtn}</span>
+              <span style="margin-left:auto;display:flex;align-items:center;gap:3px;flex-shrink:0">${_ptyRowBtn}</span>
             </div>`;
           }
           // M257: include PTY state in hash so color/label changes force re-render
@@ -15291,11 +15207,33 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
           popup.appendChild(emptyDiv);
         }
         // M811: new session input row — always shown at bottom
+        // M1745: agent/model picker row (replaces the removed per-row ⑂ Fork button —
+        // Assign's auto-spawn always forks from mother context (M1656-fork); this only
+        // lets the user choose WHICH agent/model that forked child runs on).
+        const _newSessPickerRow = document.createElement('div');
+        _newSessPickerRow.style.cssText = 'padding:7px 10px 0;border-top:1px solid var(--panel-border);display:flex;gap:6px;align-items:center';
+        const _agentSelInit = (window.curAgent || window._selectedSession?.agent || 'claude').trim();
+        const _agentSel = document.createElement('select');
+        _agentSel.id = '_sess-assign-agent-select';
+        _agentSel.style.cssText = 'font-family:var(--mono);font-size:9px;background:var(--panel-soft);border:1px solid var(--panel-border);border-radius:3px;padding:2px 4px;color:var(--text);flex:0 0 auto';
+        _agentSel.innerHTML = ['claude', 'openrouter'].map(a =>
+          `<option value="${a}"${a === _agentSelInit ? ' selected' : ''}>${a}</option>`).join('');
+        const _modelSelInit = (window.curModel || window._selectedSession?.model || '').trim();
+        const _modelSel = document.createElement('select');
+        _modelSel.id = '_sess-assign-model-select';
+        _modelSel.style.cssText = 'font-family:var(--mono);font-size:9px;background:var(--panel-soft);border:1px solid var(--panel-border);border-radius:3px;padding:2px 4px;color:var(--text);flex:1;min-width:0';
+        const _buildAssignModelOpts = (agent, selected) => (MODEL_CATALOG[agent] || []).map(([v, lbl]) =>
+          `<option value="${esc(v)}"${v === selected ? ' selected' : ''}>${esc(lbl)}</option>`).join('');
+        _modelSel.innerHTML = _buildAssignModelOpts(_agentSelInit, _modelSelInit);
+        _newSessPickerRow.appendChild(_agentSel);
+        _newSessPickerRow.appendChild(_modelSel);
+        popup.appendChild(_newSessPickerRow);
+
         const _newSessRow = document.createElement('div');
-        _newSessRow.style.cssText = 'padding:7px 10px;border-top:1px solid var(--panel-border);display:flex;gap:6px;align-items:center;flex-wrap:wrap';
+        _newSessRow.style.cssText = 'padding:7px 10px;display:flex;gap:6px;align-items:center;flex-wrap:wrap';
         // M859: locked prefix = {current agent}-exec-{projId}-, suffix editable
-        const _sessAgent = (window.curAgent || window._selectedSession?.agent || 'claude').trim();
-        const _sessPrefix = `${_sessAgent}-exec-${_sessBtnProj}-`;
+        // M1745: prefix now tracks the agent select above (was window.curAgent only)
+        let _sessPrefix = `${_agentSel.value}-exec-${_sessBtnProj}-`;
         // M1670: M1653's name-derived suffix mangled non-ASCII substar names (Korean/symbols)
         // into garbage like "---skill---mcp---" after the ASCII-only sanitizer stripped
         // everything meaningful, leaving only leftover dashes. A random 8-hex suffix is
@@ -15305,7 +15243,12 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
         const _prefixSpan = document.createElement('span');
         _prefixSpan.style.cssText = 'font-family:var(--mono);font-size:10px;color:var(--text-dim);background:var(--panel-soft);border:1px solid var(--panel-border);border-right:none;border-radius:3px 0 0 3px;padding:2px 4px;white-space:nowrap;user-select:none';
         _prefixSpan.textContent = _sessPrefix;
-        _prefixSpan.title = 'Prefix is fixed (M859)';
+        _prefixSpan.title = 'Prefix follows the agent selected above';
+        _agentSel.onchange = () => {
+          _sessPrefix = `${_agentSel.value}-exec-${_sessBtnProj}-`;
+          _prefixSpan.textContent = _sessPrefix;
+          _modelSel.innerHTML = _buildAssignModelOpts(_agentSel.value, '');
+        };
         const _newSessInput = document.createElement('input');
         _newSessInput.type = 'text';
         _newSessInput.value = _sessSuffix;
@@ -15323,8 +15266,10 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
           if (!_suffix) { _newSessInput.focus(); return; }
           const _nm = _sessPrefix + _suffix;
           if (ns) {
+            // M1745: pass the chosen agent/model so assign-spawn's mother-fork uses them
+            // instead of always defaulting to claude + project model (server.py update_north_star).
             const _r = await fetch(`/api/northstar/${encodeURIComponent(_sessBtnProj)}/north-stars/${encodeURIComponent(ns.id)}`,
-              {method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({assigned_session:_nm})}).catch(()=>null);
+              {method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({assigned_session:_nm,spawn_agent:_agentSel.value,spawn_model:_modelSel.value})}).catch(()=>null);
             if (_r?.ok) {
               ns.assigned_session = _nm;
               if (window._nsMap && window._nsMap[ns.id]) window._nsMap[ns.id].assigned_session = _nm;

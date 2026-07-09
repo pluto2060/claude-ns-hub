@@ -5668,6 +5668,7 @@ def _update_session_history_from_transcript(proj_id: str, proj_dir: str, model_k
             # record it under a foreign-agent model key.
             _mk_agent = "openrouter" if model_key.startswith("or-") else "codex" if model_key.startswith("codex-") else "claude"
             _new_agent = "claude"
+            _det_empty = False  # M1750: track whether detection was inconclusive
             try:
                 _new_t = transcripts_dir / f"{new_sid}.jsonl"
                 if _new_t.exists() and _new_t.stat().st_size > 0:
@@ -5676,9 +5677,14 @@ def _update_session_history_from_transcript(proj_id: str, proj_dir: str, model_k
                         _new_agent = "openrouter"
                     elif _det.startswith("codex-"):
                         _new_agent = "codex"
+                    elif not _det:
+                        # M1750: transcript too new — no API responses written yet (only metadata
+                        # lines). Detection is inconclusive; trust model_key (from spawn-info)
+                        # instead of defaulting to "claude" and blocking the write.
+                        _det_empty = True
             except Exception:
-                pass
-            if _new_agent != _mk_agent:
+                _det_empty = True
+            if _new_agent != _mk_agent and not _det_empty:
                 # Foreign-agent session: do NOT record under this model key (prevents the
                 # leak). Still advance _prev for the *true* owner if it later writes here.
                 pass
@@ -6460,6 +6466,10 @@ async def update_north_star(proj_id: str, ns_id: str, request: Request):
         if field in data:
             ns[field] = data[field] or None if field in ("default_agent", "assigned_session", "branch_from_session_id") else data[field]
     proj["north_stars"] = ns_list
+    # M1745: Assign panel's agent/model picker — request-scoped only (not persisted on the
+    # substar), consumed below by the assign-spawn block. "" falls back to claude / project model.
+    _spawn_agent = (data.get("spawn_agent") or "").strip().lower()
+    _spawn_model = (data.get("spawn_model") or "").strip()
     _save_project(proj_id, proj)  # M289: was _write_md_frontmatter — bypassed SQLite project_meta
     # M1347: removed _sync_substars_to_claude_md call — hub no longer writes project CLAUDE.md  # PermissionError or missing CLAUDE.md must not abort the primary SQLite save
 
@@ -6480,16 +6490,22 @@ async def update_north_star(proj_id: str, ns_id: str, request: Request):
                     f"Call get_pending_task() to find your assigned stones.",
                     encoding="utf-8",
                 )
+                # M1745: agent/model chosen in the Assign panel picker — falls back to
+                # claude + project default model when the request omits them (e.g. programmatic
+                # PATCH calls that predate this field).
+                _sp_agent = _spawn_agent if _spawn_agent in ("claude", "openrouter") else "claude"
+                _sp_override_model = _spawn_model or None
                 _sp_env = ["-e", f"NS_HUB_URL=http://{_tailscale_interface_ip()}:{PORT}",
                            "-e", f"NS_SESSION_KEY={_new_assigned}",
                            "-e", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80"]  # M1656-R8: children rely on CLI auto-compact
-                for _k, _v in _get_project_spawn_env(proj_id).items():
+                for _k, _v in _get_project_spawn_env(proj_id, override_model=_sp_override_model).items():
                     _sp_env += ["-e", f"{_k}={_v}"]
                 # M1656-fork: inherit mother conversation context via fork (fallback --continue)
                 _sp_resume_args = _mother_fork_args(proj_id, _spawn_cwd)
                 # M1656-R9: session-scoped spawn-info record — was never written for children,
                 # so their exec-pane badge always showed "— unknown" instead of ↻ fork/resume.
-                _record_spawn_info(proj_id, _sp_resume_args, agent="claude", session_name=_new_assigned)
+                _record_spawn_info(proj_id, _sp_resume_args, agent=_sp_agent, session_name=_new_assigned,
+                                   model=_sp_override_model or _get_project_model_value(proj_id) or "")
                 # Snapshot BEFORE spawn so the bg capture can find the one file THIS spawn creates
                 try:
                     _sp_pre_files = {f.name for f in (Path.home() / ".claude" / "projects"
@@ -6497,8 +6513,8 @@ async def update_north_star(proj_id: str, ns_id: str, request: Request):
                 except Exception:
                     _sp_pre_files = set()
                 _sp_cmd = (["claude", "--dangerously-skip-permissions"] + _DISALLOWED_TOOLS_ARGS
-                           + _hub_mcp_spawn_args(proj_id, _new_assigned)
-                           + _sp_resume_args + _get_project_model(proj_id))
+                           + _hub_mcp_spawn_args(proj_id, _new_assigned, agent=_sp_agent)
+                           + _sp_resume_args + _get_project_model(proj_id, override_model=_sp_override_model))
                 subprocess.Popen(["tmux", "new-session", "-d", "-s", _new_assigned, "-c", _spawn_cwd]
                                  + _sp_env + _sp_cmd)
                 _capture_live_session_id_bg(proj_id, _spawn_cwd, _new_assigned, _sp_pre_files)
