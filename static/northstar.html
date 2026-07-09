@@ -534,7 +534,8 @@ header {
 .ms-stone.active   { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-deep); animation: stone-pulse 2s ease-in-out infinite; }
 .ms-stone.pending  { background: var(--panel); border-color: var(--panel-border); color: var(--text-dim); }
 .ms-stone:hover    { transform: scale(1.15); box-shadow: 0 2px 6px rgba(0,0,0,.15); }
-@keyframes stone-pulse { 0%,100%{box-shadow:0 0 0 0 rgba(204,120,92,0)} 50%{box-shadow:0 0 0 4px rgba(204,120,92,.2)} }
+/* M1742: box-shadow keyframe → opacity (GPU-composited; box-shadow triggers CPU raster paint each frame) */
+@keyframes stone-pulse { 0%,100%{opacity:1} 50%{opacity:.7} }
 @keyframes stop-pulse { from { opacity:.6; } to { opacity:1; } }
 /* M1418: tab-hidden animation pause via CSS custom property — covers all infinite animations */
 /* M1581: added .ns-node.circle-card.has-bang, .ss-cnt-blink, .live-dot */
@@ -1102,9 +1103,9 @@ header {
 .dm-pane-body { padding: 6px 10px; }
 .dm-sess-fresh { color: var(--yellow,#d4a574) !important; }
 .dm-sess-resume { color: var(--text) !important; }
-.dm-sess-row { display: flex; align-items: center; gap: 6px; padding: 5px 8px;
+.dm-sess-row { display: flex; align-items: center; gap: 4px; padding: 5px 8px;
   border-radius: 4px; cursor: pointer; font-size: 9px; border: 1px solid transparent;
-  flex-wrap: nowrap; min-width: 0; overflow: hidden; }
+  flex-wrap: nowrap; min-width: 0; }
 .dm-sess-row:hover { background: rgba(0,0,0,.06); }
 .dm-sess-row.picked {
   background: rgba(61,139,94,.12);
@@ -1610,8 +1611,9 @@ header {
    tag, which only got injected when detail card opened. CG-first path therefore had no
    animation because the rule literally did not exist in any stylesheet until detail open. */
 @keyframes ss-cnt-blink-anim {
-  0%, 100% { transform: scale(1.05); filter: brightness(1.35) drop-shadow(0 0 3px currentColor); }
-  40%, 60% { transform: scale(1.35); filter: brightness(1.7) drop-shadow(0 0 8px currentColor); }
+  /* M1742: removed filter:brightness/drop-shadow (CPU rasterization); opacity+transform are GPU-composited */
+  0%, 100% { transform: scale(1.05); opacity: 0.85; }
+  40%, 60% { transform: scale(1.35); opacity: 1; }
 }
 .ss-cnt-blink { display: inline-block; animation: ss-cnt-blink-anim 1.4s ease-in-out infinite; font-weight: bold; }
 </style>
@@ -5409,21 +5411,20 @@ async function toggleQueueStatus(projId, mid, nextStatus, _ev) {
       }
     }
     if (nextStatus === 'queued') {
-      // M433: include current agent/model/session from UI dropdowns so queue dispatch
-      // uses the settings the user has selected — not just the server-stored defaults.
-      const _dispBody = {};
-      const _agSel = document.getElementById('dm-agent-select');
-      const _mdSel = document.getElementById('dm-model-select');
-      if (_agSel?.value) _dispBody.agent = _agSel.value;
-      if (_mdSel?.value) _dispBody.model = _mdSel.value;
-      const _sel = window._selectedSession || {};
-      // M442 root cause: passing session_id to Execute triggers _kill_all_exec_sessions
-      // (server kills running session when explicit_session_id is set). Queue auto-dispatch
-      // must NOT pass session_id — only agent/model for settings preservation.
-      // Session selection only applies when user explicitly clicks → dispatch-all.
+      // M433 REMOVED (M1750): used to send the ambient #dm-agent-select/#dm-model-select
+      // dropdown values so queue dispatch honored user-picked settings. But since M1750's
+      // earlier fix removed dropdown-sync-on-session-click, the dropdown can silently drift
+      // from whatever model the live session actually spawned with — and execute_project's
+      // _options_changed check (server.py ~9420) treats ANY model mismatch as "user wants
+      // different session options," killing and respawning the session even though this is
+      // just a queue toggle, not an explicit dispatch (from_badge=True only guards against
+      // spawning a DEAD session — it does not protect an alive one from this kill branch).
+      // Fix: send no agent/model at all — the live session's actual settings are the source
+      // of truth for automatic queue-driven dispatch; only the explicit dispatch-all button
+      // (executeProject) should ever be able to signal an intentional options change.
       fetch(`/api/northstar/${encodeURIComponent(projId)}/execute`, {
         method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({..._dispBody, from_badge: true}),
+        body: JSON.stringify({from_badge: true}),
       }).catch(() => {});
     }
   } catch (_) { _patchInFlight.delete(mid); } // release guard even on failure
@@ -6295,14 +6296,13 @@ async function reopenMs(projId, mid, btn) {
     else { await loadMilestones(projId); render(); }
     // M521: also fire execute so Claude processes the reopened stone immediately
     // M1554: from_badge=true — reopen must not spawn a dead session; only dispatch button may spawn
-    const _dB = {};
-    const _ag = document.getElementById('dm-agent-select');
-    const _md = document.getElementById('dm-model-select');
-    if (_ag?.value) _dB.agent = _ag.value;
-    if (_md?.value) _dB.model = _md.value;
+    // M1750: dropped ambient dm-agent-select/dm-model-select — same bug as toggleQueueStatus
+    // (see that function's comment): a stale dropdown value mismatching the live session's
+    // actual model tripped execute_project's _options_changed check and killed+respawned the
+    // session on a plain reopen. Reopen is a queue action, not an options change.
     fetch(`/api/northstar/${encodeURIComponent(projId)}/execute`, {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({..._dB, from_badge: true}),
+      body: JSON.stringify({from_badge: true}),
     }).catch(() => {});
   } finally { _msSetLoading(mid, false, btn); _dmSpinOff(); }
 }
@@ -6632,29 +6632,62 @@ async function _loadEfficiencyMetrics() {
   } catch(_) { el.textContent = 'Load failed'; }
 }
 
-// M1699-fork: fork the currently-picked session onto the model selected in the
-// dropdown (claude / openrouter only — both run the Claude Code CLI, so a forked
-// M1699-fork: fork a session row directly onto the model selected in the dropdown
-// (claude / openrouter). No popup — the dropdown already holds the target model.
-// agent is derived from the row's agent + model prefix by the backend. The source
-// session is left untouched and remains resumable after switching back.
-async function forkSessionFromRow(projId, sourceId, sourceAgent) {
+// M1733: restored agent/model picker before fork — forkSessionFromRow previously read
+// whatever was left in the ambient #dm-model-select dropdown with zero confirmation, so a
+// dropdown left on a stale/unrelated model (e.g. or-owl-alpha from browsing a different
+// project) silently forked onto that model. Now shows a small picker; the actual fork moved
+// to _doForkSession.
+function forkSessionFromRow(projId, sourceId, sourceAgent) {
   if (!sourceId || sourceId === 'fresh') {
     _hubAlert('No source session to fork from this row.');
     return;
   }
   const modelSel = document.getElementById('dm-model-select');
-  const targetModel = (modelSel ? modelSel.value : '') || '';
-  // Restrict to claude / openrouter (CLI-based); reject codex/dsk for now.
-  if (targetModel && !targetModel.startsWith('claude-') && !targetModel.startsWith('or-') && targetModel !== 'haiku' && targetModel !== 'sonnet' && targetModel !== 'opus' && targetModel !== 'fable') {
-    _nsConfirm('Fork not supported for this model',
-      `${targetModel} is not a Claude-Code-based model.\nFork supports claude-* and or-* only.`,
-      null);
-    return;
-  }
-  // agent follows the dropdown model: or-* → openrouter, else the row's agent (claude default).
-  const targetAgent = targetModel.startsWith('or-') ? 'openrouter' : (sourceAgent || 'claude');
+  const defaultModel = (modelSel ? modelSel.value : '') || '';
   const btn = event && event.target && event.target.closest('span');
+  _showForkPicker(projId, sourceId, sourceAgent || 'claude', defaultModel, btn);
+}
+
+function _showForkPicker(projId, sourceId, sourceAgent, defaultModel, btn) {
+  document.getElementById('fork-picker-modal')?.remove();
+  const agents = ['claude', 'openrouter'];
+  const m = document.createElement('div');
+  m.id = 'fork-picker-modal';
+  m.style.cssText = 'position:fixed;inset:0;z-index:10100;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.5)';
+  const _buildModelOpts = (agent, selected) => (MODEL_CATALOG[agent] || []).map(([v, lbl]) =>
+    `<option value="${esc(v)}"${v === selected ? ' selected' : ''}>${esc(lbl)}</option>`
+  ).join('');
+  const _initialAgent = agents.includes(sourceAgent) ? sourceAgent : (defaultModel.startsWith('or-') ? 'openrouter' : 'claude');
+  m.innerHTML = `<div style="background:var(--panel);border:1px solid var(--panel-border);border-radius:8px;padding:12px 14px;max-width:260px;width:92%;font-family:var(--mono)">
+    <div style="font-size:9px;font-weight:600;color:var(--accent);margin-bottom:8px;letter-spacing:.04em">FORK SESSION — CHOOSE AGENT / MODEL</div>
+    <div style="font-size:9px;color:var(--text-dim);margin-bottom:3px">Agent</div>
+    <select id="fp-agent-select" style="width:100%;background:var(--panel-soft);border:1px solid var(--panel-border);border-radius:4px;padding:4px 7px;font-family:var(--mono);font-size:9px;color:var(--text);box-sizing:border-box;margin-bottom:8px">
+      ${agents.map(a => `<option value="${a}"${a === _initialAgent ? ' selected' : ''}>${a}</option>`).join('')}
+    </select>
+    <div style="font-size:9px;color:var(--text-dim);margin-bottom:3px">Model</div>
+    <select id="fp-model-select" style="width:100%;background:var(--panel-soft);border:1px solid var(--panel-border);border-radius:4px;padding:4px 7px;font-family:var(--mono);font-size:9px;color:var(--text);box-sizing:border-box;margin-bottom:10px">
+      ${_buildModelOpts(_initialAgent, defaultModel)}
+    </select>
+    <div style="display:flex;gap:6px">
+      <button id="fp-cancel-btn" style="flex:1;font-family:var(--mono);font-size:9px;padding:4px 0;border-radius:3px;border:1px solid var(--panel-border);background:none;color:var(--text-dim);cursor:pointer">Cancel</button>
+      <button id="fp-fork-btn" style="flex:1;font-family:var(--mono);font-size:9px;padding:4px 0;border-radius:3px;border:1px solid var(--accent);background:var(--accent-soft);color:var(--accent);cursor:pointer">⑂ Fork</button>
+    </div>
+  </div>`;
+  const agentSel = m.querySelector('#fp-agent-select');
+  const modelSel = m.querySelector('#fp-model-select');
+  agentSel.onchange = () => { modelSel.innerHTML = _buildModelOpts(agentSel.value, ''); };
+  m.querySelector('#fp-cancel-btn').onclick = () => m.remove();
+  m.querySelector('#fp-fork-btn').onclick = () => {
+    const chosenAgent = agentSel.value;
+    const chosenModel = modelSel.value;
+    m.remove();
+    _doForkSession(projId, sourceId, chosenAgent, chosenModel, btn);
+  };
+  m.addEventListener('click', e => { if (e.target === m) m.remove(); });
+  document.body.appendChild(m);
+}
+
+async function _doForkSession(projId, sourceId, targetAgent, targetModel, btn) {
   const origTxt = btn ? btn.textContent : '';
   if (btn) { btn.style.pointerEvents = 'none'; btn.textContent = '◌ Forking…'; }
   try {
@@ -6667,7 +6700,7 @@ async function forkSessionFromRow(projId, sourceId, sourceAgent) {
       _hubAlert('Fork failed: ' + (d.error || r.status));
       return;
     }
-    _hubAlert(`Forked onto ${d.target_model} → ${d.session}. Original session intact.`);
+    // M1744: success alert removed per user request
     if (typeof window._renderResumableSessions === 'function') window._renderResumableSessions();
     if (typeof window._refreshExecState === 'function') window._refreshExecState();
   } catch (e) {
@@ -6689,27 +6722,10 @@ function _selectSession(agent, model, sessionId) {
     const dot = r.querySelector('span');
     if (dot) dot.style.color = isPicked ? 'var(--green)' : 'var(--text-dim)';
   });
-  // Sync agent selector
+  // Sync agent selector only — M1746: do NOT sync model dropdown on session row click.
+  // Model dropdown is for dispatch target; session row click is for resume/fork targeting only.
   const agentSel = document.getElementById('dm-agent-select');
   if (agentSel) agentSel.value = agent;
-  // M263: reset curModel when agent changes — prevents stale model from wrong catalog
-  if (window.curAgent !== agent) window.curModel = model;
-  // Sync model selector — use the session's model (not curModel) to avoid agent/catalog mismatch
-  const modelSel = document.getElementById('dm-model-select');
-  if (modelSel && typeof MODEL_CATALOG !== 'undefined') {
-    const catalog = MODEL_CATALOG[agent] || MODEL_CATALOG.claude || [];
-    const opts = catalog.map(([v,lbl]) =>
-      `<option value="${esc(v)}"${v===model?' selected':''}
-        style="background:var(--bg-deep);color:var(--text)">${esc(lbl)}</option>`
-    ).join('');
-    // Inject model as option if not in catalog (e.g. OR models from older sessions)
-    const inCatalog = catalog.some(([v]) => v === model);
-    const extraOpt = (model && !inCatalog)
-      ? `<option value="${esc(model)}" selected style="background:var(--bg-deep);color:var(--text)">${esc(model.replace(/^or-/,''))}</option>`
-      : '';
-    modelSel.innerHTML = opts + extraOpt;
-    modelSel.value = model;
-  }
   // Async re-render to sync server state
   if (typeof window._renderResumableSessions === 'function') window._renderResumableSessions();
 }
@@ -6720,7 +6736,11 @@ async function executeProject(projId, btn) {
   // M284/M425: confirm at dispatch time if new options differ — use in-modal dialog (not browser confirm)
   window._execRestartOk = window._execRestartOk || {};
   const _restartKey = `${projId}:${Date.now()>>10}`; // coarse key — same ~1s window = same confirm
-  if (!window._execRestartOk[projId]) {
+  // M1748: skip restart confirm when user explicitly chose "+ new session" — no existing
+  // session is being resumed, so warning about agent/model change is irrelevant.
+  const _selSessId = (window._selectedSession || {}).session_id || '';
+  const _isNewSession = !_selSessId || _selSessId === 'fresh';
+  if (!window._execRestartOk[projId] && !_isNewSession) {
     try {
       const _sessR = await fetch('/api/exec-sessions');
       const _sessD = await _sessR.json();
@@ -7634,14 +7654,26 @@ async function refreshSessionStatus() {
       const _isMother = s.session === `${s.agent||'claude'}-exec-${s.proj_id}`;
       if (_isMother) {
         newExec[s.proj_id] = s.idle ? 'idle' : 'running';
+        // M1741: mother session model → main avatar. Only mother sets _execModel so the
+        // ns-card avatar reflects the mother's model, not whichever child happened to
+        // overwrite it last in the loop (e.g. Clone: opus mother + sonnet child → avatar
+        // should show opus, the authoritative project-level model).
+        window._execModel[s.proj_id] = s.model || '';
       } else if (!(s.proj_id in newExec)) {
         // No mother session record yet (e.g. only children alive) — fall back to any-running-wins
         // so the ring isn't blank; gets overwritten the instant a mother record appears.
         if (!s.idle) newExec[s.proj_id] = 'running';
         else if (!newExec[s.proj_id]) newExec[s.proj_id] = 'idle';
+        // No mother yet → use child's model as temporary stand-in
+        if (!window._execModel[s.proj_id]) window._execModel[s.proj_id] = s.model || '';
       }
-      window._execModel[s.proj_id] = s.model || '';
-      (window._execSessionList[s.proj_id] = window._execSessionList[s.proj_id] || []).push(s.idle ? 'idle' : 'running');
+      (window._execSessionList[s.proj_id] = window._execSessionList[s.proj_id] || []).push({idle: s.idle, model: s.model||'', session: s.session||'', isMother: _isMother});
+    }
+    // M1741: sort each project's session list so mother is always [0] (mini avatar shows [1]=first child).
+    // API response order is non-deterministic; without sorting, the child may land at [0] and the
+    // mother at [1], causing the mini overlay to render the mother again instead of the child.
+    for (const pid of Object.keys(window._execSessionList)) {
+      window._execSessionList[pid].sort((a, b) => (b.isMother ? 1 : 0) - (a.isMother ? 1 : 0));
     }
     // Clear model for projects whose exec session ended
     for (const pid of Object.keys(window._execModel)) {
@@ -7929,19 +7961,22 @@ function nodeCard(p, idx) {
   const _sessList = (window._execSessionList || {})[p.id||p.name] || [];
   // _mkMiniAvatarInner: the raw image/fallback content (no positioning), reused for both the
   // 2nd-session box and the 3rd-session box nested inside it.
-  const _mkMiniAvatarInner = (st, extraCls) => {
+  // M1741: _sessList is now [{idle, model, session, isMother}, ...] objects (was strings)
+  const _mkMiniAvatarInner = (sessObj, extraCls) => {
+    const st = sessObj.idle ? 'idle' : 'running';
     const _op = st === 'running' ? '1' : '0.3';
-    // M1729: running child sessions pulse the same way the main avatar ring does
-    // (.avatar-ring.status-active — border + sess-pulse) so child busy-state is
-    // visually consistent with mother's, not just distinguished by static opacity.
     const _runCls = st === 'running' ? ' ns-sess-mini-active' : '';
-    return _avatarUrl
-      ? `<img class="ns-sess-mini-avatar${_runCls} ${extraCls}" style="opacity:${_op}" src="${esc(_avatarUrl)}" alt="">`
+    // M1741: use per-session model avatar so Clone with opus+sonnet shows correct images per child
+    const _sessModelAvatars = _nsModelAvatars();
+    const _sModel = sessObj.model || '';
+    let _sKey = null;
+    if (_sModel && _sessModelAvatars[_sModel]) { _sKey = _sModel; }
+    else if (_sModel) { const _ks = Object.keys(_sessModelAvatars).sort((a,b)=>b.length-a.length); _sKey = _ks.find(k=>_sModel.includes(k))||null; }
+    const _sUrl = (_sKey ? _sessModelAvatars[_sKey] : null) || _sessModelAvatars['default'] || _avatarUrl;
+    return _sUrl
+      ? `<img class="ns-sess-mini-avatar${_runCls} ${extraCls}" style="opacity:${_op}" src="${esc(_sUrl)}" alt="">`
       : `<div class="ns-sess-mini-avatar ns-sess-mini-fallback${_runCls} ${extraCls}" style="opacity:${_op}">${esc(_initials)}</div>`;
   };
-  // 3rd session's avatar is a DOM child of the 2nd session's own wrapper (not a sibling), so its
-  // `position:absolute;bottom/right` resolves against the 2nd avatar's own box — this is what
-  // makes the containment fractal/recursive (main-ring:2nd-avatar :: 2nd-avatar:3rd-avatar).
   const _thirdHtml = _sessList.length > 2 ? _mkMiniAvatarInner(_sessList[2], 'ns-sess-nested') : '';
   const _sessAvatarStackHtml = _sessList.length > 1
     ? `<div class="ns-sess-avatars" title="${_sessList.length} live sessions">
@@ -12605,16 +12640,13 @@ function _msAddMsg(event, projId, mid, currentStatus, btn) {
       _freshBtn.textContent = '+ msg';
       Object.assign(_freshBtn.style, { color: '#fff', background: 'var(--accent-deep)', border: '1px solid var(--accent-deep)', opacity: '1' });
     }
-    // M433: include current dropdown settings in dispatch
-    const _dB = {};
-    const _ag = document.getElementById('dm-agent-select');
-    const _md = document.getElementById('dm-model-select');
-    if (_ag?.value) _dB.agent = _ag.value;
-    if (_md?.value) _dB.model = _md.value;
+    // M433 REMOVED (M1750): ambient dropdown model/agent mismatching the live session's
+    // actual settings tripped execute_project's _options_changed check and killed the
+    // session on a plain msg-queue dispatch — same bug as toggleQueueStatus/reopenMs.
     // M442: do NOT pass session_id — would trigger _kill_all_exec_sessions in Execute endpoint
     return fetch(`/api/northstar/${encodeURIComponent(projId)}/execute`, {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({..._dB, from_badge: true}),
+      body: JSON.stringify({from_badge: true}),
     });
   }).then(() => {
     if (projId) { delete _msRenderFingerprint[projId]; loadMilestones(projId); }
@@ -12859,8 +12891,7 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
   // which already persist via requireInteraction (M255 v1). ESC also dismisses.
   const _escClose = (e) => {
     if (e.key === 'Escape') {
-      popup.remove();
-      _openCommentMid = null; // M222
+      _closeCommentPopupNow(); // M1740: use canonical close so sessionStorage is saved
       document.removeEventListener('keydown', _escClose);
       document.removeEventListener('click', _hComment);
       document.removeEventListener('touchstart', _hComment);
@@ -12871,8 +12902,7 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
     // M258: skip close if skill/agent picker modal is open
     if (window._skillModalActive) return;
     if (!popup.contains(e.target)) {
-      popup.remove();
-      _openCommentMid = null; // M222
+      _closeCommentPopupNow(); // M1740: use canonical close so sessionStorage is saved
       document.removeEventListener('click', _hComment);
       document.removeEventListener('touchstart', _hComment);
       document.removeEventListener('keydown', _escClose);
@@ -14007,11 +14037,12 @@ function renderRight(p) {
             const isPicked = _curSess.session_id ? (_curSess.session_id === s.id) : (_curSess.model === model_key && _curSess.agent === agent);
             const isCurrentModel = (model_key === curModel);
             const pickColor = isPicked ? 'var(--green)' : 'var(--text-dim)';
+            const _sessDisplayId = s.label || s.id.slice(0,12);
             const label = isFresh
               ? `✦ new session`
               : isExecLive
                 ? `⟳ ${esc(s.label || s.id.slice(0,12))} `
-                : `↻ resume  ${esc(s.label || s.id.slice(0,12))}`;
+                : `↻ resume`; // M1737: restored per user request
             // M342: removed ● live from subLabel — exec button already shows IDLE/LIVE state; duplicate badge causes confusion
             // M436: model name more vivid — remove dim opacity, use accent-soft color for selected
             const _mlColor = isPicked ? 'var(--accent)' : 'var(--text-soft,var(--text-dim))';
@@ -14024,7 +14055,7 @@ function renderRight(p) {
             if (!isFresh && !isExecLive && s.activity) {
                 const _d = new Date(s.activity * 1000);
                 const _pad = n => String(n).padStart(2,'0');
-                _lastUsed = `<span style="font-size:8px;color:var(--text-soft,var(--text-dim));font-family:var(--mono);flex-shrink:0;white-space:nowrap;width:88px;text-align:right" title="last used (local time)">${String(_d.getFullYear()).slice(2)}/${_pad(_d.getMonth()+1)}/${_pad(_d.getDate())} ${_pad(_d.getHours())}:${_pad(_d.getMinutes())}</span>`;
+                _lastUsed = `<span style="font-size:8px;color:var(--text-soft,var(--text-dim));font-family:var(--mono);flex-shrink:0;white-space:nowrap;width:80px;text-align:right" title="last used (local time)">${String(_d.getFullYear()).slice(2)}/${_pad(_d.getMonth()+1)}/${_pad(_d.getDate())} ${_pad(_d.getHours())}:${_pad(_d.getMinutes())}</span>`;
             }
             const subLabel = (isFresh || isExecLive) ? '' : `<span style="font-size:8px;color:${_mlColor};margin-left:4px;font-weight:${isPicked?'600':'400'};flex-shrink:0;width:68px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(_effectiveModelLabel)}</span>${_lastUsed}`;
             // M183: ›_ button on right of each session row; resume rows pass session_id → --resume
@@ -14042,13 +14073,13 @@ function renderRight(p) {
               + (isExecLive && _tmuxSession ? `<span class="ns-node-term live" style="font-size:8px;padding:1px 6px;cursor:pointer;flex-shrink:0;margin-left:3px"
                   title="Open in browser terminal (ttyd — mobile-friendly with virtual keyboard)"
                   onclick="event.stopPropagation();openTtydTerminal('${esc(_tmuxSession)}','${esc(_projId)}')">↗_</span>` : '');
-            // M1699-fork: per-row ⑂ Fork button (placed LEFT of the tmux terminal button).
-            // Forks THIS row's source session onto the model currently selected in the
-            // dropdown (claude / openrouter). No popup — direct fork. Hidden on fresh rows
+            // M1699-fork/M1733: per-row ⑂ Fork button (placed LEFT of the tmux terminal button).
+            // Opens a small agent/model picker (_showForkPicker), then forks THIS row's source
+            // session onto the chosen model (claude / openrouter). Hidden on fresh rows
             // (no source) and exec_live (already running).
             const _forkRowBtn = (!isFresh && !isExecLive && s.id && s.id !== 'fresh')
-              ? `<span class="ns-node-term" style="font-size:8px;padding:1px 6px;cursor:pointer;flex-shrink:0;color:var(--blue,#7b9fd4);border:1px solid rgba(123,159,212,.4);background:rgba(123,159,212,.1);border-radius:3px"
-                  title="Fork this session onto the selected model (claude / openrouter) — source stays intact"
+              ? `<span class="ns-node-term" style="font-size:8px;padding:1px 4px;cursor:pointer;flex-shrink:0;color:var(--blue,#7b9fd4);border:1px solid rgba(123,159,212,.4);background:rgba(123,159,212,.1);border-radius:3px"
+                  title="Fork this session onto a chosen model (claude / openrouter) — source stays intact"
                   onclick="event.stopPropagation();forkSessionFromRow('${esc(_projId)}','${esc(s.id)}','${esc(agent)}')">⑂ Fork</span>`
               : '';
             // M253: for fresh rows, use current dropdown agent/model so switching to openrouter
@@ -14079,11 +14110,13 @@ function renderRight(p) {
                 const _dotTitle = _hasProcess ? 'Process alive in tmux' : 'No active process (orphaned transcript)';
                 return `<span style="color:${_dotColor};font-size:9px;flex-shrink:0" title="${_dotTitle}">${_hasProcess ? '●' : '○'}</span>`;
               })()}
-              <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 0;min-width:0">${label}</span>
-              ${isExecLive ? `<span style="font-size:8px;color:var(--green);font-weight:600;flex-shrink:0">live</span>` : (!isFresh && _liveExecSid && s.id === _liveExecSid ? `<span style="font-size:8px;color:var(--green);opacity:.7;flex-shrink:0">cur</span>` : '')}
+              ${(isFresh || isExecLive)
+                ? `<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 0;min-width:0">${label}</span>`
+                : `<span style="flex-shrink:0;white-space:nowrap">${label}</span><span style="flex:1 1 0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono);color:var(--text-dim);margin-left:4px" title="${esc(s.id)}">${esc(_sessDisplayId)}</span>`
+              }
+              ${isExecLive ? `<span style="font-size:8px;color:var(--green);font-weight:600;flex-shrink:0">live</span>` : ''}
               ${subLabel}
-              ${_forkRowBtn}
-              ${_ptyRowBtn}
+              <span style="margin-left:auto;display:flex;align-items:center;gap:3px;flex-shrink:0">${_forkRowBtn}${_ptyRowBtn}</span>
             </div>`;
           }
           // M257: include PTY state in hash so color/label changes force re-render
@@ -14555,6 +14588,10 @@ document.addEventListener('input', e => {
           _correctExecStatusFor(d.proj_id);
           // M497b: hide typing indicator when session goes idle (message already shown via milestone_updated)
           _hideTypingIndicator();
+          // M1739: session went idle → transcript updated → refresh session list model labels immediately
+          if (d.proj_id === window._detailModalOpenProjId && typeof window._renderResumableSessions === 'function') {
+            setTimeout(window._renderResumableSessions, 600);
+          }
         }
       } catch(_) {}
     });
@@ -14679,22 +14716,26 @@ async function _refreshDetailCard(projId) {
 
 // M135: standalone 15s auto-refresh removed — hub drives refresh via hub-refresh postMessage (8s cycle)
 
-// M135: real-time clock — rAF-based so it only runs when browser is painting (M1581: was 1s setInterval, caused iOS CPU to stay awake)
+// M135: real-time clock — rAF-based (M1581: replaced 1s setInterval). M1742: rAF loop now pauses
+// entirely when tab is hidden — previously called requestAnimationFrame unconditionally, keeping
+// the 60Hz loop alive even with document.hidden=true (iOS ran full GPU frame budget in background).
 (function _clockRaf() {
   let _lastClockSec = -1;
+  let _rafId = null;
   function _tick() {
-    if (!document.hidden) {
-      const now = new Date();
-      const sec = now.getSeconds();
-      if (sec !== _lastClockSec) {
-        _lastClockSec = sec;
-        const el = document.getElementById('updated-at');
-        if (el) el.textContent = now.toLocaleTimeString('en-GB', { hour12: false });
-      }
+    if (document.hidden) { _rafId = null; return; } // stop loop; visibilitychange will restart
+    const now = new Date();
+    const sec = now.getSeconds();
+    if (sec !== _lastClockSec) {
+      _lastClockSec = sec;
+      const el = document.getElementById('updated-at');
+      if (el) el.textContent = now.toLocaleTimeString('en-GB', { hour12: false });
     }
-    requestAnimationFrame(_tick);
+    _rafId = requestAnimationFrame(_tick);
   }
-  requestAnimationFrame(_tick);
+  function _start() { if (!_rafId && !document.hidden) _rafId = requestAnimationFrame(_tick); }
+  document.addEventListener('visibilitychange', _start);
+  _start();
 })();
 
 // ── M541: MoSCoW badge ───────────────────────────────────────────────────────
@@ -16658,8 +16699,8 @@ async function _showHubConfigModal() {
 .cg-hbtn.primary { background:var(--accent,#cc785c);border-color:var(--accent,#cc785c);color:#fff; }
 .cg-hbtn.link-active { background:var(--green,#3d8b5e);border-color:var(--green,#3d8b5e);color:#fff; }
 /* M1442: link-src node bright highlight — pulse glow + scale so user knows which node is the link source */
+/* M1742: filter:brightness/drop-shadow replaced with opacity+transform (GPU-composited, no CPU raster) */
 .cg-card.cg-link-src {
-  filter: brightness(1.6) drop-shadow(0 0 8px var(--accent,#cc785c));
   transform: scale(1.10);
   z-index: 20;
   animation: cg-link-src-pulse 0.9s ease-in-out infinite alternate;
@@ -16670,8 +16711,8 @@ async function _showHubConfigModal() {
   border-color: var(--accent,#cc785c) !important;
 }
 @keyframes cg-link-src-pulse {
-  from { filter: brightness(1.5) drop-shadow(0 0 6px var(--accent,#cc785c)); }
-  to   { filter: brightness(1.9) drop-shadow(0 0 14px var(--accent,#cc785c)); }
+  from { transform: scale(1.07); opacity: 0.85; }
+  to   { transform: scale(1.13); opacity: 1; }
 }
 /* M1454: blink pulse — green glow for nodes with active blink milestones */
 .cg-card.cg-blink-active {
@@ -16681,9 +16722,10 @@ async function _showHubConfigModal() {
   box-shadow: 0 0 0 2px var(--green,#5a9572), 0 0 10px 2px rgba(90,149,114,.45) !important;
   border-color: var(--green,#5a9572) !important;
 }
+/* M1742: filter→opacity+transform (GPU-composited) */
 @keyframes cg-blink-pulse {
-  from { filter: brightness(1.2) drop-shadow(0 0 4px var(--green,#5a9572)); }
-  to   { filter: brightness(1.6) drop-shadow(0 0 12px var(--green,#5a9572)); }
+  from { opacity: 0.75; transform: scale(1.0); }
+  to   { opacity: 1;    transform: scale(1.04); }
 }
 #cg-board {
   flex:1;position:relative;overflow:auto;touch-action:pan-x pan-y;

@@ -101,6 +101,17 @@ No config files. No environment variables. No separate daemon. Open the printed 
 - [Claude Code CLI](https://claude.ai/code) (`claude --version`)
 - `tmux` (`brew install tmux` / `apt install tmux`)
 - Tailscale (optional — for remote mobile access)
+- `litellm` (optional — only if you want to route sessions through OpenRouter instead of Claude directly; see below)
+
+**Using OpenRouter instead of (or alongside) Claude?** Hub can auto-start a local LiteLLM proxy that routes `openrouter`-tagged sessions to OpenRouter's API. It's off by default and requires two manual setup steps hub does not create for you:
+1. Install `litellm` (`pip install litellm`) and create `~/.rsk-litellm.yaml` with your model routing config.
+2. Put your `OPENROUTER_API_KEY` (and any other provider keys) in `~/.claude/env/shared.env`.
+
+Without both of these, OpenRouter sessions silently stay unavailable — hub does not error, it just never starts the proxy.
+
+**Running on WSL2?** Hub works out of the box, with two things worth knowing:
+- Port exposure to your Windows host/Tailscale is automatic on startup (`wsl-expose`, if installed) — no manual `ssh -L` forwarding needed.
+- On boot, hub waits up to 60s for `tailscaled` to assign an IP before binding — if `tailscale status` isn't ready yet (common right after a fresh WSL2 launch), the first request or two may briefly fail; retrying after a few seconds resolves it.
 
 ---
 
@@ -143,8 +154,7 @@ hub install-global
 ```
 ~/.hub/
 ├── server.py          — main FastAPI server
-├── hub.db             — SQLite: projects, settings
-├── northstar.db       — SQLite: stones (milestones), exec sessions
+├── ns-events.db       — SQLite: stones (milestones), exec sessions, action log
 ├── config.yaml        — optional overrides (port, tailscale IP, etc.)
 ├── hooks/             — PostToolUse / Stop hooks for Claude Code
 ├── static/            — web UI (northstar.html, index.html)
@@ -157,8 +167,18 @@ hub install-global
 
 ## Telemetry & privacy
 
-On startup, one anonymized `hub_start` event is sent:
-`ts`, `event`, `install_id=sha256(hostname)[:16]`, `version`, `os` — **no PII, no code, no Stone text**.
+If data collection is enabled (default: on — see opt-out below), hub sends:
+
+- **On startup**: one `hub_start` event — `ts`, `event`, `install_id=sha256(hostname)[:16]`,
+  `version`, `os`. No PII, no code, no Stone text.
+- **Every 30 minutes** (if there's new activity): batches of tool-call summaries, action-log
+  entries, and Stone text (truncated to 1000 chars) — used to build an agent-training dataset.
+  These batches pass through a PII scrubber (masks emails, phone numbers, IP addresses, API
+  keys/tokens) before upload, but the scrubber is regex-based and cannot detect free-text
+  personal content (e.g. health or financial details written into a Stone's task description).
+  **If you write sensitive information directly into a Stone's text, it may be included in
+  this upload even with data collection consent left at its default.** Opt out below if this
+  matters to you, or avoid putting sensitive free text in Stone descriptions.
 
 Opt out anytime:
 
@@ -202,28 +222,30 @@ cat ~/.claude/settings.json | grep hub
 
 ## Data schema & portability
 
-All data lives in local SQLite (`~/.hub/northstar.db`). No vendor lock-in.
+All data lives in local SQLite (`~/.hub/ns-events.db`). No vendor lock-in.
 
 ```sql
--- milestones (Stones)
-CREATE TABLE milestones (
-  id TEXT PRIMARY KEY,          -- e.g. "M1301"
-  project TEXT,
-  text TEXT,                    -- your original idea / task
-  status TEXT,                  -- queued | in_progress | pending_confirmation | done
+-- milestones_store (Stones) — stone fields (text, status, evidence_url, etc.)
+-- live inside the data_json blob, not as flat columns
+CREATE TABLE milestones_store (
+  proj_id TEXT NOT NULL,
+  stone_id TEXT NOT NULL,        -- e.g. "M1301"
+  data_json TEXT NOT NULL,       -- {"text", "status", "evidence_url", "conversation", ...}
+  status TEXT,                   -- queued | pending_confirmation | done
   done INTEGER DEFAULT 0,
+  held INTEGER DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  model_used TEXT,
   exec_start TEXT,
   exec_end TEXT,
-  model_used TEXT,
-  evidence_url TEXT,
-  append_message TEXT,          -- Claude's completion summary
-  created_at TEXT DEFAULT (datetime('now'))
+  cost_usd REAL,
+  PRIMARY KEY (proj_id, stone_id)
 );
 ```
 
 Export/import:
 ```bash
-sqlite3 ~/.hub/northstar.db .dump > backup.sql
+sqlite3 ~/.hub/ns-events.db .dump > backup.sql
 ```
 
 ---

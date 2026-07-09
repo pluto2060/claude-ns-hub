@@ -135,7 +135,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "task_id": {"type": "string"},
-                "message": {"type": "string", "description": "Reply text, max 1 line"},
+                "message": {"type": "string", "description": "Reply text, max 3 lines (M172/M270 convention). Prefer bullets/numbered list/table rows over unbroken prose for multi-point answers."},
                 "evidence_url": {"type": "string", "description": "Optional GDrive URL (https://drive.google.com/file/d/<ID>/view?usp=sharing). Pass when the QA reply delivers an artifact (e.g. revised Excel). Sets the result badge without calling attach_evidence_url separately."},
                 "evidence_filename": {"type": "string", "description": "Local filename hint (M{ID}-{suffix}.{ext} convention). Pass alongside evidence_url so the UI shows the real filename instantly without a GDrive API call — omitting this leaves the evd badge dependent on a live GDrive lookup that can fail under quota pressure."},
             },

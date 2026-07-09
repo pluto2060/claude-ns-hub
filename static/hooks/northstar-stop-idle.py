@@ -54,10 +54,23 @@ try:
     busy, reason = False, "agent_stopped"
 
     # M131-d: a background subagent may still be running for this session (see docstring).
+    # M1731: SubagentStop does not always fire for a SubagentStart (crash/timeout/kill
+    # mid-flight), leaking the counter upward forever with no matching decrement — observed
+    # 2026-07-08: every exec session on the box stuck at count=1, some for 20+ hours, silently
+    # blocking dispatch (UniversEye M84 sat unconsumed 45+ min while its pane was actually idle
+    # at the prompt). A real subagent finishes in seconds-to-minutes, never hours — so treat the
+    # marker as stale/leaked past this TTL and fall back to the Stop-is-authoritative idle signal
+    # rather than trusting a counter that can only leak upward, never self-heal.
+    _SUBAGENT_MARKER_TTL_SECS = 900  # 15min — generous vs. observed subagent durations (~4min max)
     marker = os.path.join(os.path.expanduser("~"), ".claude", f".subagent-count-{sk}")
     try:
-        if os.path.exists(marker) and int(open(marker).read().strip() or "0") > 0:
-            busy, reason = True, "subagent_running"
+        if os.path.exists(marker):
+            _age = __import__("time").time() - os.path.getmtime(marker)
+            if _age > _SUBAGENT_MARKER_TTL_SECS:
+                with open(marker, "w") as _f:
+                    _f.write("0")
+            elif int(open(marker).read().strip() or "0") > 0:
+                busy, reason = True, "subagent_running"
     except Exception:
         pass
 
