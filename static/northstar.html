@@ -1945,7 +1945,7 @@ header {
     background:#252220;border-bottom:1px solid #333">
     <span style="font-family:var(--mono);font-size:11px;color:#cc785c">LIVE SESSION</span>
     <div style="display:flex;gap:6px">
-      <button onclick="document.getElementById('kill-confirm-overlay').style.display='flex'" style="background:none;border:1px solid #c0392b;border-radius:4px;color:#e05252;font-family:var(--mono);font-size:10px;padding:2px 7px;cursor:pointer">■ kill</button>
+      <button onclick="document.getElementById('kill-confirm-overlay').style.display='flex'" data-kill-overlay="1" style="background:none;border:1px solid #c0392b;border-radius:4px;color:#e05252;font-family:var(--mono);font-size:10px;padding:2px 7px;cursor:pointer">■ kill</button>
       <button onclick="toggleTmuxOverlay()" style="background:none;border:1px solid #555;border-radius:4px;color:#888;font-family:var(--mono);font-size:10px;padding:2px 7px;cursor:pointer">✕</button>
     </div>
   </div>
@@ -5310,7 +5310,7 @@ function _showUnqueueToast(projId, mid) {
   if (_stopBtn) _stopBtn.onclick = async () => {
     _stopBtn.textContent = 'Stopping…';
     _stopBtn.disabled = true;
-    await fetch(`/api/northstar/${encodeURIComponent(projId)}/exec-session`, { method: 'DELETE' }).catch(() => {});
+    await fetch(`/api/northstar/${encodeURIComponent(projId)}/tmux-session/claude-exec-${encodeURIComponent(projId)}`, { method: 'DELETE' }).catch(() => {});
     card.remove();
     if (window._refreshExecState) window._refreshExecState();
   };
@@ -11384,6 +11384,10 @@ function openTerminal(projId, sessionId, _unused, tmuxSession) {
   const bd = document.getElementById('ns-term-backdrop');
   if (bd) bd.style.display = 'block';
   document.getElementById('ns-term-proj').textContent = projId;
+  // M1754: remember the REAL tmux session this terminal is attached to, so killSession()
+  // can target it directly instead of guessing "claude-exec-{projId}" (wrong for
+  // openrouter/branched/renamed sessions — kill-session silently no-op'd on a name mismatch).
+  window._termTmuxSession = tmuxSession || '';
   float.style.height = float.dataset.lastH || '680px';
   const _isMobile = /iPhone|iPad|Android/i.test(navigator.userAgent);
 
@@ -12054,13 +12058,18 @@ async function killSession() {
   // M432: kill via server API (tmux kill-session) — not by typing in terminal
   const projId = document.getElementById('ns-term-proj')?.textContent?.trim();
   if (projId) window._termPtyKilled = projId;
+  // M1754: use the tmux session this terminal actually attached to (set by openTerminal).
+  // Falls back to the classic claude-exec-{projId} guess for the no-arg/legacy open path —
+  // but the guess was wrong (silent no-op) for openrouter-exec-* or branched/renamed sessions,
+  // which is why the kill button appeared to do nothing while live-session kill worked fine.
+  const _targetSession = window._termTmuxSession || `claude-exec-${projId}`;
   // Close WebSocket first (stop I/O)
   if (_termWs) { _termWs.close(); _termWs = null; }
-  // Kill via server: PTY session + exec session
+  // Kill via server: PTY session + main exec session ONLY (never bulk — would take down forks too)
   if (projId && projId !== '—') {
     await Promise.all([
       fetch(`/api/northstar/${encodeURIComponent(projId)}/session`, { method: 'DELETE' }).catch(() => {}),
-      fetch(`/api/northstar/${encodeURIComponent(projId)}/exec-session`, { method: 'DELETE' }).catch(() => {}),
+      fetch(`/api/northstar/${encodeURIComponent(projId)}/tmux-session/${encodeURIComponent(_targetSession)}`, { method: 'DELETE' }).catch(() => {}),
     ]);
     // M1118: clear assigned_session in cache immediately so badge disappears without waiting for next poll
     const _stars = _nsStarsCache[projId] || [];
@@ -13200,19 +13209,21 @@ function toggleTmuxOverlay() {
 let _tmuxWatchProjId = null;
 let _tmuxWatchSession = '';  // M837: which tmux session the watch overlay is bound to
 
-async function killExecSession() {
+async function killExecSession(explicitSession) {
   const projId = _tmuxWatchProjId;
-  const specificSession = _tmuxWatchSession;  // M861: capture before stopTmuxWatch clears it
+  // M1749: ALWAYS kill only the individually-bound session. Never bulk-kill the whole
+  // project (which would take down the main claude session alongside the fork). explicitSession
+  // takes priority (set by overlay/terminal kill buttons), then fall back to the watched session.
+  const specificSession = (explicitSession || _tmuxWatchSession || '').trim();
   stopTmuxWatch();
   if (!projId) return;
   // M1153: immediate kill — no STOPPING motion, no 2-second grace (match tmux terminal killSession behavior)
   const output = document.getElementById('dm-tmux-output');
-  // M861: kill only the watched session when a specific branched session is open; bulk-kill only for main
-  if (specificSession) {
-    await fetch(`/api/northstar/${encodeURIComponent(projId)}/tmux-session/${encodeURIComponent(specificSession)}`, {method:'DELETE'}).catch(()=>{});
-  } else {
-    await fetch(`/api/northstar/${encodeURIComponent(projId)}/exec-session`, {method:'DELETE'}).catch(()=>{});
-  }
+  // M1749: kill ONLY the targeted session via the named endpoint (cascades to branch children
+  // of a mother only — never the main claude session). If no target resolved, kill only the
+  // project's MAIN exec session so a stray button press can never wipe every exec session.
+  const _target = specificSession || `claude-exec-${projId}`;
+  await fetch(`/api/northstar/${encodeURIComponent(projId)}/tmux-session/${encodeURIComponent(_target)}`, {method:'DELETE'}).catch(()=>{});
   if (output) { output.style.color = ''; output.style.fontWeight = ''; output.style.textAlign = ''; output.style.fontSize = '10px'; output.style.letterSpacing = ''; output.textContent = '(session ended)'; }
   // M1118: clear assigned_session immediately in cache so sess badge disappears at once
   const _stars1118 = _nsStarsCache[projId] || [];

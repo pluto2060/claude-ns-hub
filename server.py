@@ -5077,6 +5077,23 @@ def _get_project_agent(proj_id: str) -> str:
     return _get_project_agent_value(proj_id)
 
 
+def _resolve_claude_bin(proj_id: str = None) -> str:
+    """Resolve the claude CLI binary path with the same resilience chain as
+    _get_agent_spawn_cmd (nvm / .local/bin fallback) — without the embedded --model,
+    so callers can assemble their own argv (e.g. fork path that injects model_args separately)."""
+    import shutil as _shutil_spawn
+    cfg_claude = _hub_config_get(proj_id or "", "claude_code_path") if proj_id else ""
+    if not cfg_claude:
+        cfg_claude = _shutil_spawn.which("claude") or ""
+        if not cfg_claude:
+            for _cbin_base in [Path.home() / ".local" / "bin", Path.home() / ".nvm" / "versions", Path("/usr/local/lib")]:
+                for _bin in _cbin_base.rglob("claude"):
+                    if _bin.is_file():
+                        cfg_claude = str(_bin); break
+                if cfg_claude: break
+    return cfg_claude or "claude"
+
+
 def _get_agent_spawn_cmd(proj_id: str) -> list:
     """Return the agent binary + safety flags for a project spawn.
 
@@ -10568,11 +10585,19 @@ async def fork_session(proj_id: str, request: Request):
     except Exception:
         pass
 
+    # M1750: build the claude binary WITHOUT _get_agent_spawn_cmd's embedded --model,
+    # because model_args (below) already carries the (override) model. Using _get_agent_spawn_cmd
+    # here double-injected --model (once from the agent cmd, once from model_args), producing
+    # "... --model openrouter-hy3 --mcp-config X --model openrouter-hy3 --resume ...". The duplicate
+    # --model corrupts arg parsing / model validation and is the cause of "issue with the selected
+    # model" on fork (new-session path injects --model exactly once and works fine).
+    claude_bin = _resolve_claude_bin()
+    _agent_base_cmd = [claude_bin, "--dangerously-skip-permissions", *_DISALLOWED_TOOLS_ARGS]
     subprocess.Popen([
         "tmux", "new-session", "-d", "-s", session_name,
         "-c", spawn_cwd,
         *_tmux_env,
-        *_get_agent_spawn_cmd(proj_id),
+        *_agent_base_cmd,
         *model_args,
         *resume_args,
     ])
