@@ -550,7 +550,12 @@ header {
 .ns-node-term,
 .ns-node.circle-card.has-bang,
 .ss-cnt-blink,
-.live-dot { animation-play-state: var(--anim-state, running); }
+.live-dot,
+/* M1757: cg-* animations run while tab is backgrounded — no --anim-state gate was set */
+.cg-card.cg-blink-active,
+.cg-card.cg-blink-active .cg-ring,
+.cg-card.cg-link-src,
+.cg-card.cg-link-src .cg-ring { animation-play-state: var(--anim-state, running); }
 /* M1581: ms-running-highlight uses !important on animation shorthand — must match with !important */
 .nt-table tr.ms-running-highlight td { animation-play-state: var(--anim-state, running) !important; }
 /* Stone content */
@@ -7522,7 +7527,7 @@ document.addEventListener('visibilitychange', () => {
     if (window._tmuxWatchPaused && window._tmuxWatchActive && !_tmuxWatchInterval) {
       window._tmuxWatchPaused = false;
       const _poll = window._tmuxWatchPollFn;
-      if (_poll) { _poll(); _tmuxWatchInterval = setInterval(_poll, 2000); } // M1581: 2s (matches startTmuxWatch)
+      if (_poll) { _poll(); if (window._schedTmuxPoll) window._schedTmuxPoll(); else _tmuxWatchInterval = setInterval(_poll, 2000); } // M1757: use adaptive backoff scheduler; fallback to 2s
     }
   }
 });
@@ -13268,6 +13273,14 @@ function startTmuxWatch(projId, tmuxSession) {
   const _tmuxQ = tmuxSession ? `&tmux_session=${encodeURIComponent(tmuxSession)}` : '';
   window._tmuxWatchActive = true; // M1581: visibility handler checks this
   window._tmuxWatchPaused = false;
+  // M1757: adaptive backoff — 3 fast polls (2s), then 2 medium (4s), then slow (10s) when idle
+  let _noChangeCnt = 0;
+  const _TMUX_MS = [2000, 2000, 2000, 4000, 4000, 10000];
+  const _schedTmuxPoll = () => {
+    if (_tmuxWatchInterval) clearInterval(_tmuxWatchInterval);
+    _tmuxWatchInterval = setInterval(poll, _TMUX_MS[Math.min(_noChangeCnt, _TMUX_MS.length - 1)]);
+  };
+  window._schedTmuxPoll = _schedTmuxPoll; // M1757: exposed for visibility-resume path
   const poll = async () => {
     window._tmuxWatchPollFn = poll; // M1581: expose for visibility-resume
     try {
@@ -13292,20 +13305,25 @@ function startTmuxWatch(projId, tmuxSession) {
       }
       const newText = d.output || '(waiting for output…)';
       if (output.textContent !== newText) {
+        _noChangeCnt = 0; // M1757: output changed — reset to fast 2s polling
         const atBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 40;
         output.textContent = newText;
         if (atBottom) output.scrollTop = output.scrollHeight;
         // M1575: no prevScrollTop restore — browser preserves scrollTop on textContent write;
         // restoring it explicitly breaks scroll momentum by forcing 0→prevScrollTop every poll.
+      } else {
+        _noChangeCnt++; // M1757: no change — step toward slower interval
       }
-    } catch(_) {}
+      _schedTmuxPoll(); // M1757: reschedule at current backoff level
+    } catch(_) { _noChangeCnt++; _schedTmuxPoll(); }
   };
   poll();
-  _tmuxWatchInterval = setInterval(poll, 2000); // M1581: 1s→2s — halves iOS foreground CPU/radio wakeups
+  _tmuxWatchInterval = setInterval(poll, _TMUX_MS[0]); // M1757: start at fast 2s
 }
 function stopTmuxWatch() {
   if (_tmuxWatchInterval) { clearInterval(_tmuxWatchInterval); _tmuxWatchInterval = null; }
-  window._tmuxWatchActive = false; window._tmuxWatchPaused = false; window._tmuxWatchPollFn = null; // M1581
+  window._tmuxWatchActive = false; window._tmuxWatchPaused = false;
+  window._tmuxWatchPollFn = null; window._schedTmuxPoll = null; // M1581/M1757
   const overlay = document.getElementById('tmux-live-overlay');
   if (overlay) overlay.style.display = 'none';
   const liveBackdrop = document.getElementById('tmux-live-backdrop');
@@ -16681,12 +16699,13 @@ async function _showHubConfigModal() {
      box-shadow animates on the compositor (cheaper than filter) so the pulsing glow is restored here. */
   animation: cg-blink-glow-pulse 1.1s ease-in-out infinite alternate;
 }
-/* M1756: restore original filter:brightness/drop-shadow for blink card glow (M1742 replaced with
-   opacity+transform which lost all visual brightness; .cg-ring is small so filter raster cost is
-   negligible — the perf concern in M1742 was for larger layout containers, not individual 60px nodes) */
+/* M1757: drop filter:brightness from cg-blink-pulse — .cg-ring already delivers pulsing green glow
+   via cg-blink-glow-pulse (box-shadow, compositor-only). Keeping filter here would rasterize the
+   card on every frame while providing no unique visual benefit (M1756 restored it, but the glow
+   was already handled by M1755's cg-blink-glow-pulse). opacity+transform are GPU-composited. */
 @keyframes cg-blink-pulse {
-  from { filter: brightness(1.2) drop-shadow(0 0 4px var(--green,#5a9572)); transform: scale(1.0); }
-  to   { filter: brightness(1.7) drop-shadow(0 0 14px var(--green,#5a9572)); transform: scale(1.04); }
+  from { transform: scale(1.0); opacity: 0.88; }
+  to   { transform: scale(1.04); opacity: 1; }
 }
 @keyframes cg-blink-glow-pulse {
   from { box-shadow: 0 0 0 2px var(--green,#5a9572), 0 0 6px 2px rgba(90,149,114,.4); }
