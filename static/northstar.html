@@ -1616,9 +1616,9 @@ header {
    tag, which only got injected when detail card opened. CG-first path therefore had no
    animation because the rule literally did not exist in any stylesheet until detail open. */
 @keyframes ss-cnt-blink-anim {
-  /* M1742: removed filter:brightness/drop-shadow (CPU rasterization); opacity+transform are GPU-composited */
-  0%, 100% { transform: scale(1.05); opacity: 0.85; }
-  40%, 60% { transform: scale(1.35); opacity: 1; }
+  /* M1755: restore filter:brightness/drop-shadow (visual quality, M1742 had stripped these) */
+  0%, 100% { transform: scale(1.05); filter: brightness(1.35) drop-shadow(0 0 3px currentColor); }
+  40%, 60% { transform: scale(1.35); filter: brightness(1.7) drop-shadow(0 0 8px currentColor); }
 }
 .ss-cnt-blink { display: inline-block; animation: ss-cnt-blink-anim 1.4s ease-in-out infinite; font-weight: bold; }
 </style>
