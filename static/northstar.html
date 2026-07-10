@@ -14032,9 +14032,14 @@ function renderRight(p) {
               + (isExecLive && _tmuxSession ? `<span class="ns-node-term live" style="font-size:8px;padding:1px 6px;cursor:pointer;flex-shrink:0;margin-left:3px"
                   title="Open in browser terminal (ttyd — mobile-friendly with virtual keyboard)"
                   onclick="event.stopPropagation();openTtydTerminal('${esc(_tmuxSession)}','${esc(_projId)}')">↗_</span>` : '');
-            // M1745: per-row ⑂ Fork button removed — superseded by the substar sess-badge
-            // Assign panel's agent/model picker (M1745), which now covers the same
-            // "start a new session on a chosen model" need via the Assign flow.
+            // M1756: ⑂ Fork button restored — model/agent picker moved here from sess badge popup.
+            // Only shown on transcript resume rows (not fresh, not exec_live).
+            const _forkRowBtn = (!isFresh && !isExecLive && s.id)
+              ? `<span class="ns-fork-btn" data-sid="${esc(s.id)}" data-proj="${esc(_projId)}"
+                  title="Fork this session on a new model/agent"
+                  onclick="event.stopPropagation();_showForkPicker(this,${JSON.stringify(_projId)},${JSON.stringify(s.id)})"
+                  style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:3px;border:1px solid var(--panel-border);background:none;color:var(--text-dim);cursor:pointer;flex-shrink:0;user-select:none">⑂</span>`
+              : '';
             // M253: for fresh rows, use current dropdown agent/model so switching to openrouter
             // then clicking "new session" doesn't reset dropdowns back to claude default.
             // M271: fresh rows use dropdown's actual current value to preserve user selection
@@ -14069,7 +14074,7 @@ function renderRight(p) {
               }
               ${isExecLive ? `<span style="font-size:8px;color:var(--green);font-weight:600;flex-shrink:0">live</span>` : ''}
               ${subLabel}
-              <span style="margin-left:auto;display:flex;align-items:center;gap:3px;flex-shrink:0">${_ptyRowBtn}</span>
+              <span style="margin-left:auto;display:flex;align-items:center;gap:3px;flex-shrink:0">${_forkRowBtn}${_ptyRowBtn}</span>
             </div>`;
           }
           // M257: include PTY state in hash so color/label changes force re-render
@@ -15243,104 +15248,8 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
           emptyDiv.textContent = 'No active sessions for this project';
           popup.appendChild(emptyDiv);
         }
-        // M811: new session input row — always shown at bottom
-        // M1745: agent/model picker row (replaces the removed per-row ⑂ Fork button —
-        // Assign's auto-spawn always forks from mother context (M1656-fork); this only
-        // lets the user choose WHICH agent/model that forked child runs on).
-        const _newSessPickerRow = document.createElement('div');
-        _newSessPickerRow.style.cssText = 'padding:7px 10px 0;border-top:1px solid var(--panel-border);display:flex;gap:6px;align-items:center';
-        const _agentSelInit = (window.curAgent || window._selectedSession?.agent || 'claude').trim();
-        const _agentSel = document.createElement('select');
-        _agentSel.id = '_sess-assign-agent-select';
-        _agentSel.style.cssText = 'font-family:var(--mono);font-size:9px;background:var(--panel-soft);border:1px solid var(--panel-border);border-radius:3px;padding:2px 4px;color:var(--text);flex:0 0 auto';
-        _agentSel.innerHTML = ['claude', 'openrouter'].map(a =>
-          `<option value="${a}"${a === _agentSelInit ? ' selected' : ''}>${a}</option>`).join('');
-        const _modelSelInit = (window.curModel || window._selectedSession?.model || '').trim();
-        const _modelSel = document.createElement('select');
-        _modelSel.id = '_sess-assign-model-select';
-        _modelSel.style.cssText = 'font-family:var(--mono);font-size:9px;background:var(--panel-soft);border:1px solid var(--panel-border);border-radius:3px;padding:2px 4px;color:var(--text);flex:1;min-width:0';
-        const _buildAssignModelOpts = (agent, selected) => (MODEL_CATALOG[agent] || []).map(([v, lbl]) =>
-          `<option value="${esc(v)}"${v === selected ? ' selected' : ''}>${esc(lbl)}</option>`).join('');
-        _modelSel.innerHTML = _buildAssignModelOpts(_agentSelInit, _modelSelInit);
-        _newSessPickerRow.appendChild(_agentSel);
-        _newSessPickerRow.appendChild(_modelSel);
-        popup.appendChild(_newSessPickerRow);
-
-        const _newSessRow = document.createElement('div');
-        _newSessRow.style.cssText = 'padding:7px 10px;display:flex;gap:6px;align-items:center;flex-wrap:wrap';
-        // M859: locked prefix = {current agent}-exec-{projId}-, suffix editable
-        // M1745: prefix now tracks the agent select above (was window.curAgent only)
-        let _sessPrefix = `${_agentSel.value}-exec-${_sessBtnProj}-`;
-        // M1670: M1653's name-derived suffix mangled non-ASCII substar names (Korean/symbols)
-        // into garbage like "---skill---mcp---" after the ASCII-only sanitizer stripped
-        // everything meaningful, leaving only leftover dashes. A random 8-hex suffix is
-        // always safe (no symbol/mojibake possible) — the substar name is shown via the
-        // input's title tooltip instead, for context without risking the submitted value.
-        const _sessSuffix = Array.from(crypto.getRandomValues(new Uint8Array(4)), b => b.toString(16).padStart(2, '0')).join('');
-        const _prefixSpan = document.createElement('span');
-        _prefixSpan.style.cssText = 'font-family:var(--mono);font-size:10px;color:var(--text-dim);background:var(--panel-soft);border:1px solid var(--panel-border);border-right:none;border-radius:3px 0 0 3px;padding:2px 4px;white-space:nowrap;user-select:none';
-        _prefixSpan.textContent = _sessPrefix;
-        _prefixSpan.title = 'Prefix follows the agent selected above';
-        _agentSel.onchange = () => {
-          _sessPrefix = `${_agentSel.value}-exec-${_sessBtnProj}-`;
-          _prefixSpan.textContent = _sessPrefix;
-          _modelSel.innerHTML = _buildAssignModelOpts(_agentSel.value, '');
-        };
-        const _newSessInput = document.createElement('input');
-        _newSessInput.type = 'text';
-        _newSessInput.value = _sessSuffix;
-        _newSessInput.placeholder = 'suffix';
-        _newSessInput.title = ns?.name ? `Substar: ${ns.name}` : '';
-        _newSessInput.className = 'sess-suffix-inp';
-        // M1552: text suffix (alphanumeric allowed); default = substar id prefix
-        _newSessInput.style.cssText = 'font-family:var(--mono);font-size:10px;background:var(--panel-soft,var(--panel));border:1px solid var(--panel-border);border-left:none;color:var(--text);padding:2px 6px;border-radius:0 3px 3px 0;flex:1;min-width:40px;outline:none';
-        const _newSessBtn = document.createElement('button');
-        _newSessBtn.textContent = 'Assign';
-        _newSessBtn.style.cssText = 'font-family:var(--mono);font-size:9px;padding:2px 7px;border-radius:3px;border:1px solid var(--accent);background:none;color:var(--accent);cursor:pointer;white-space:nowrap';
-        _newSessBtn.onclick = async () => {
-          // M859: full name = locked prefix + suffix input
-          const _suffix = _newSessInput.value.trim().replace(/\s+/g, '-');
-          if (!_suffix) { _newSessInput.focus(); return; }
-          const _nm = _sessPrefix + _suffix;
-          if (ns) {
-            // M1745: pass the chosen agent/model so assign-spawn's mother-fork uses them
-            // instead of always defaulting to claude + project model (server.py update_north_star).
-            const _r = await fetch(`/api/northstar/${encodeURIComponent(_sessBtnProj)}/north-stars/${encodeURIComponent(ns.id)}`,
-              {method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({assigned_session:_nm,spawn_agent:_agentSel.value,spawn_model:_modelSel.value})}).catch(()=>null);
-            if (_r?.ok) {
-              ns.assigned_session = _nm;
-              if (window._nsMap && window._nsMap[ns.id]) window._nsMap[ns.id].assigned_session = _nm;
-              // M897: immediate sess button DOM update — textContent + full color
-              { const _sb = document.querySelector(`[data-ns-sess-btn="${ns.id}"]`);
-                if (_sb) {
-                  const _nmTrimmed = (_nm||'').trim();
-                  const _nmIsMain = new RegExp(`-exec-${_sessBtnProj}$`).test(_nmTrimmed);
-                  const _nmSuffix = _nmIsMain ? 'main' : (_nmTrimmed.replace(new RegExp(`.*-exec-${_sessBtnProj}-`),'') || 'branch');
-                  _sb.textContent = _nmSuffix;
-                  _sb.title = `Assigned: ${_nm} — click to view/change`;
-                  _sb.style.color = _nmIsMain ? 'var(--green)' : '#7b9fd4';
-                  _sb.style.borderColor = _nmIsMain ? 'rgba(61,139,94,.4)' : 'rgba(123,159,212,.4)';
-                  _sb.style.background = _nmIsMain ? 'rgba(61,139,94,.12)' : 'rgba(123,159,212,.12)';
-                } }
-              if (typeof loadMilestones === 'function') { try { loadMilestones(_sessBtnProj); } catch(_) {} }
-              // M811: if 409 notification modal is present, close it and auto-dispatch
-              const _notifyModal = document.getElementById('_unassigned-notify-modal');
-              if (_notifyModal) {
-                _notifyModal.remove();
-                _closeSessionModal();
-                const _execBtn = document.getElementById('dm-exec-btn');
-                if (_execBtn && !_execBtn.disabled) setTimeout(() => _execBtn.click(), 80);
-                return;
-              }
-            }
-          }
-          _closeSessionModal();
-        };
-        _newSessInput.addEventListener('keydown', e => { if (e.key === 'Enter') _newSessBtn.click(); });
-        _newSessRow.appendChild(_prefixSpan);  // M859: locked prefix first
-        _newSessRow.appendChild(_newSessInput);
-        _newSessRow.appendChild(_newSessBtn);
-        popup.appendChild(_newSessRow);
+        // M1756: Assign button + agent/model picker removed — fork function moved to session pane Fork button.
+        // Sess badge popup is now assign-by-click-only (existing sessions list above).
         // M811-modal: mount backdrop + modal, Escape to close
         document.body.appendChild(_sessBdrop);
         document.body.appendChild(popup);
@@ -16064,6 +15973,77 @@ window._blinkState = window._blinkState || {};
 let _nsAvatarCache = (() => {
   try { return JSON.parse(localStorage.getItem('ns-avatar-cache') || '{}'); } catch { return {}; }
 })();
+
+// M1756: Fork picker — shown when ⑂ button in session pane is clicked.
+// Renders a small inline popover with agent+model selects + Fork button.
+// Calls POST /api/northstar/{proj}/fork-session with source_session_id + target_model.
+function _showForkPicker(triggerEl, projId, sourceSid) {
+  // Toggle: close if already open for same trigger
+  const existing = document.getElementById('_fork-picker-pop');
+  if (existing) { existing.remove(); if (existing.dataset.srcSid === sourceSid) return; }
+  const pop = document.createElement('div');
+  pop.id = '_fork-picker-pop';
+  pop.dataset.srcSid = sourceSid;
+  pop.style.cssText = 'position:fixed;background:var(--panel);border:1px solid var(--panel-border);border-radius:6px;box-shadow:0 4px 16px rgba(0,0,0,.4);z-index:10010;font-family:var(--mono);font-size:10px;padding:10px;display:flex;flex-direction:column;gap:6px;min-width:200px';
+  // Position below trigger
+  const tr = triggerEl.getBoundingClientRect();
+  pop.style.top = (tr.bottom + 4) + 'px';
+  pop.style.left = Math.max(8, tr.left - 100) + 'px';
+  // Agent select
+  const _agInit = (window.curAgent || 'claude').trim();
+  const _agSel = document.createElement('select');
+  _agSel.style.cssText = 'font-family:var(--mono);font-size:9px;background:var(--panel-soft);border:1px solid var(--panel-border);border-radius:3px;padding:2px 4px;color:var(--text)';
+  _agSel.innerHTML = ['claude', 'openrouter'].map(a => `<option value="${a}"${a===_agInit?' selected':''}>${a}</option>`).join('');
+  // Model select
+  const _mdInit = (window.curModel || '').trim();
+  const _mdSel = document.createElement('select');
+  _mdSel.style.cssText = 'font-family:var(--mono);font-size:9px;background:var(--panel-soft);border:1px solid var(--panel-border);border-radius:3px;padding:2px 4px;color:var(--text)';
+  const _buildMdOpts = (ag, sel) => (MODEL_CATALOG[ag]||[]).map(([v,l])=>`<option value="${v}"${v===sel?' selected':''}>${l}</option>`).join('');
+  _mdSel.innerHTML = _buildMdOpts(_agInit, _mdInit);
+  _agSel.onchange = () => { _mdSel.innerHTML = _buildMdOpts(_agSel.value, ''); };
+  // Fork button
+  const _forkBtn = document.createElement('button');
+  _forkBtn.textContent = '⑂ Fork';
+  _forkBtn.style.cssText = 'font-family:var(--mono);font-size:9px;padding:3px 8px;border-radius:3px;border:1px solid var(--accent);background:none;color:var(--accent);cursor:pointer;align-self:flex-end';
+  _forkBtn.onclick = async () => {
+    _forkBtn.disabled = true;
+    _forkBtn.textContent = 'Forking…';
+    try {
+      const r = await fetch(`/api/northstar/${encodeURIComponent(projId)}/fork-session`, {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({source_session_id: sourceSid, target_model: _mdSel.value, agent: _agSel.value})
+      });
+      const d = await r.json().catch(() => ({}));
+      if (r.ok && d.ok) {
+        pop.remove();
+        // Burst-refresh session pane + exec state so new fork appears immediately
+        if (window._refreshExecState) [0, 600, 1800].forEach(t => setTimeout(window._refreshExecState, t));
+        // Toast
+        try {
+          let _t = document.getElementById('ns-push-toasts');
+          if (!_t) { _t = document.createElement('div'); _t.id='ns-push-toasts'; _t.style.cssText='position:fixed;top:64px;left:14px;z-index:10001;display:flex;flex-direction:column;gap:8px;max-width:340px;pointer-events:none'; document.body.appendChild(_t); }
+          const _c = document.createElement('div');
+          _c.style.cssText = 'pointer-events:auto;background:var(--panel);border:1px solid var(--green,#3d8b5e);border-radius:8px;padding:8px 11px;box-shadow:0 6px 24px rgba(0,0,0,.25);font-family:var(--mono);font-size:11px;color:var(--text)';
+          _c.innerHTML = `<div style="color:var(--green,#3d8b5e);font-weight:600;margin-bottom:2px">⑂ Fork spawned</div><div style="font-size:10px;color:var(--text-dim)">${(d.session||'').replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])) || _mdSel.value}</div>`;
+          _t.appendChild(_c);
+          setTimeout(() => { _c.style.transition='opacity .3s'; _c.style.opacity='0'; setTimeout(()=>_c.remove(), 350); }, 3000);
+        } catch(_) {}
+      } else {
+        _forkBtn.textContent = 'Error — retry';
+        _forkBtn.disabled = false;
+      }
+    } catch(_) { _forkBtn.textContent = 'Error — retry'; _forkBtn.disabled = false; }
+  };
+  pop.appendChild(_agSel);
+  pop.appendChild(_mdSel);
+  pop.appendChild(_forkBtn);
+  document.body.appendChild(pop);
+  // Close on outside click
+  setTimeout(() => {
+    const _close = e => { if (!pop.contains(e.target) && e.target !== triggerEl) { pop.remove(); document.removeEventListener('mousedown', _close); } };
+    document.addEventListener('mousedown', _close);
+  }, 0);
+}
 
 function _nsModelAvatars() {
   return _nsAvatarCache;
