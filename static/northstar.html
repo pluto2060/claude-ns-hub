@@ -13699,12 +13699,20 @@ function renderRight(p) {
             // M1656-R: proj status = running if ANY session of the proj runs (last-write-wins
             // bug made a busy child look idle when the idle mother was processed after it)
             const _projAgg = {};
+            window._execModel = window._execModel || {};
             for (const s of running) {
               if (!s.idle) _projAgg[s.proj_id] = 'running';
               else if (!_projAgg[s.proj_id]) _projAgg[s.proj_id] = 'idle';
-              // M377: always overwrite to clear stale cross-agent model
-              window._execModel = window._execModel || {};
-              window._execModel[s.proj_id] = s.model || ''; // M334: track model for NS-card display
+              // M1754-b: apply the same _isMother guard as the poller (L7581-7595).
+              // Without it, the SSE path's last-write-wins over all sessions caused the
+              // non-mother child (e.g. or-hy3 fork) to overwrite _execModel, making the
+              // main avatar show hy3 even when the mother/first-child was sonnet.
+              const _ssIsMother = s.session === `${s.agent||'claude'}-exec-${s.proj_id}`;
+              if (_ssIsMother) {
+                window._execModel[s.proj_id] = s.model || ''; // mother → definitive
+              } else if (!window._execModel[s.proj_id]) {
+                window._execModel[s.proj_id] = s.model || ''; // no mother yet → temporary stand-in
+              }
             }
             Object.assign(_execStatus, _projAgg);
             // M267: sync agent+model from the LIVE (non-idle) exec session so detail card reflects what's running

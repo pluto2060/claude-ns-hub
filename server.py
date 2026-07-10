@@ -10642,9 +10642,13 @@ async def fork_session(proj_id: str, request: Request):
                 _t = Path.home() / ".claude" / "projects" / _enc / f"{_new_sid}.jsonl"
                 if _t.exists() and _t.stat().st_size > 0:
                     _det = _detect_session_model(_t)
-                    _det_agent = "openrouter" if _det.startswith("or-") else "codex" if _det.startswith("codex-") else "claude"
-                    if _det_agent != _mk_agent:
-                        return  # wrong agent — abort, do not write
+                    if _det:  # M1750-b: only check agent when detection is conclusive; empty = no API calls yet, trust _mk_agent (tmux session name)
+                        _det_agent = "openrouter" if _det.startswith("or-") else "codex" if _det.startswith("codex-") else "claude"
+                        # M1750-c: OpenRouter aliases hy3:free → claude-sonnet-5 in transcript model field.
+                        # If _mk_agent is openrouter but _det_agent is claude, this is OR upstream aliasing,
+                        # NOT a true agent mismatch — skip the guard (trust tmux session name prefix).
+                        if _det_agent != _mk_agent and not (_mk_agent == "openrouter" and _det_agent == "claude"):
+                            return  # wrong agent — abort, do not write
             except Exception:
                 pass
             # Write fork SID under its model key without touching _current/_default
@@ -12176,6 +12180,11 @@ async def get_exec_sessions():
                             break
             except Exception:
                 pass
+
+        # M1754-revert: spawn_model is user intent (what was requested at dispatch time).
+        # Transcript model cannot be trusted for openrouter sessions — OpenRouter returns
+        # claude-sonnet-5 as the model ID in responses even when hy3:free was requested,
+        # so _detect_session_model would misreport the session model. spawn_model is ground truth.
 
         # M1656-R: expose accurate per-session state for UI (what stone, why busy)
         _rec = _agent_busy_sessions.get(session_name) or {}
