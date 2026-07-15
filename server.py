@@ -6807,7 +6807,7 @@ async def update_north_star(proj_id: str, ns_id: str, request: Request):
                            + _sp_resume_args + _get_project_model(proj_id, override_model=_sp_override_model))
                 subprocess.Popen(["tmux", "new-session", "-d", "-s", _new_assigned, "-c", _spawn_cwd]
                                  + _sp_env + _sp_cmd)
-                subprocess.run(["tmux", "set-option", "-t", _new_assigned, "history-limit", "2000"],
+                subprocess.run(["tmux", "set-option", "-t", _new_assigned, "history-limit", "5000"],
                                capture_output=True, timeout=2)  # M1757: parity with branch/fork
                 if _sp_presigned_sid:
                     _write_sid_direct(proj_id, _new_assigned, _sp_presigned_sid)
@@ -9393,6 +9393,43 @@ async def get_tmux_output(proj_id: str, lines: int = 20, tmux_session: str = "")
         capture_output=True, text=True,timeout=2
     )
     output = result.stdout.strip()
+    # M1836: when ESC[3J (Claude Code startup) wiped scrollback (history_size=0) and the
+    # captured pane is short (≤ pane_height lines ≈ idle state), prepend recent
+    # completion-log entries as a "prior work" header so the user can see what this session
+    # last accomplished without needing to reopen a transcript.
+    # Only inject when tmux_session is explicit (user has the LIVE SESSION panel open)
+    # and the pane command is a shell (Claude is at-prompt, not actively processing).
+    if tmux_session.strip():
+        try:
+            _hist_r = await asyncio.to_thread(
+                subprocess.run,
+                ["tmux", "display-message", "-t", session_name, "-p", "#{history_size}:#{pane_current_command}"],
+                capture_output=True, text=True, timeout=2
+            )
+            _hist_parts = (_hist_r.stdout.strip() or "0:bash").split(":", 1)
+            _hist_size = int(_hist_parts[0]) if _hist_parts[0].isdigit() else 0
+            _pane_cmd = _hist_parts[1] if len(_hist_parts) > 1 else "bash"
+            # M1836: "at prompt" = shell idle OR claude CLI at-prompt (both show no active work)
+            _at_prompt = _pane_cmd in _SHELLS or _pane_cmd == "claude"
+            if _at_prompt and _hist_size == 0:
+                # Session is idle at shell prompt with no scrollback — inject completion-log
+                _clog = PROJECTS_DIR / proj_id / "completion-log.jsonl"
+                if _clog.exists():
+                    _entries = []
+                    for _line in _clog.read_text().splitlines()[-8:]:
+                        try:
+                            _e = json.loads(_line)
+                            _ts = _e.get("timestamp", "")[:16].replace("T", " ")
+                            _mid = _e.get("milestone_id", "?")
+                            _ev = (_e.get("evidence") or "")[:120]
+                            _entries.append(f"[{_ts}] {_mid}: {_ev}")
+                        except Exception:
+                            pass
+                    if _entries:
+                        _header = "── recent completions (scrollback cleared by ESC[3J) ──\n" + "\n".join(_entries) + "\n──────────────────────────────────────────────────────\n"
+                        output = _header + output
+        except Exception:
+            pass
     return JSONResponse({"ok": True, "running": True, "session": session_name, "output": output})
 
 
@@ -10263,7 +10300,7 @@ async def execute_project(proj_id: str, request: Request):
                                             _write_sid_direct(proj_id, _br_sess, _br_presigned_sid)
                                         else:
                                             _capture_live_session_id_bg(proj_id, _br_spawn_cwd, _br_sess, _br_pre_files, spawn_marker=_br_marker)
-                                        await asyncio.to_thread(subprocess.run, ["tmux", "set-option", "-t", _br_sess, "history-limit", "2000"], capture_output=True, timeout=2)  # M1345
+                                        await asyncio.to_thread(subprocess.run, ["tmux", "set-option", "-t", _br_sess, "history-limit", "5000"], capture_output=True, timeout=2)  # M1345
                                         # M1678: readiness-gated unified wake (was blind send-keys during boot — parked text in input box)
                                         threading.Thread(target=_spawn_wake_when_ready,
                                                          args=(_br_sess, proj_id), daemon=True).start()
@@ -10388,7 +10425,7 @@ async def execute_project(proj_id: str, request: Request):
                     *_get_agent_spawn_cmd(proj_id),
                     *resume_args,
                 ])
-                subprocess.run(["tmux", "set-option", "-t", session_name, "history-limit", "2000"], capture_output=True, timeout=2)
+                subprocess.run(["tmux", "set-option", "-t", session_name, "history-limit", "5000"], capture_output=True, timeout=2)
                 _exec_idle_file(proj_id).unlink(missing_ok=True)  # M536: clear idle flag on spawn
                 _server_log_action(proj_id, "", "exec:spawn", f"session:{session_name} resume:{resume_args[-1] if resume_args else 'fresh'}")
                 # M366: immediately push running status so ns-card shows green border without waiting for poller
@@ -10784,7 +10821,7 @@ async def execute_project(proj_id: str, request: Request):
                 "claude", "--dangerously-skip-permissions", *_DISALLOWED_TOOLS_ARGS, *_get_project_model(proj_id),
                 *_mcp_full_args, *resume_args,
             ])
-            subprocess.run(["tmux", "set-option", "-t", session_name, "history-limit", "2000"], capture_output=True, timeout=2)
+            subprocess.run(["tmux", "set-option", "-t", session_name, "history-limit", "5000"], capture_output=True, timeout=2)
             import asyncio as _aio
             # Wait for Claude + SessionStart hook to complete
             # Hook deletes the prompt file when injected — use file deletion as ready signal
@@ -10839,7 +10876,7 @@ async def execute_project(proj_id: str, request: Request):
                     "claude", "--dangerously-skip-permissions", *_DISALLOWED_TOOLS_ARGS, *_get_project_model(proj_id), *_mcp_args_retry,
                     *resume_args,
                 ])
-                subprocess.run(["tmux", "set-option", "-t", session_name, "history-limit", "2000"], capture_output=True, timeout=2)
+                subprocess.run(["tmux", "set-option", "-t", session_name, "history-limit", "5000"], capture_output=True, timeout=2)
                 elapsed = 0
                 while elapsed < deadline:
                     await _aio.sleep(1)
@@ -10939,7 +10976,7 @@ async def execute_project(proj_id: str, request: Request):
                         "claude", "--dangerously-skip-permissions", *_DISALLOWED_TOOLS_ARGS, *_mother_model_args,  # M1166
                         *_ss_resume_args,
                     ])
-                    subprocess.run(["tmux", "set-option", "-t", _ss_sname, "history-limit", "2000"], capture_output=True, timeout=2)
+                    subprocess.run(["tmux", "set-option", "-t", _ss_sname, "history-limit", "5000"], capture_output=True, timeout=2)
                     _newly_spawned.append((_ss_sname, time.time()))
                 _server_log_action(proj_id, "", "exec:substar_branch",
                                    f"spawned {len(_newly_spawned)} new + {len(_alive_branch_keys)} reused sessions: "
@@ -11183,7 +11220,7 @@ async def fork_session(proj_id: str, request: Request):
         *model_args,
         *resume_args,
     ])
-    subprocess.run(["tmux", "set-option", "-t", session_name, "history-limit", "2000"],
+    subprocess.run(["tmux", "set-option", "-t", session_name, "history-limit", "5000"],
                    capture_output=True, timeout=2)
     _exec_idle_file(proj_id).unlink(missing_ok=True)
     _server_log_action(proj_id, "", "exec:fork",
