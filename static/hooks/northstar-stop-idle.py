@@ -37,8 +37,15 @@ try:
         sys.exit(0)
 
     # Session identity — same derivation as northstar-action-log.py / hub-mcp-server.py
-    sk, is_exec = "", False
-    if os.environ.get("TMUX"):
+    # M1766: NS_SESSION_KEY (set at spawn time) first — zero subprocess cost, zero timeout
+    # risk. tmux display-message only as fallback for sessions spawned without it (rare).
+    # A transient tmux timeout here used to silently misroute the busy-state write to a
+    # legacy::proj fallback key, leaving the real session's stale busy record uncleared
+    # (observed: FromScratch cd3364e0 stuck tool_start ~7min after Stop fired cleanly).
+    sk, is_exec = os.environ.get("NS_SESSION_KEY", "").strip(), False
+    if sk:
+        is_exec = "-exec-" in sk
+    elif os.environ.get("TMUX"):
         try:
             import subprocess
             sk = subprocess.run(["tmux", "display-message", "-p", "#S"],

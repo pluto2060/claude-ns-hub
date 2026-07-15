@@ -26,8 +26,9 @@ try:
     data = json.loads(raw) if raw else {}
     hook_event = data.get("hook_event_name", "")
 
-    sk = ""
-    if os.environ.get("TMUX"):
+    # M1766: NS_SESSION_KEY (set at spawn time) first — see northstar-stop-idle.py docstring.
+    sk = os.environ.get("NS_SESSION_KEY", "").strip()
+    if not sk and os.environ.get("TMUX"):
         try:
             import subprocess
             sk = subprocess.run(["tmux", "display-message", "-p", "#S"],

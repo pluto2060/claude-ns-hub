@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 import sqlite3
 import yaml as _yaml
@@ -653,6 +654,8 @@ _WAKE_SENT_TTL_SECS = 45  # M1675: optimistic busy hold after wake injection (cl
 _COMPACT_HOLD_SECS = 300       # was 600 — self-heal + fixed Stop hook now clear it promptly
 _COMPACT_SELFHEAL_SECS = 240   # marker-age past which compaction is deemed complete
 _TOOL_HEARTBEAT_HOLD_SECS = 900  # M1741: 15min grace for tool_call_heartbeat (see below)
+_CLAIM_TTL_SECS = 120.0  # M1769: shared with claim_task_for_session's local _claim_ttl —
+                         # how long a claimed_by_session lock is trusted before being stale
 
 
 def _validate_stone_hold(session_name: str, rec: dict) -> str | None:
@@ -678,8 +681,13 @@ def _validate_stone_hold(session_name: str, rec: dict) -> str | None:
         ).fetchone()
         conn.close()
         if row:
-            _claimed = (json.loads(row[0]).get("claimed_by_session") or "").strip()
-            if not _claimed or _claimed == session_name:
+            _row_d = json.loads(row[0])
+            _claimed = (_row_d.get("claimed_by_session") or "").strip()
+            _claimed_at = _row_d.get("claimed_at") or 0
+            # M1769: name match alone isn't proof of a live claim — a stale claimed_by_session
+            # (TTL long expired, e.g. a dead session's leftover claim) must not count as
+            # in-flight just because a revived/new session happens to share the same name.
+            if not _claimed or (_claimed == session_name and (time.time() - _claimed_at) < _CLAIM_TTL_SECS):
                 return _sid  # still genuinely in-flight for this session
         rec["stone_id"] = None
         return None
@@ -760,7 +768,16 @@ def _first_running_stone(proj_id: str) -> str | None:
 def _oob_is_busy(proj_id: str, session_name: str | None = None) -> bool:
     """Legacy-compatible busy check.
     session_name given + that session has ever reported → its own state only.
-    Otherwise: any busy session of the project, then legacy proj-level record."""
+    Otherwise: any busy session of the project, then legacy proj-level record.
+    M1806: session_name is NOT a narrowing filter on the sibling-scan fallback below —
+    a cold-start session with no record of its own falls straight through to "any busy
+    session of the project" (line ~776), the exact TTL-less sibling-busy inheritance M1771
+    already fixed for the /api/exec-sessions display path. That fix only patched the ONE
+    call site (idle-display), leaving this function's own fallback — and every OTHER call
+    site that passes session_name expecting a session-scoped answer (dispatch/wake
+    decisions, not just display) — still exposed. Use _oob_is_busy_session_scoped for any
+    new session-scoped call site instead of calling this function with session_name set;
+    kept here unchanged only for the two genuinely project-wide callers (no session_name)."""
     if session_name and session_name in _agent_busy_sessions:
         rec = _agent_busy_sessions[session_name]
         if rec.get("proj_id") == proj_id:
@@ -768,6 +785,26 @@ def _oob_is_busy(proj_id: str, session_name: str | None = None) -> bool:
     for _sk, rec in _agent_busy_sessions.items():
         if rec.get("proj_id") == proj_id and _session_is_busy(_sk):
             return True
+    oob = _agent_busy_state.get(proj_id)
+    if not oob:
+        return False
+    if (time.time() - oob.get("ts", 0)) >= _OOB_STALE_SECS:
+        return False
+    return bool(oob.get("busy", False))
+
+
+def _oob_is_busy_session_scoped(proj_id: str, session_name: str) -> bool:
+    """M1806: the session-scoped counterpart of the M1771 fix, generalized so it isn't
+    duplicated at every call site. A session with its own busy record → that record decides,
+    same as _oob_is_busy. A session with NO record of its own → idle=True (not "inherit
+    whatever a sibling last reported", which has no TTL and can be hours/days stale) — the
+    only exception is the existing TTL-bound (_OOB_STALE_SECS) legacy proj-level record,
+    which is a real "something in this project reported busy recently" signal, not an
+    unbounded sibling scan."""
+    if session_name in _agent_busy_sessions:
+        rec = _agent_busy_sessions[session_name]
+        if rec.get("proj_id") == proj_id:
+            return _session_is_busy(session_name)
     oob = _agent_busy_state.get(proj_id)
     if not oob:
         return False
@@ -880,6 +917,17 @@ async def agent_busy(request: Request):
     # send the field keep the pre-M1656 project-level behavior unchanged.
     _session_key = str(body.get("session_key") or "").strip()
     _is_exec = bool(body.get("is_exec", True))
+    # M1770: an exec session's own name embeds its true project (claude-exec-{proj}[-suffix]) —
+    # trust that over whatever proj_id the hook computed. Hooks derive proj_id from
+    # NS_PROJ_ID/CLAUDE_PROJECT_DIR/os.getcwd() (northstar-stop-idle.py etc.), any of which can
+    # transiently read the wrong cwd (e.g. a shell tool mid-turn cd'd elsewhere when the hook
+    # fired) and mislabel a correctly-identified session under a different project's proj_id —
+    # session_key stays right, proj_id silently goes wrong (observed: claude-exec-UniversEye's
+    # busy record tagged proj_id=MOAT while genuinely idle in UniversEye).
+    if _session_key:
+        _sk_agent, _sk_proj = _parse_exec_session_name(_session_key)
+        if _sk_proj and _sk_proj != proj_id:
+            proj_id = _sk_proj
     if not _is_exec:
         # Non-exec (user CLI/IDE) session: record for observability only. Must NOT write
         # _agent_busy_state/_session_running_stone or trigger dispatch — otherwise an open
@@ -1207,7 +1255,7 @@ async def get_tool_trace(stone_id: str = "", proj_id: str = "", limit: int = 500
         return JSONResponse({"ok": False, "error": str(e)})
 
 @app.get("/api/action-log")
-async def get_action_log(proj_id: str = "", stone_id: str = "", limit: int = 200, since_minutes: int = 0):
+async def get_action_log(proj_id: str = "", stone_id: str = "", limit: int = 200, since_minutes: int = 0, action: str = ""):
     """M526: Query recent user action log for debugging."""
     try:
         from datetime import datetime as _dt, timedelta as _td
@@ -1219,13 +1267,15 @@ async def get_action_log(proj_id: str = "", stone_id: str = "", limit: int = 200
             q += " AND proj_id=?"; params.append(proj_id)
         if stone_id:
             q += " AND stone_id=?"; params.append(stone_id)
+        if action:
+            q += " AND action=?"; params.append(action)
         if since_minutes > 0:
             cutoff = (_dt.utcnow() - _td(minutes=since_minutes)).isoformat()
             q += " AND ts >= ?"; params.append(cutoff)
         q += " ORDER BY ts DESC LIMIT ?"; params.append(limit)
         rows = [dict(r) for r in conn.execute(q, params).fetchall()]
         conn.close()
-        return JSONResponse({"ok": True, "actions": rows, "count": len(rows)})
+        return JSONResponse({"ok": True, "rows": rows, "actions": rows, "count": len(rows)})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)})
 
@@ -3815,6 +3865,13 @@ _SESSION_TTL = 30 * 60  # kill after 30 min idle
 _exec_attach_relay: dict[str, dict] = {}
 _EXEC_ATTACH_STALE_SECS = 900  # 15min — well past any real interactive terminal glance
 
+# M1763: tmux-output HTTP poll viewer registry — tracks sessions currently viewed via
+# the /tmux-output endpoint (which uses capture-pane, not a tmux client, so M1337's
+# list-clients check never fires). TTL=30s; reset on each poll. _send_exec_wake checks
+# this alongside list-clients so both viewer paths block wake injection.
+_tmux_output_viewers: dict[str, float] = {}  # session_name → last_poll_time
+_TMUX_OUTPUT_VIEWER_TTL = 30.0  # seconds of inactivity before no longer "watching"
+
 
 def _kill_session(proj_id: str) -> None:
     """Terminate a session and clean up all registries."""
@@ -4102,6 +4159,7 @@ async def _start_milestone_watcher():
                     # session is alive AND idle, re-fire the trigger so Claude is forced
                     # to read the REPLY PROTOCOL again. Prevents silently skipped replies.
                     pending_reply_ids = []
+                    _pending_reply_owner_m = None
                     for m in raw_ms:
                         if not isinstance(m, dict): continue
                         # M225: held stones are completely excluded from claude token consumption
@@ -4109,8 +4167,12 @@ async def _start_milestone_watcher():
                         conv = m.get("conversation") or []
                         if conv and isinstance(conv, list) and conv[-1].get("role") == "user":
                             pending_reply_ids.append(m.get("id"))
+                            if _pending_reply_owner_m is None:
+                                _pending_reply_owner_m = m
                     if pending_reply_ids:
-                        session_name = _live_exec_session_name(proj_id)
+                        # M131-b-followup: resolve via the owning substar's assigned_session
+                        # instead of always targeting the main session first.
+                        session_name = _owning_exec_session_name(proj_id, _pending_reply_owner_m or {}, proj)
                         check = subprocess.run(["tmux", "has-session", "-t", f"={session_name}"], capture_output=True, timeout=2)
                         if check.returncode == 0:
                             # M149: append-only queue (one entry per write)
@@ -4507,8 +4569,7 @@ def _session_claimable_queued_count(proj_id: str, session_name: str) -> int:
         proj = _db_load_project(proj_id) or {}
         sub_sess = {ns.get("id"): (ns.get("assigned_session") or "").strip()
                     for ns in (proj.get("north_stars") or []) if isinstance(ns, dict)}
-        _ag_e, _pid_e = _parse_exec_session_name(session_name)
-        is_child = bool(_pid_e) and session_name != f"{_ag_e}-exec-{_pid_e}"
+        # M1797: mother/child concept removed — all sessions can claim free-pool stones.
         _now_e = time.time()
         n = 0
         for m in stones:
@@ -4522,11 +4583,11 @@ def _session_claimable_queued_count(proj_id: str, session_name: str) -> int:
             if not str(m.get("text", "")).strip():
                 continue
             cb = (m.get("claimed_by_session") or "").strip()
-            if cb and cb != session_name and (_now_e - (m.get("claimed_at") or 0)) < 120:
+            if cb and cb != session_name and (_now_e - (m.get("claimed_at") or 0)) < _CLAIM_TTL_SECS:
                 continue  # in-flight on another session
             sid = (m.get("substar_id") or "").strip()
             owner = sub_sess.get(sid, "") if sid else ""
-            if owner == session_name or (not owner and not is_child):
+            if owner == session_name or not owner:
                 n += 1
         return n
     except Exception:
@@ -4630,28 +4691,7 @@ async def _start_queue_continuation_poller():
                     if queued_count == 0:
                         continue  # nothing this session could claim
 
-                    # M1097: run M836.2 auto-assign before "go" injection so substars get
-                    # their assigned_session even when poller fires instead of execute button.
-                    try:
-                        _pa = _db_load_project(proj_id)
-                        if _pa:
-                            _ns_list_p = _pa.get("north_stars") or []
-                            _queued_p = [
-                                json.loads(r[0]) for r in sqlite3.connect(str(_NS_EVENTS_DB)).execute(
-                                    "SELECT data_json FROM milestones_store WHERE proj_id=? AND status='queued' AND COALESCE(held,0)=0",
-                                    (proj_id,)
-                                ).fetchall()
-                            ]
-                            _unassigned_p, _ = _find_unassigned_substars(_queued_p, _ns_list_p)
-                            if _unassigned_p:
-                                for _ns_p in _ns_list_p:
-                                    if isinstance(_ns_p, dict) and _ns_p.get("id") in _unassigned_p:
-                                        _ns_p["assigned_session"] = sname
-                                _pa["north_stars"] = _ns_list_p
-                                _db_save_project(proj_id, _pa)
-                                _parse_cache.pop(str(PROJECTS_DIR / proj_id / "north-star.md"), None)
-                    except Exception:
-                        pass
+                    # M1802: poller auto-assign removed — substars must be manually assigned.
 
                     # Send wake message — MCP sessions get tool-call instruction, others get 'go'.
                     # M1656-R: _send_exec_wake's atomic per-session 90s dedup is the ONLY
@@ -4687,7 +4727,22 @@ async def _start_queue_continuation_poller():
 
                 # M1095: scan all projects' substars — clear assigned_session if the
                 # session is dead (handles external kills that bypass _kill_all_exec_sessions)
+                # M1768: `_ls_out` came from `_arun`, whose bare except silently returns "" on
+                # ANY tmux failure/timeout (box under load) — an empty string parses to an
+                # EMPTY alive_sessions set, which then looked like every assigned session on
+                # the box died at once and wiped ALL substar assignments in a single tick
+                # (observed: MOAT cleared 6 substars simultaneously, including a fork session
+                # that was demonstrably still alive and mid-task — its freed substar then fell
+                # into the free pool and got double-claimed by the mother, duplicating a 5min+
+                # subagent audit in parallel). A truly empty tmux server (no sessions at all)
+                # is exceedingly rare on a live box with an active exec session running this
+                # very poller loop, so treat an empty _ls_out as "list-sessions failed this
+                # tick" and skip the unassign scan entirely rather than trusting it.
                 try:
+                  if not _ls_out.strip():
+                    _server_log_action("", "", "exec:dead_unassign_skip_empty_ls",
+                                       "tmux list-sessions returned empty — skipping unassign scan")
+                  else:
                     alive_sessions: set = set(_ls_out.splitlines())
                     # Also add any custom sess-* via tmux list-sessions (M1493: reuse _ls_out, no extra call)
                     alive_sessions.update(s.strip() for s in _ls_out.splitlines() if s.strip())
@@ -4727,73 +4782,6 @@ async def _start_queue_continuation_poller():
                 except Exception:
                     pass  # cleanup must never crash the poller
 
-                # M1656-②v2: mother natural-death → cascade kill orphan child sessions.
-                # DEATH = observed alive→gone TRANSITION, not mere absence — a child spawned
-                # while the mother never existed is standalone and must NOT be reaped
-                # (observed: child killed ≤10s after spawn when mother was already gone).
-                # Also: mother ref must be a real tmux exec session name — legacy
-                # branch_from values holding conversation UUIDs killed innocent sessions.
-                if not hasattr(_poll_queue_continuation, "_sess_last_alive"):
-                    _poll_queue_continuation._sess_last_alive = {}
-                _sess_last_alive: dict = _poll_queue_continuation._sess_last_alive
-                _now_alive_ts = time.time()
-                for _sn_alive in alive_sessions:
-                    if "-exec-" in _sn_alive:
-                        _sess_last_alive[_sn_alive] = _now_alive_ts
-                _MOTHER_DEATH_WINDOW = 600  # cascade only if mother seen alive within last 10min
-                try:
-                    for _pdir in PROJECTS_DIR.iterdir():
-                        try:
-                            _pid = _pdir.name
-                            _p = _db_load_project(_pid)
-                            if not _p:
-                                continue
-                            _ns_list = _p.get("north_stars") or []
-                            # Build session → branch_from map
-                            _sess_to_ns: dict = {}
-                            for _ns in _ns_list:
-                                if not isinstance(_ns, dict):
-                                    continue
-                                _a = (_ns.get("assigned_session") or "").strip()
-                                if _a:
-                                    _sess_to_ns[_a] = _ns
-                            _changed = False
-                            for _ns in _ns_list:
-                                if not isinstance(_ns, dict):
-                                    continue
-                                _child_sess = (_ns.get("assigned_session") or "").strip()
-                                _mother_id = (_ns.get("branch_from_session_id") or "").strip()
-                                if not _child_sess or not _mother_id:
-                                    continue
-                                # Find mother session name from its substar
-                                _mother_ns = _sess_to_ns.get(_mother_id)
-                                _mother_sess = (_mother_ns.get("assigned_session") or "").strip() if _mother_ns else _mother_id
-                                # M1656-②v2 guards: mother ref must be a tmux exec name (not a
-                                # conversation UUID), and mother must have been SEEN alive recently
-                                # — absence alone is not death.
-                                if not _mother_sess or "-exec-" not in _mother_sess:
-                                    continue
-                                _mother_seen = _sess_last_alive.get(_mother_sess, 0)
-                                _mother_died = (_mother_sess not in alive_sessions
-                                                and _mother_seen > 0
-                                                and (_now_alive_ts - _mother_seen) < _MOTHER_DEATH_WINDOW)
-                                if _child_sess in alive_sessions and _mother_died:
-                                    try:
-                                        subprocess.run(["tmux", "kill-session", "-t", f"={_child_sess}"],
-                                                       capture_output=True, timeout=3)
-                                    except Exception:
-                                        pass
-                                    _ns["assigned_session"] = None
-                                    _agent_busy_sessions.pop(_child_sess, None)
-                                    _changed = True
-                                    _server_log_action(_pid, "", "exec:mother_death_cascade",
-                                                       f"child:{_child_sess} mother:{_mother_sess}")
-                            if _changed:
-                                _db_save_project(_pid, _p)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass  # cascade kill must never crash the poller
             except Exception:
                 pass  # poller must never crash
 
@@ -5247,7 +5235,12 @@ _HUB_EXEC_SYS_PROMPT = (
     "MUST be Skill(skill=skill_refs[0]) — before reading task text or any other tool. "
     "M1565 SEQUENTIAL CHAIN: if skill_refs_remaining is present (non-empty), "
     "after skill_refs[0] completes call each skill in skill_refs_remaining in order. "
-    "Skipping any skill = silent failure."
+    "Skipping any skill = silent failure. "
+    "GDRIVE UPLOAD RULE (M1772): mcp__claude_ai_Google_Drive__* tools are hard-blocked at exec-session level. "
+    "When spawning subagents (Agent tool), ALWAYS include in the subagent prompt: "
+    "'evidence upload: ONLY use mcp__ns-hub__upload_evidence or rclone Bash — "
+    "NEVER mcp__claude_ai_Google_Drive__create_file'. "
+    "Subagents do NOT inherit the exec-session tool block."
 )
 
 
@@ -5258,7 +5251,17 @@ _HUB_EXEC_SYS_PROMPT = (
 # genuine CLI-level deny-list, distinct from --dangerously-skip-permissions (which only
 # bypasses the interactive approval prompt for tools that ARE available) — a denied tool is
 # never offered to the model at all. Spliced into every spawn command below.
-_DISALLOWED_TOOLS_ARGS = ["--disallowedTools", "AskUserQuestion"]
+_DISALLOWED_TOOLS_ARGS = [
+    "--disallowedTools",
+    # M1712-b: AskUserQuestion blocks exec session turn with no hub-side continuation
+    # M1772: mcp__claude_ai_Google_Drive__* blocked at CLI level — base64 encoding is
+    # extremely slow; use mcp__ns-hub__upload_evidence or rclone Bash instead.
+    "AskUserQuestion,mcp__claude_ai_Google_Drive__copy_file,"
+    "mcp__claude_ai_Google_Drive__create_file,mcp__claude_ai_Google_Drive__download_file_content,"
+    "mcp__claude_ai_Google_Drive__get_file_metadata,mcp__claude_ai_Google_Drive__get_file_permissions,"
+    "mcp__claude_ai_Google_Drive__list_recent_files,mcp__claude_ai_Google_Drive__read_file_content,"
+    "mcp__claude_ai_Google_Drive__search_files",
+]
 
 
 def _hub_mcp_spawn_args(proj_id: str, session_name: str, agent: str = "claude") -> list:
@@ -5312,7 +5315,7 @@ _wake_send_lock = __import__('threading').Lock()  # M1585 v2: atomic dedup check
 
 
 def _send_exec_wake(session_name: str, proj_id: str | None = None, force_dedup_reset: bool = False,
-                    _skip_boot_grace: bool = False) -> bool:
+                    _skip_boot_grace: bool = False, _force_viewer_bypass: bool = False) -> bool:
     """M1114: Send exec wake message to tmux, with optional skill pre-inject.
     If the first queued stone has skill_refs, sends /skill-name first (CLI intercept)
     then sleeps 1s, then sends the main wake message.
@@ -5357,6 +5360,14 @@ def _send_exec_wake(session_name: str, proj_id: str | None = None, force_dedup_r
         return False  # booting — readiness thread / next poller pass will wake
     if not _tmux_session_alive(session_name):
         return False
+    # M1763: also block if user is watching via the /tmux-output HTTP poll endpoint
+    # (capture-pane doesn't register a tmux client, so list-clients alone misses this).
+    # M1765: _force_viewer_bypass=True skips this gate for explicit user-triggered dispatch
+    # (execute button path) — user just submitted a stone, they want it to start now.
+    if not _force_viewer_bypass:
+        _last_poll = _tmux_output_viewers.get(session_name, 0.0)
+        if (now - _last_poll) < _TMUX_OUTPUT_VIEWER_TTL:
+            return False  # M1763: user is viewing via HTTP poll — never auto-inject
     try:
         _cl = subprocess.run(["tmux", "list-clients", "-t", f"={session_name}"],
                              capture_output=True, text=True, timeout=2)
@@ -5498,7 +5509,7 @@ def _transcript_too_large(proj_id: str) -> bool:
     return False
 
 
-def _record_spawn_info(proj_id: str, resume_args: list, agent: str = "claude", session_name: str = "", model: str = None) -> None:
+def _record_spawn_info(proj_id: str, resume_args: list, agent: str = "claude", session_name: str = "", model: str = None, is_mother: bool = False) -> None:
     """Snapshot what resume flag we used when spawning Claude for this project/session.
 
     Surfaces to the UI via /api/exec-sessions so users can see whether the
@@ -5535,9 +5546,29 @@ def _record_spawn_info(proj_id: str, resume_args: list, agent: str = "claude", s
         except Exception:
             from_id = ""
         _mode = "fork" if "--fork-session" in resume_args else "resume"
-        info = {"agent": agent, "mode": _mode, "from_id": from_id, "at": _dt.now().isoformat(timespec="seconds")}
+        # M1774-correction: --fork-session allocates a NEW session id / .jsonl — leave
+        # live_session_id unset so _capture_live_session_id_bg is the single source of truth.
+        # M1806-fix: resume reuses the SAME session id as from_id (no new .jsonl created),
+        # so live_session_id == from_id deterministically. Set it now so _spawn_sid_to_model
+        # can index by live_session_id alone without needing from_id as a separate key.
+        _live = from_id if _mode == "resume" else ""
+        info = {"agent": agent, "mode": _mode, "from_id": from_id, "live_session_id": _live, "at": _dt.now().isoformat(timespec="seconds")}
     elif "--continue" in resume_args:
         info = {"agent": agent, "mode": "continue", "from_id": "", "at": _dt.now().isoformat(timespec="seconds")}
+    elif "--session-id" in resume_args:
+        # M1803: a fresh spawn's presigned --session-id IS the live session id — known
+        # deterministically at spawn time (M1775), unlike --fork-session's ambiguous case
+        # above. Was falling into the plain "fresh" branch below with live_session_id never
+        # set at all, even though the exact value was right there in resume_args (confirmed
+        # live: actual tmux pane argv `--session-id 4d4a5545-...` matched .session-history.json
+        # exactly, but .spawn-info-by-session.json recorded neither).
+        try:
+            idx = resume_args.index("--session-id")
+            _sid = resume_args[idx + 1] if idx + 1 < len(resume_args) else ""
+        except Exception:
+            _sid = ""
+        info = {"agent": agent, "mode": "fresh", "from_id": "", "live_session_id": _sid,
+                "at": _dt.now().isoformat(timespec="seconds")}
     else:
         info = {"agent": agent, "mode": "fresh", "from_id": "", "at": _dt.now().isoformat(timespec="seconds")}
     # M189: add model to spawn info so UI can display it in the session pane
@@ -5558,6 +5589,10 @@ def _record_spawn_info(proj_id: str, resume_args: list, agent: str = "claude", s
             except Exception:
                 pass
     info["model"] = _proj_model
+    # M1796: explicit mother flag — now that every session has a suffix, suffix presence
+    # alone can no longer distinguish mother from children.
+    if is_mother:
+        info["is_mother"] = True
     _key = session_name or "_main"
     try:
         pdir = PROJECTS_DIR / proj_id
@@ -5579,8 +5614,39 @@ def _record_spawn_info(proj_id: str, resume_args: list, agent: str = "claude", s
         pass
 
 
+def _write_sid_direct(proj_id: str, session_name: str, sid: str) -> None:
+    """M1775: write a known-in-advance live_session_id (e.g. from --session-id pre-assignment)
+    directly into spawn-info, bypassing the poll-and-diff capture entirely. Same target file
+    as _capture_live_session_id_bg's internal _write_sid, exposed standalone so spawn call
+    sites that pre-generate the UUID don't need a background thread at all."""
+    _f = PROJECTS_DIR / proj_id / ".spawn-info-by-session.json"
+    _all: dict = {}
+    if _f.exists():
+        try:
+            _all = json.loads(_f.read_text())
+        except Exception:
+            pass
+    if session_name in _all:
+        _all[session_name]["live_session_id"] = sid
+        _f.write_text(json.dumps(_all, ensure_ascii=False))
+
+
+def _write_spawn_marker(tdir: Path, session_name: str) -> Optional[Path]:
+    """M1773-C: write a marker file immediately before tmux spawn so
+    _capture_live_session_id_bg can resolve ambiguity by matching the new .jsonl
+    whose mtime is closest to (and within 2s of) the marker's mtime."""
+    try:
+        tdir.mkdir(parents=True, exist_ok=True)
+        marker = tdir / f".spawning-{session_name}"
+        marker.touch()
+        return marker
+    except Exception:
+        return None
+
+
 def _capture_live_session_id_bg(proj_id: str, proj_dir: str, session_name: str, pre_existing: set,
-                                 poll_interval: float = 1.0, timeout: float = 20.0) -> None:
+                                 poll_interval: float = 1.0, timeout: float = 20.0,
+                                 spawn_marker: Optional[Path] = None) -> None:
     """M1656-R9: session-scoped live_session_id capture — runs in a background thread so
     the spawn call site doesn't block. POLLS the transcript directory (Claude CLI can take
     well over 2s to boot and write its first transcript line, especially forking a large
@@ -5588,37 +5654,55 @@ def _capture_live_session_id_bg(proj_id: str, proj_dir: str, session_name: str, 
     created — unambiguous even when sibling sessions (mother/other children) share the
     same transcript directory and write concurrently (the old heuristic just grabbed
     'newest mtime file', which frequently picked a SIBLING's transcript instead of this
-    session's own — confirmed root cause of the mother/child pane info mismatch)."""
+    session's own — confirmed root cause of the mother/child pane info mismatch).
+
+    M1773-C: When multiple new files appear simultaneously (ambiguous), fall back to the
+    marker-file strategy: pick the .jsonl whose mtime is closest to spawn_marker's mtime
+    and within a 2-second window. This eliminates the race without relying on OS timestamp
+    precision — the marker is written synchronously on the hub side, giving a reliable
+    reference point."""
     import time as _t, threading as _th
+
+    def _write_sid(sid: str) -> None:
+        _write_sid_direct(proj_id, session_name, sid)
 
     def _run():
         encoded = _encode_cwd_for_claude(str(proj_dir))
         tdir = Path.home() / ".claude" / "projects" / encoded
+        _marker_mtime = spawn_marker.stat().st_mtime if (spawn_marker and spawn_marker.exists()) else None
         _deadline = _t.time() + timeout
-        while _t.time() < _deadline:
-            _t.sleep(poll_interval)
-            try:
-                if not tdir.exists():
-                    continue
-                _now_files = {f.name for f in tdir.glob("*.jsonl")}
-                _new_files = _now_files - pre_existing
-                if len(_new_files) == 1:
-                    _new_sid = next(iter(_new_files))[:-6]  # strip ".jsonl"
-                    _f = PROJECTS_DIR / proj_id / ".spawn-info-by-session.json"
-                    _all = {}
-                    if _f.exists():
-                        try:
-                            _all = json.loads(_f.read_text())
-                        except Exception:
-                            _all = {}
-                    if session_name in _all:
-                        _all[session_name]["live_session_id"] = _new_sid
-                        _f.write_text(json.dumps(_all, ensure_ascii=False))
+        try:
+            while _t.time() < _deadline:
+                _t.sleep(poll_interval)
+                try:
+                    if not tdir.exists():
+                        continue
+                    _now_files = {f.name for f in tdir.glob("*.jsonl")}
+                    _new_files = _now_files - pre_existing
+                    if len(_new_files) == 1:
+                        _write_sid(next(iter(_new_files))[:-6])
+                        return
+                    if len(_new_files) > 1:
+                        if _marker_mtime is not None:
+                            # M1773-C: pick the candidate closest to marker mtime within ±2s
+                            _candidates = [
+                                (f, abs((tdir / f).stat().st_mtime - _marker_mtime))
+                                for f in _new_files
+                                if abs((tdir / f).stat().st_mtime - _marker_mtime) <= 2.0
+                            ]
+                            if _candidates:
+                                _best = min(_candidates, key=lambda x: x[1])[0]
+                                _write_sid(_best[:-6])
+                        return  # ambiguous without marker — leave unset
+                except Exception:
                     return
-                if len(_new_files) > 1:
-                    return  # genuinely ambiguous — leave unset, UI falls back to heuristic
-            except Exception:
-                return
+        finally:
+            # Always clean up marker regardless of outcome
+            if spawn_marker:
+                try:
+                    spawn_marker.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     _th.Thread(target=_run, daemon=True).start()
 
@@ -5649,40 +5733,98 @@ def _read_spawn_info(proj_id: str, session_name: str) -> dict:
     return {}
 
 
-def _update_session_history_from_transcript(proj_id: str, proj_dir: str, model_key: str = "", preserve_current: bool = False) -> str | None:
+def _update_session_history_locked(proj_id: str, mutate_fn) -> None:
+    """M1804: read-modify-write .session-history.json under an exclusive file lock.
+    Root cause of real data loss (verified live, 2026-07-13: 6 of 9 same-day transcripts
+    missing from the file entirely, plus one SID duplicated across 3 ring slots): the two
+    write sites (_update_session_history_from_transcript + the fork endpoint) each did a
+    bare read → mutate-in-memory → write with NO locking. When spawns land close together
+    (repeated fork/idle-spawn testing is exactly this pattern, but any two near-simultaneous
+    dispatches would trigger it), a later write's read snapshot predates an earlier write's
+    result — the earlier write is silently discarded wholesale, not just its one key.
+    mutate_fn(hist: dict) -> None mutates the loaded dict in place; this function persists it.
+    fcntl.flock blocks (not spins) until the lock is free, so callers see zero added latency
+    under normal (non-contended) load and correctly serialize under real contention."""
+    import fcntl
+    hist_file = PROJECTS_DIR / proj_id / ".session-history.json"
+    hist_file.parent.mkdir(parents=True, exist_ok=True)
+    hist_file.touch(exist_ok=True)
+    with open(hist_file, "r+") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            f.seek(0)
+            raw = f.read()
+            try:
+                hist = json.loads(raw) if raw.strip() else {}
+            except Exception:
+                hist = {}
+            mutate_fn(hist)
+            f.seek(0)
+            f.truncate()
+            f.write(json.dumps(hist))
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+_SESSION_HISTORY_RING_SIZE = 5  # M1802: model_key + 4 _prev.._prev4 slots
+
+
+def _session_history_slot_keys(model_key: str) -> list[str]:
+    """M1802: the 5 key names in this model's history ring, newest-first."""
+    return [model_key] + [f"{model_key}_prev{i if i > 1 else ''}"
+                           for i in range(1, _SESSION_HISTORY_RING_SIZE)]
+
+
+def _push_session_history_ring(hist: dict, model_key: str, new_sid: str) -> None:
+    """M1802: shift model_key's 5-slot ring (model_key, _prev, _prev2, _prev3, _prev4) down
+    one and insert new_sid at the front. Was a 2-slot chain (model_key + _prev only) — a 3rd
+    spawn under the same model within a short window silently discarded the 1st session with
+    no way to resume it, even though its transcript still exists on disk (observed live:
+    repeated fork/idle-spawn testing on MOAT). Mutates hist in place; caller persists it.
+    Shared by both write sites (fresh/resume spawn + fork spawn) so the ring-shift logic
+    can't drift between them."""
+    _slots = _session_history_slot_keys(model_key)
+    old_chain = [hist.get(k) for k in _slots]
+    if old_chain[0] and old_chain[0] != new_sid:
+        for _i in range(len(_slots) - 1, 0, -1):
+            if old_chain[_i - 1]:
+                hist[_slots[_i]] = old_chain[_i - 1]
+    hist[model_key] = new_sid
+
+
+def _update_session_history_from_transcript(proj_id: str, proj_dir: str, model_key: str = "", preserve_current: bool = False, known_sid: str = "") -> str | None:
     """Scan the transcript directory for the newest .jsonl file and record it in session-history.
     Returns the session ID if found, else None. Called after a fresh tmux spawn so the new
     session appears in the resume list immediately (before Stop hook fires).
     M1699-fork: preserve_current=True (fork sessions) leaves the source session's _current/
-    _default anchors untouched so the original model's session can still be resumed."""
+    _default anchors untouched so the original model's session can still be resumed.
+    M1775: known_sid, when provided (e.g. pre-assigned via --session-id, or an existing
+    --resume target), skips the newest-mtime scan entirely — that scan is the same class of
+    mis-attribution bug _capture_live_session_id_bg was built to fix for forks (a concurrently
+    writing sibling session can win the mtime sort). The rest of the history-anchor/
+    cross-agent-contamination-guard logic below is unchanged and still applies to known_sid."""
     try:
         encoded = _encode_cwd_for_claude(str(proj_dir))
         transcripts_dir = Path.home() / ".claude" / "projects" / encoded
-        if not transcripts_dir.exists():
-            return None
-        jsonls = sorted(transcripts_dir.glob("*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)
-        if not jsonls or jsonls[0].stat().st_size == 0:
-            return None
-        new_sid = jsonls[0].stem
-        hist_file = PROJECTS_DIR / proj_id / ".session-history.json"
-        hist = {}
-        if hist_file.exists():
-            try:
-                hist = json.loads(hist_file.read_text())
-            except Exception:
-                pass
+        if known_sid:
+            new_sid = known_sid
+        else:
+            if not transcripts_dir.exists():
+                return None
+            jsonls = sorted(transcripts_dir.glob("*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)
+            if not jsonls or jsonls[0].stat().st_size == 0:
+                return None
+            new_sid = jsonls[0].stem
         _is_agent_specific = bool(model_key) and (
             model_key.startswith("or-") or model_key.startswith("codex-")
         )
-        if not _is_agent_specific and not preserve_current:
-            hist["_current"] = new_sid
+        # M1740: cross-agent contamination guard — detection reads a file, not hist, so it
+        # can run outside the lock. A fork spawns a new session that may reuse/inherit a
+        # SIBLING agent's transcript (e.g. forking a claude session into openrouter). Without
+        # this guard the claude session id leaks into the openrouter model key (and its
+        # ring), so it shows up in the wrong agent's resume list.
+        _record_under_model_key = False
         if model_key:
-            # M1740: cross-agent contamination guard. A fork spawns a new session that may
-            # reuse/inherit a SIBLING agent's transcript (e.g. forking a claude session into
-            # openrouter). Without this guard the claude session id leaks into the openrouter
-            # model key (and its _prev), so it shows up in the wrong agent's resume list.
-            # Detect the NEW session's real agent from its transcript model and refuse to
-            # record it under a foreign-agent model key.
             _mk_agent = "openrouter" if model_key.startswith("or-") else "codex" if model_key.startswith("codex-") else "claude"
             _new_agent = "claude"
             _det_empty = False  # M1750: track whether detection was inconclusive
@@ -5701,19 +5843,23 @@ def _update_session_history_from_transcript(proj_id: str, proj_dir: str, model_k
                         _det_empty = True
             except Exception:
                 _det_empty = True
-            if _new_agent != _mk_agent and not _det_empty:
-                # Foreign-agent session: do NOT record under this model key (prevents the
-                # leak). Still advance _prev for the *true* owner if it later writes here.
-                pass
-            else:
-                # M316: preserve previous session — save old ID as {model_key}_prev before overwriting
-                old_sid = hist.get(model_key)
-                if old_sid and old_sid != new_sid:
-                    hist[f"{model_key}_prev"] = old_sid
-                hist[model_key] = new_sid
-        if not _is_agent_specific and not hist.get("_default"):
-            hist["_default"] = new_sid
-        hist_file.write_text(json.dumps(hist))
+            # Foreign-agent session: do NOT record under this model key (prevents the leak).
+            # Still advance the ring for the *true* owner if it later writes here.
+            _record_under_model_key = not (_new_agent != _mk_agent and not _det_empty)
+
+        # M1804: entire read-mutate-write happens under one file lock — was a bare
+        # read/mutate/write with no locking (see _update_session_history_locked docstring
+        # for the real data-loss incident this fixes: 6 of 9 same-day transcripts missing,
+        # one SID duplicated across 3 ring slots, all from concurrent spawns racing on this
+        # exact file).
+        def _mutate(hist: dict) -> None:
+            if not _is_agent_specific and not preserve_current:
+                hist["_current"] = new_sid
+            if model_key and _record_under_model_key:
+                _push_session_history_ring(hist, model_key, new_sid)
+            if not _is_agent_specific and not hist.get("_default"):
+                hist["_default"] = new_sid
+        _update_session_history_locked(proj_id, _mutate)
         return new_sid
     except Exception:
         return None
@@ -5787,6 +5933,46 @@ def _truncate_transcript_before_stone(transcript_path: Path, stone_id: str) -> "
         return None
 
 
+def _truncate_transcript_before_last_user_turn(transcript_path: Path) -> "str | None":
+    """M1780: cut point for fork-while-busy when the mother is mid-work on a DIRECT
+    conversational turn (no stone claim) — _truncate_transcript_before_stone only fires
+    when _agent_busy_sessions has a stone_id, which is None for interactive chat (e.g. a
+    user asking the mother to investigate something, exactly the shape of session that
+    forked this very hub session's own work). Same problem, different trigger: a fork
+    taken mid-turn inherits the mother's unfinished direct-conversation work and a naive
+    'just continue' child would carry on answering the mother's question instead of
+    starting fresh.
+    Fix: cut right before the LAST {"type":"user",...} line in the transcript — that is
+    the start of whatever turn the mother is currently mid-response to. Everything before
+    it (completed prior exchanges) is kept so context isn't lost, but the in-flight
+    unanswered turn itself is excluded.
+    Returns the new file's session id (stem) on success, None if no user turn was found
+    (nothing to cut — e.g. mother hasn't received any message yet) or on I/O error."""
+    import uuid as _uuid_trunc2
+    try:
+        lines = transcript_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        cut_idx = None
+        for i in range(len(lines) - 1, -1, -1):
+            try:
+                entry = json.loads(lines[i])
+            except Exception:
+                continue
+            if isinstance(entry, dict) and entry.get("type") == "user":
+                cut_idx = i
+                break
+        if cut_idx is None:
+            return None  # no user turn found — nothing safe to cut, caller falls back
+        kept = lines[:cut_idx]
+        if not kept:
+            return None  # nothing precedes it — forking an empty transcript is pointless
+        new_sid = str(_uuid_trunc2.uuid4())
+        new_path = transcript_path.parent / f"{new_sid}.jsonl"
+        new_path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+        return new_sid
+    except Exception:
+        return None
+
+
 def _mother_fork_args(proj_id: str, proj_dir: str) -> list:
     """M1656-fork: return ['--resume', <mother_sid>, '--fork-session'] so a branched child
     session inherits the mother conversation's full context while writing to its OWN new
@@ -5797,7 +5983,13 @@ def _mother_fork_args(proj_id: str, proj_dir: str) -> list:
     M1679: if the mother is currently busy with an in-flight stone, fork from a
     truncated COPY that ends right before that stone's assignment (see
     _truncate_transcript_before_stone) instead of her live, in-progress conversation —
-    the child then starts its own turn clean instead of finishing the mother's work."""
+    the child then starts its own turn clean instead of finishing the mother's work.
+    M1780: extended to the no-stone-claim case — a mother busy from a direct interactive
+    conversation (stone_id is None, e.g. answering a user's question, exactly the shape
+    of session that originally forked THIS fix's own work) previously fell straight
+    through to the raw, untruncated fork since the M1679 condition never fired without a
+    stone_id. Falls back to cutting before her last unanswered user turn instead (see
+    _truncate_transcript_before_last_user_turn)."""
     try:
         hist_file = PROJECTS_DIR / proj_id / ".session-history.json"
         if hist_file.exists():
@@ -5809,14 +6001,17 @@ def _mother_fork_args(proj_id: str, proj_dir: str) -> list:
                          / _encode_cwd_for_claude(str(proj_dir)) / f"{sid}.jsonl")
                     if t.exists() and t.stat().st_size > 0:
                         try:
-                            _agent_mfa = _get_project_agent_value(proj_id)
-                            _mother_sess = f"{_agent_mfa}-exec-{proj_id}"
+                            # M1796: mother session now has UUID suffix — look up live session name
+                            _mother_sess = _live_exec_session_name(proj_id) or f"{_get_project_agent_value(proj_id)}-exec-{proj_id}"
                             _mrec = _agent_busy_sessions.get(_mother_sess) or {}
                             _mother_stone = _mrec.get("stone_id")
-                            if _mother_stone and _session_is_busy(_mother_sess):
-                                _cut_sid = _truncate_transcript_before_stone(t, _mother_stone)
+                            if _session_is_busy(_mother_sess):
+                                if _mother_stone:
+                                    _cut_sid = _truncate_transcript_before_stone(t, _mother_stone)
+                                else:
+                                    _cut_sid = _truncate_transcript_before_last_user_turn(t)
                                 if _cut_sid:
-                                    _server_log_action(proj_id, _mother_stone, "exec:fork_truncated",
+                                    _server_log_action(proj_id, _mother_stone or "", "exec:fork_truncated",
                                                        f"mother:{_mother_sess} orig_sid:{sid} cut_sid:{_cut_sid}")
                                     return ["--resume", _cut_sid, "--fork-session"]
                         except Exception:
@@ -5911,28 +6106,48 @@ def _exec_session_names(proj_id: str) -> list:
 
 
 def _live_exec_session_name(proj_id: str) -> str:
-    """Return the first running exec session name for a project, if any."""
+    """Return the first running exec session name for a project, if any.
+    M1796: sessions now have UUID suffix — no predictable fallback name exists when none are
+    running. Returns empty string in that case; callers must handle the no-session state."""
     for candidate in _exec_session_names(proj_id):
         check = subprocess.run(["tmux", "has-session", "-t", f"={candidate}"], capture_output=True, timeout=2)
         if check.returncode == 0:
             return candidate
-    return f"{_get_project_agent_value(proj_id)}-exec-{proj_id}"
+    return ""
 
 
-def _kill_all_exec_sessions(proj_id: str, spare_children: bool = False) -> None:
-    """M206: kill ALL agent-prefixed exec sessions for a project.
+def _owning_exec_session_name(proj_id: str, milestone: dict, proj: dict = None) -> str:
+    """M131-b-followup: resolve the session that OWNS a stone via its substar's
+    assigned_session, falling back to _live_exec_session_name only when the stone has no
+    substar or the substar has no assigned session. M1796: no predictable main-session name
+    exists — _live_exec_session_name returns the first live session from tmux discovery."""
+    _sid_own = (milestone.get("substar_id") or "").strip() if isinstance(milestone, dict) else ""
+    if _sid_own:
+        if proj is None:
+            proj = _db_load_project(proj_id) or {}
+        for _ns_own in (proj.get("north_stars") or []):
+            if isinstance(_ns_own, dict) and _ns_own.get("id") == _sid_own:
+                _owner = (_ns_own.get("assigned_session") or "").strip()
+                if _owner:
+                    return _owner
+                break
+    return _live_exec_session_name(proj_id)
+
+
+def _kill_all_exec_sessions(proj_id: str, spare: set = None) -> list:
+    """M206: kill agent-prefixed exec sessions for a project.
     Prevents duplicate panes when agent changes (e.g. claude-exec + openrouter-exec both alive).
     M1087: also kills custom assigned_session values from substars (sess- or any non-exec pattern).
-    M1656-R3: spare_children=True → branched child sessions ({agent}-exec-{proj}-{suffix})
-    are NOT killed and their substar assignments are preserved. Used by dispatch-time
-    respawn of the MAIN session — a mother respawn must never take down working children.
+    M1797: mother/child distinction removed — all sessions are peers, so sparing is no longer
+    an is_child predicate. M1797-followup: callers that only mean to replace ONE session (e.g.
+    respawning the session whose options changed) must pass spare={that other alive sessions'
+    names} — otherwise every unrelated, healthy sibling session for the project gets killed too
+    (regression found in M1797 self-audit: a plain model/agent change on one dispatch target was
+    wiping every other working session in the project).
     M1656-R3: kill uses tmux exact-match (=name) — plain -t does PREFIX matching, so
     killing a dead 'claude-exec-MOAT' silently killed 'claude-exec-MOAT-Marketing'."""
     killed = []
-
-    def _is_child(sess: str) -> bool:
-        _ag, _pid = _parse_exec_session_name(sess)
-        return bool(_pid) and sess != f"{_ag}-exec-{_pid}"
+    _spare = spare or set()
 
     # Collect custom assigned sessions from substars before clearing them
     extra_sessions: list = []
@@ -5951,7 +6166,7 @@ def _kill_all_exec_sessions(proj_id: str, spare_children: bool = False) -> None:
         if s not in all_candidates:
             all_candidates.append(s)
     for candidate in all_candidates:
-        if spare_children and _is_child(candidate):
+        if candidate in _spare:
             continue
         # =name → exact target match only (no prefix fallback)
         r = subprocess.run(["tmux", "kill-session", "-t", f"={candidate}"], capture_output=True, timeout=5)
@@ -5961,7 +6176,7 @@ def _kill_all_exec_sessions(proj_id: str, spare_children: bool = False) -> None:
         _exec_idle_count.pop(candidate, None)
         _exec_was_running.pop(candidate, None)
     if killed:
-        _server_log_action(proj_id, "", "exec:kill", f"sessions:{','.join(killed)}{' (children spared)' if spare_children else ''}")
+        _server_log_action(proj_id, "", "exec:kill", f"sessions:{','.join(killed)}{f' (spared {len(_spare)})' if _spare else ''}")
     # M985/M1656-R3: clear assigned_session ONLY for substars whose session was actually
     # killed — spared children keep their assignments (prevents auto-assign absorption).
     try:
@@ -5973,7 +6188,7 @@ def _kill_all_exec_sessions(proj_id: str, spare_children: bool = False) -> None:
                 if not isinstance(ns, dict):
                     continue
                 _a = (ns.get("assigned_session") or "").strip()
-                if _a and (_a in killed or not spare_children):
+                if _a and _a in killed:
                     ns["assigned_session"] = None
                     changed = True
             if changed:
@@ -5982,6 +6197,7 @@ def _kill_all_exec_sessions(proj_id: str, spare_children: bool = False) -> None:
                 _parse_cache.pop(str(PROJECTS_DIR / proj_id / "north-star.md"), None)
     except Exception:
         pass
+    return killed
 
 
 def _substar_session_name(proj_id: str, substar_id: str) -> str:
@@ -6385,6 +6601,22 @@ async def get_north_stars(proj_id: str):
     return JSONResponse({"ok": True, "north_stars": fallback_ns})
 
 
+@app.get("/api/northstar/{proj_id}/north-stars/{ns_id}/last-worked-session")
+async def get_last_worked_session(proj_id: str, ns_id: str):
+    """M1787: pure read — surfaces the "직전 세션" (last-worked session) candidate for an
+    unassigned substar, for the sess popup to show as a clearly-labeled pick rather than
+    something the server auto-assigns/auto-spawns on its own (M1780: no silent auto-spawn on
+    unassigned; a human should see and choose). Never writes assigned_session, never spawns —
+    same _last_worked_session_for_substar lookup used server-side, just exposed read-only."""
+    _active = _db_get_active_milestones(proj_id) or []
+    _last = _last_worked_session_for_substar(proj_id, ns_id, _active)
+    if not _last:
+        return JSONResponse({"ok": True, "session_name": None})
+    _name, _sid = _last
+    return JSONResponse({"ok": True, "session_name": _name, "resumable_sid": _sid or None,
+                         "is_live": _tmux_session_alive(_name)})
+
+
 @app.post("/api/northstar/{proj_id}/north-stars")
 async def add_north_star(proj_id: str, request: Request):
     """M204: Add a new sub-star (north star entry) to the project."""
@@ -6479,9 +6711,9 @@ async def update_north_star(proj_id: str, ns_id: str, request: Request):
     if not ns:
         return JSONResponse({"ok": False, "error": "north-star not found"}, status_code=404)
     _old_assigned = (ns.get("assigned_session") or "").strip()
-    for field in ("name", "metric", "target", "current", "status", "default_agent", "assigned_session", "branch_from_session_id"):
+    for field in ("name", "metric", "target", "current", "status", "default_agent", "assigned_session"):
         if field in data:
-            ns[field] = data[field] or None if field in ("default_agent", "assigned_session", "branch_from_session_id") else data[field]
+            ns[field] = data[field] or None if field in ("default_agent", "assigned_session") else data[field]
     proj["north_stars"] = ns_list
     # M1745: Assign panel's agent/model picker — request-scoped only (not persisted on the
     # substar), consumed below by the assign-spawn block. "" falls back to claude / project model.
@@ -6493,6 +6725,18 @@ async def update_north_star(proj_id: str, ns_id: str, request: Request):
     # M1656-①: Assign button → auto-spawn if session is dead so M1095 poller doesn't wipe it
     _new_assigned = (ns.get("assigned_session") or "").strip()
     if _new_assigned and _new_assigned != _old_assigned:
+        # M1809-assign: same UUID-suffix guard as branch-spawn — legacy names (no 8-char suffix)
+        # get a fresh UUID-suffixed name here too, so assign-button spawns never create bare
+        # 'claude-exec-{proj_id}' sessions that break _parse_exec_session_name (M1770 re-risk).
+        import uuid as _uuid_asn, re as _re_asn
+        if not _re_asn.search(r'-exec-[^-]+-[0-9a-f]{8}$', _new_assigned):
+            _asn_uuid = str(_uuid_asn.uuid4()).replace("-", "")[:8]
+            _asn_new = f"claude-exec-{proj_id}-{_asn_uuid}"
+            ns["assigned_session"] = _asn_new
+            proj["north_stars"] = ns_list
+            _save_project(proj_id, proj)
+            _server_log_action(proj_id, ns_id, "exec:assign_sess_renamed", f"{_new_assigned}→{_asn_new}")
+            _new_assigned = _asn_new
         try:
             _chk = subprocess.run(["tmux", "has-session", "-t", f"={_new_assigned}"],
                                    capture_output=True, timeout=2)
@@ -6517,24 +6761,58 @@ async def update_north_star(proj_id: str, ns_id: str, request: Request):
                            "-e", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80"]  # M1656-R8: children rely on CLI auto-compact
                 for _k, _v in _get_project_spawn_env(proj_id, override_model=_sp_override_model).items():
                     _sp_env += ["-e", f"{_k}={_v}"]
-                # M1656-fork: inherit mother conversation context via fork (fallback --continue)
-                _sp_resume_args = _mother_fork_args(proj_id, _spawn_cwd)
+                # M1787: if the session name being (re)assigned matches a resumable transcript
+                # this exact name previously owned (the "직전 세션" candidate M1780 asked to
+                # surface in the sess popup instead of auto-spawning it), resume THAT transcript
+                # directly — --resume <sid>, not a mother-fork. A human explicitly picking "last
+                # worked session X" wants X's own conversation back, not a fresh branch off
+                # whatever mother happens to be doing right now.
+                _sp_active_ms = _db_get_active_milestones(proj_id) or []
+                _sp_last = _last_worked_session_for_substar(proj_id, ns_id, _sp_active_ms)
+                if _sp_last and _sp_last[0] == _new_assigned and _sp_last[1]:
+                    _sp_resume_args = ["--resume", _sp_last[1]]
+                else:
+                    # M1656-fork: inherit mother conversation context via fork (fallback --continue)
+                    _sp_resume_args = _mother_fork_args(proj_id, _spawn_cwd)
+                # M1775: when actually forking (--fork-session present), pre-assign the new
+                # session id via --session-id <uuid> instead of polling the transcript dir for
+                # the new file — verified via `claude --help` + live test that --session-id
+                # composes with --resume/--fork-session and the transcript is written to
+                # exactly that UUID's .jsonl. Eliminates the capture race entirely for this
+                # path. --continue fallback (no fork) is untouched — that path's session id
+                # is the CLI's own concern (continuation semantics), not ours to pre-assign.
+                _sp_presigned_sid = ""
+                if "--fork-session" in _sp_resume_args:
+                    import uuid as _uuid_sp
+                    _sp_presigned_sid = str(_uuid_sp.uuid4())
+                    _sp_resume_args = [*_sp_resume_args, "--session-id", _sp_presigned_sid]
                 # M1656-R9: session-scoped spawn-info record — was never written for children,
                 # so their exec-pane badge always showed "— unknown" instead of ↻ fork/resume.
                 _record_spawn_info(proj_id, _sp_resume_args, agent=_sp_agent, session_name=_new_assigned,
                                    model=_sp_override_model or _get_project_model_value(proj_id) or "")
-                # Snapshot BEFORE spawn so the bg capture can find the one file THIS spawn creates
-                try:
-                    _sp_pre_files = {f.name for f in (Path.home() / ".claude" / "projects"
-                                     / _encode_cwd_for_claude(str(_spawn_cwd))).glob("*.jsonl")}
-                except Exception:
-                    _sp_pre_files = set()
+                _sp_tdir = Path.home() / ".claude" / "projects" / _encode_cwd_for_claude(str(_spawn_cwd))
+                _sp_pre_files: set = set()
+                _sp_marker = None
+                if not _sp_presigned_sid:
+                    # Non-fork fallback (--continue): keep the polling capture for this case.
+                    # Snapshot BEFORE Popen so the bg capture can find the one file THIS spawn
+                    # creates (M1762-b: capturing after Popen risks a 0-diff on a fast boot).
+                    try:
+                        _sp_pre_files = {f.name for f in _sp_tdir.glob("*.jsonl")}
+                    except Exception:
+                        _sp_pre_files = set()
+                    _sp_marker = _write_spawn_marker(_sp_tdir, _new_assigned)
                 _sp_cmd = (["claude", "--dangerously-skip-permissions"] + _DISALLOWED_TOOLS_ARGS
                            + _hub_mcp_spawn_args(proj_id, _new_assigned, agent=_sp_agent)
                            + _sp_resume_args + _get_project_model(proj_id, override_model=_sp_override_model))
                 subprocess.Popen(["tmux", "new-session", "-d", "-s", _new_assigned, "-c", _spawn_cwd]
                                  + _sp_env + _sp_cmd)
-                _capture_live_session_id_bg(proj_id, _spawn_cwd, _new_assigned, _sp_pre_files)
+                subprocess.run(["tmux", "set-option", "-t", _new_assigned, "history-limit", "2000"],
+                               capture_output=True, timeout=2)  # M1757: parity with branch/fork
+                if _sp_presigned_sid:
+                    _write_sid_direct(proj_id, _new_assigned, _sp_presigned_sid)
+                else:
+                    _capture_live_session_id_bg(proj_id, _spawn_cwd, _new_assigned, _sp_pre_files, spawn_marker=_sp_marker)
                 # M1656-R8 (user decision): no server-side compact gating — Claude's
                 # built-in auto-compact (CLAUDE_AUTOCOMPACT_PCT_OVERRIDE) handles full context.
                 # M1678: readiness-gated unified wake (was blind send-keys during boot)
@@ -6551,6 +6829,15 @@ async def update_north_star(proj_id: str, ns_id: str, request: Request):
                     "reason": "assign_spawn_init", "ts": time.time()
                 }
                 _ns_push("session_update", proj_id=proj_id)
+            else:
+                # M1799: session already alive — the old code path had no wake here.
+                # The poller eventually fires (up to 90s dedup window), but if user just
+                # re-assigned an idle alive session to a queued stone, the session should
+                # pick it up immediately. force_dedup_reset=True clears any stale
+                # _wake_last_sent[_new_assigned] from before the reassignment.
+                if _session_claimable_queued_count(proj_id, _new_assigned) > 0:
+                    _send_exec_wake(_new_assigned, proj_id, force_dedup_reset=True)
+                    _server_log_action(proj_id, ns_id, "exec:assign_wake", _new_assigned)
         except Exception as _e:
             _server_log_action(proj_id, ns_id, "exec:assign_spawn_err", str(_e)[:120])
 
@@ -6693,7 +6980,7 @@ async def generate_substar_agent(proj_id: str, ns_id: str, request: Request):
             f"2. **Clarity over cleverness** — prefer explicit, well-reasoned outputs over clever shortcuts.",
             f"3. **Evidence-anchored** — back recommendations with data, examples, or established frameworks.",
             f"4. **Iterative refinement** — surface ambiguities early; confirm scope before full execution.",
-            f"5. **Concise reporting** — completion messages are 1 line, past tense, no preamble.",
+            f"5. **Concise reporting** — completion messages are ≤3 lines, past tense, no preamble (1 line ideal; 3 lines hard cap).",
             f"",
             f"## NS Hub Completion Protocol",
             f"",
@@ -6705,7 +6992,7 @@ async def generate_substar_agent(proj_id: str, ns_id: str, request: Request):
             f'  "model_used": "<model-id>",',
             f'  "exec_start": "<ISO timestamp>",',
             f'  "exec_end": "<ISO timestamp>",',
-            f'  "append_message": {{"role": "claude", "text": "<1-line past-tense result>"}}',
+            f'  "append_message": {{"role": "claude", "text": "<≤3-line past-tense result>"}}',
             f"}}",
             f"```",
         ]
@@ -6734,7 +7021,7 @@ async def generate_substar_agent(proj_id: str, ns_id: str, request: Request):
             f"## Execution Protocol",
             f"1. Read the full stone text before acting.",
             f"2. Implement the task completely.",
-            f"3. PATCH `status=pending_confirmation` with `append_message` (<=1 line, past tense).",
+            f"3. PATCH `status=pending_confirmation` with `append_message` (≤3 lines, past tense; 1 line ideal).",
             f"4. Include `model_used`, `exec_start`, `exec_end` in the same PATCH.",
         ]
 
@@ -6823,13 +7110,63 @@ async def claim_task_for_session(proj_id: str, request: Request):
         ).fetchall()
         stones = [json.loads(r[0]) for r in rows]
         # Filter: not held, has text, and not claimed by ANOTHER session within TTL (120s)
-        _claim_ttl = 120.0
+        _claim_ttl = _CLAIM_TTL_SECS
         _now_c = time.time()
 
         def _claim_blocked(m: dict) -> bool:
             _cb = (m.get("claimed_by_session") or "").strip()
             _ca = m.get("claimed_at") or 0
-            return bool(_cb and _cb != session_name and (_now_c - _ca) < _claim_ttl)
+            if _cb and _cb != session_name and (_now_c - _ca) < _claim_ttl:
+                return True
+            # M1783: same-session re-claim while still actively working the SAME task.
+            # Status stays 'queued' by design (no in_progress UI state), so a stone
+            # this exact session already claimed is otherwise indistinguishable from
+            # a fresh one once _claim_ttl (120s) elapses — a stray wake mid-work
+            # (e.g. landing right after a compaction boundary while a background
+            # subagent, like expert-research's Fact Finder, is still in flight) then
+            # re-claims and re-runs the same task.
+            # M1785 fix: this must NOT block a legitimate re-claim to answer a NEW user
+            # reply posted on a stone the session already owns (long-lived exec sessions
+            # revisit their own stones constantly across a REPLY-SYNC cycle) — observed on
+            # FromScratch M117, where a real "현재 aft 상태 확인" follow-up got silently
+            # swallowed because the owning session was transiently busy with other work.
+            # Only block when there's no conversation activity after claimed_at — i.e. the
+            # stone genuinely has nothing new since this session last picked it up.
+            # M1803 fix: same-session busy-state alone is not proof the claim is real —
+            # _session_is_busy also returns True for a "wake_sent" optimistic record set the
+            # instant _send_exec_wake injects a wake, purely so the poller doesn't double-wake
+            # while the just-woken session is still mid-claim (M1675). That record has nothing
+            # to do with whether THIS claim is actually still in flight. Root cause traced
+            # further: no kill path in this file clears claimed_by_session when a session dies
+            # (only assigned_session, at the substar level, gets cleared — server.py's own
+            # _kill_all_exec_sessions). Since this hub always respawns under the exact same
+            # deterministic tmux name, a session killed mid-claim leaves a claim that the
+            # respawned process (same name) can never distinguish from "I claimed this a
+            # moment ago" without an explicit staleness check — the cross-session branch above
+            # already has one (_claim_ttl), the same-session branch didn't. Require the claim to
+            # still be within _claim_ttl before even considering it a same-session in-flight
+            # candidate; past that window, wake_sent's momentary busy=true must not resurrect a
+            # claim whose owning process may well be dead. Observed live: MOAT M1782, killed
+            # mid-work, respawned under the identical tmux name, then blocked from re-claiming
+            # its own inherited stone for 15+ min despite the poller correctly reporting
+            # queued_count:1 every cycle — claimed_at was ~1000s old, far past _claim_ttl.
+            if _cb == session_name and (_now_c - _ca) < _claim_ttl and _session_is_busy(session_name):
+                import datetime as _dt_claim
+                _conv_m = m.get("conversation") or []
+                _has_new_activity = False
+                for c in _conv_m:
+                    if not isinstance(c, dict):
+                        continue
+                    try:
+                        _c_ts = _dt_claim.datetime.fromisoformat((c.get("ts") or "").replace("Z", "+00:00")).timestamp()
+                    except Exception:
+                        continue
+                    if _c_ts > _ca:
+                        _has_new_activity = True
+                        break
+                if not _has_new_activity:
+                    return True
+            return False
 
         candidates = [m for m in stones
                       if not m.get("held") and str(m.get("text", "")).strip()
@@ -6848,11 +7185,7 @@ async def claim_task_for_session(proj_id: str, request: Request):
             _sid = (m.get("substar_id") or "").strip()
             return _substar_session.get(_sid, "") if _sid else ""
 
-        # M1656-R4: children claim ONLY their own substar's stones. The free pool
-        # (no substar / unassigned substar) belongs to the MAIN session — a mother's
-        # stone must be worked by the mother, never work-stolen by an idle child.
-        _ag_c, _pid_c = _parse_exec_session_name(session_name) if session_name else ("", "")
-        _is_child_session = bool(_pid_c) and session_name != f"{_ag_c}-exec-{_pid_c}"
+        # M1797: mother/child concept removed — all sessions can claim free-pool stones.
 
         stone = None
         if session_name:
@@ -6861,8 +7194,8 @@ async def claim_task_for_session(proj_id: str, request: Request):
                 if _stone_session(m) == session_name:
                     stone = m
                     break
-            # Second (MAIN session only): free-pool stones (no substar / unassigned substar)
-            if stone is None and not _is_child_session:
+            # Second: free-pool stones (no substar / unassigned substar)
+            if stone is None:
                 for m in candidates:
                     if not _stone_session(m):
                         stone = m
@@ -6874,6 +7207,19 @@ async def claim_task_for_session(proj_id: str, request: Request):
 
         if stone is None:
             conn.close()
+            # M1800: log the empty-handed case with the received session_name — previously
+            # only the success/race-lost paths logged anything, so a claim-task call that
+            # silently returned nothing left no trace of what session_name it actually saw.
+            # This mattered concretely: MOAT's claude-exec-MOAT called get_pending_task 11x
+            # in a row with queued_count:1 confirmed by the poller each time, all returning
+            # has_task:false, while a manual curl with session_name="claude-exec-MOAT" (the
+            # supposedly-correct value) succeeded immediately — with no log of what session_name
+            # the live calls actually sent, the mismatch (if any) was unprovable after the fact.
+            _server_log_action(
+                proj_id, "", "task:claim_empty",
+                f"session:{session_name or '(empty)'} candidates:{len(candidates)} "
+                f"assigned_substars:{sorted(_substar_session.values())}"
+            )
             return JSONResponse({"has_task": False, "queued_count": 0})
 
         # Claim via TTL fields only — status remains 'queued' (UI-safe)
@@ -7391,8 +7737,8 @@ async def create_milestone(proj_id: str, request: Request, background_tasks: Bac
             if isinstance(_ns_cw, dict) and _ns_cw.get("id") == new_ms.get("substar_id"):
                 _assigned_cw = (_ns_cw.get("assigned_session") or "").strip()
                 break
-        _agent_cw = _get_project_agent_value(proj_id)
-        _target_cw = _assigned_cw or f"{_agent_cw}-exec-{proj_id}"
+        # M1796: main session has UUID suffix — use live session name instead of hardcoded base name
+        _target_cw = _assigned_cw or _live_exec_session_name(proj_id) or ""
 
         def _stone_create_dispatch(_sn=_target_cw, _pid=proj_id, _mid=new_id):
             try:
@@ -8148,6 +8494,16 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                                 f"  4. DO NOT change status — this reply does NOT advance the stone lifecycle.\n"
                                 f"  5. If reply needs more than 3 lines: write docs/ns-replies/<DATE>-{mid}.md and reference path.\n"
                                 f"  6. M270: No follow-up questions unless genuinely missing critical info.\n"
+                                f"  7. M1781: Do NOT post a 'working on this now / will update soon' progress-narration "
+                                f"reply — ns-comment-reply-protocol.md Rule 2/anti-patterns forbids it. If the work "
+                                f"genuinely isn't done yet, either answer what's answerable now or stay silent until "
+                                f"it's truly done; posting a premature status reply consumes the ONE reply slot "
+                                f"(M190 blocks claude→claude — you cannot post a second reply until the user responds "
+                                f"again) and leaves the real completion report with nowhere to go.\n"
+                                f"  8. M1781: If M190 (claude_self_reply_blocked) rejects your append_message because "
+                                f"you already replied, that ONLY blocks the reply text — attach_evidence_url(task_id, "
+                                f"evidence_url) is a separate call with no M190 gate and still works. Never skip "
+                                f"attaching evidence just because the reply itself is blocked.\n"
                                 f"Mandatory — do this BEFORE any other queued work."
                             ),
                         }, ensure_ascii=False)
@@ -8161,9 +8517,12 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                         if check.returncode == 0:
                             try:
                                 # M1656-fix (option②): check this specific session's own reported state.
-                                _oob_idle = not _oob_is_busy(proj_id, session_name)
+                                # M1806: session-scoped variant — no unbounded sibling-busy inheritance
+                                # for a cold-start session with no record of its own.
+                                _oob_idle = not _oob_is_busy_session_scoped(proj_id, session_name)
                                 if _oob_idle:
-                                    if _send_exec_wake(session_name, proj_id, force_dedup_reset=True):
+                                    if _send_exec_wake(session_name, proj_id, force_dedup_reset=True,
+                                                       _force_viewer_bypass=True):  # M1765: user comment wake
                                         _ns_push("session_running", proj_id=proj_id, kind="exec")
                             except Exception:
                                 pass
@@ -8561,7 +8920,15 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                 _extract_knowledge_object(proj_id, m)
             # Old-style done=False (from auto-ack) — treat as pending
             elif data.get("done") is False:
-                if m.get("status") != "queued":
+                _restore_status = data.get("status")
+                if _restore_status == "pending_confirmation":
+                    # M1769: explicit restore-to-pc; preserve pending_confirm_at if present
+                    m["status"] = "pending_confirmation"
+                    if "pending_confirm_at" in data:
+                        m["pending_confirm_at"] = data["pending_confirm_at"]
+                    elif not m.get("pending_confirm_at"):
+                        m["pending_confirm_at"] = now_iso
+                elif m.get("status") != "queued":
                     m["status"] = "pending"
                 m["done"] = False
             updated = True
@@ -8645,7 +9012,13 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                 if isinstance(_ns_qd, dict) and _ns_qd.get("id") == _sid_qd:
                     _owner_sess_qd = (_ns_qd.get("assigned_session") or "").strip()
                     break
-        _agent_idle = not _oob_is_busy(proj_id, _owner_sess_qd or None)  # M1574: TTL-aware, session-scoped
+        # M1806: session-scoped variant when a specific owner is known (no unbounded
+        # sibling-busy inheritance); unassigned substar (_owner_sess_qd empty) keeps the
+        # original project-wide aggregation via _oob_is_busy(proj_id) — that fallback is
+        # intentional here (no specific session to scope to), unlike the two call sites
+        # above that had a real session_name being defeated by the sibling-scan fallback.
+        _agent_idle = (not _oob_is_busy_session_scoped(proj_id, _owner_sess_qd)) if _owner_sess_qd \
+            else (not _oob_is_busy(proj_id))
         if _agent_idle:
             # M1633-fix: reopen path (prev status was non-queued, e.g. pending_confirmation→queued
             # via user comment) must reset dedup so the stone is dispatched immediately even if a
@@ -8658,11 +9031,12 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                         if _tmux_session_alive(_owner):
                             _send_exec_wake(_owner, proj_id, force_dedup_reset=_is_reopen)
                         return
+                    # M1797: all sessions are peers — wake the first alive session for this project.
                     ls = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"], capture_output=True, text=True, timeout=2)
                     for sn in (ls.stdout or "").splitlines():
                         sn = sn.strip()
                         for prefix in ("claude-exec-", "openrouter-exec-", "codex-exec-", "dsk-exec-"):
-                            if sn.startswith(prefix) and sn[len(prefix):] == proj_id:
+                            if sn.startswith(prefix + proj_id):
                                 _send_exec_wake(sn, proj_id, force_dedup_reset=_is_reopen)
                                 return
                 except Exception:
@@ -9004,6 +9378,14 @@ async def get_tmux_output(proj_id: str, lines: int = 20, tmux_session: str = "")
         subprocess.run, ["tmux", "has-session", "-t", f"={session_name}"], capture_output=True, timeout=2)
     if check.returncode != 0:
         return JSONResponse({"ok": False, "running": False, "output": ""})
+    # M1763: mark this session as actively watched via HTTP poll — _send_exec_wake checks
+    # this registry alongside tmux list-clients so wake injection is suppressed either way.
+    # M1765: only set viewer gate when user has the full terminal panel open (explicit
+    # tmux_session param). The ?lines=15 call (no tmux_session) is the NS-card API-error
+    # health check — background poll, not active viewing. Treating it as "watching" falsely
+    # blocked wakes when the user wasn't at the terminal.
+    if tmux_session.strip():
+        _tmux_output_viewers[session_name] = time.time()
     # Capture pane output
     result = await asyncio.to_thread(
         subprocess.run,
@@ -9189,6 +9571,65 @@ def _find_unassigned_substars(queued_stones: list, ns_list: list) -> tuple:
     return unassigned_ids, unassigned_names
 
 
+def _last_worked_session_for_substar(proj_id: str, substar_id: str, all_stones: list) -> tuple[str, str] | None:
+    """M1786: when a substar has no assigned_session (fresh, or cleared by a kill), prefer
+    re-assigning the session that most recently worked one of its stones over grabbing
+    whichever idle session happens to be polling. Returns (session_name, resume_sid) —
+    resume_sid is "" when the session is still alive (no explicit --resume needed) or when
+    it's dead but has no recoverable transcript. Returns None if no viable candidate is
+    found at all — callers must fall back to their existing auto-assign behavior.
+
+    Judged by: the most recent claimed_by_session value across this substar's stones
+    (per user direction — not assigned_session itself, which may already be cleared).
+
+    'Resumable' means either:
+      - a live tmux session by that exact name still exists, OR
+      - .spawn-info-by-session.json has a live_session_id for that name AND the matching
+        .jsonl transcript still exists on disk (so a deterministic-name respawn can
+        --resume it and pick the conversation back up).
+    Does not itself spawn or PATCH anything — pure lookup, side-effect free.
+    """
+    import re as _re_lws
+    # M1828: only consider UUID-suffixed session names (M1796 invariant).
+    # Legacy suffix-less names (claude-exec-PROJ) in claimed_by_session are stale pre-M1796
+    # records — skip them so the UI doesn't surface a dead/unresumable suffix-less session
+    # as "last session" in the sess badge popup.
+    _uuid_suffix_pat = _re_lws.compile(r'-exec-[^-]+-[0-9a-f]{8}$')
+    candidates: list[tuple[float, str]] = []  # (claimed_at, session_name)
+    for m in all_stones:
+        if not isinstance(m, dict) or (m.get("substar_id") or "") != substar_id:
+            continue
+        _cb = (m.get("claimed_by_session") or "").strip()
+        if not _cb:
+            continue
+        if not _uuid_suffix_pat.search(_cb):
+            continue  # M1828: skip legacy suffix-less session names
+        candidates.append((m.get("claimed_at") or 0, _cb))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    _last_session = candidates[0][1]
+
+    if _tmux_session_alive(_last_session):
+        return (_last_session, "")
+
+    _si = _read_spawn_info(proj_id, _last_session)
+    _live_sid = _si.get("live_session_id") or _si.get("from_id") or ""
+    if not _live_sid:
+        return None
+    try:
+        _proj_dir = _get_project_dir(proj_id)
+        if not _proj_dir:
+            return None
+        _encoded = _encode_cwd_for_claude(str(_proj_dir))
+        _t = Path.home() / ".claude" / "projects" / _encoded / f"{_live_sid}.jsonl"
+        if _t.exists() and _t.stat().st_size > 0:
+            return (_last_session, _live_sid)
+    except Exception:
+        pass
+    return None
+
+
 def _awaits_user_reply(m: dict) -> bool:
     """M160: True when last conversation entry is from claude — user must reply before this stone may run.
 
@@ -9331,31 +9772,28 @@ async def execute_project(proj_id: str, request: Request):
         # M291: empty-text queued stones are excluded from dispatch — no content to act on.
         new_queued_top = [m for m in active_ms if m.get("status") == "queued" and not _awaits_user_reply(m) and not m.get("held") and str(m.get("text","")).strip()]
 
-        # M836.2 / M1097: auto-assign main session to ALL unassigned substars at dispatch time.
-        # Previously filtered to only substars with queued stones — now assigns all substars immediately
-        # so the session assignment is atomic with exec dispatch (not deferred to 30s poller).
-        _ns_list_early = proj.get("north_stars") or []
-        _early_agent = body_agent if body_agent in _ALLOWED_AGENTS else _get_project_agent_value(proj_id)
-        _main_sess_name = f"{_early_agent}-exec-{proj_id}"
-        _assigned_names_early = []
-        _changed_early = False
-        for _ns in _ns_list_early:
-            if not isinstance(_ns, dict): continue
-            if not (_ns.get("assigned_session") or "").strip():
-                _ns["assigned_session"] = _main_sess_name
-                _assigned_names_early.append(_ns.get("name") or (_ns.get("id") or "")[-8:])
-                _changed_early = True
-        if _changed_early:
-            proj["north_stars"] = _ns_list_early
-            try:
-                _save_project(proj_id, proj)
-            except Exception:
-                pass
-            _server_log_action(proj_id, "", "exec:auto_assign_main",
-                               f"dispatch-time assign: {','.join(_assigned_names_early)} → {_main_sess_name}")
-
         agent = body_agent if body_agent in _ALLOWED_AGENTS else _get_project_agent_value(proj_id)
-        session_name = f"{agent}-exec-{proj_id}"
+        # M1796: every ▶ spawn creates a uniquely-named session using the session UUID as suffix
+        # (like fork sessions), eliminating the "main session" special-name concept entirely.
+        # - Resume row click: explicit_session_id IS the UUID → suffix = uuid8
+        # - Fresh spawn: pre-sign a UUID now so suffix is deterministic before spawn
+        # Both cases: session_name = "{agent}-exec-{proj_id}-{uuid8}"
+        # NOTE: _presigned_main_sid is also read at L10734+ where the old presign logic lived;
+        # that block now reuses this value instead of generating a second UUID.
+        import uuid as _uuid_m1796
+        _eff_sid = (explicit_session_id or "").strip()
+        if _eff_sid and _eff_sid not in ("fresh", "_last", "last"):
+            # Resume: suffix from the selected session's UUID
+            _presigned_main_sid = _eff_sid
+        else:
+            # Fresh: generate UUID now (deterministic suffix before any spawning)
+            _presigned_main_sid = str(_uuid_m1796.uuid4())
+        _main_suffix = _presigned_main_sid.replace("-", "")[:8]
+        session_name = f"{agent}-exec-{proj_id}-{_main_suffix}"
+
+        # M1802: auto-assign removed — substars without assigned_session stay unassigned.
+        # User must manually assign via the sess popup. This prevents unexpected session routing.
+
         # M524.3: graceful Windows check — tmux not available on Windows native
         if not _HAS_PTY and sys.platform == "win32":
             return JSONResponse({
@@ -9392,20 +9830,27 @@ async def execute_project(proj_id: str, request: Request):
         for _pfx, _pfx_agent in _all_exec_prefixes:
             if _pfx_agent != agent:
                 # Only the OTHER agent's exact MAIN session name counts — never its branches.
-                _old_base = f"{_pfx}{proj_id}"
-                if _old_base in _live_sessions:
-                    _stale_agent_found = True
+                # M1796: sessions now have suffix — match any suffix variant of the other agent's main
+                _old_prefix = f"{_pfx}{proj_id}-"
+                _old_base_legacy = f"{_pfx}{proj_id}"
+                for _ls in _live_sessions:
+                    if _ls == _old_base_legacy or _ls.startswith(_old_prefix):
+                        # M1797: any session of a different agent is stale (no mother/child distinction)
+                        _stale_agent_found = True
+                        break
+                if _stale_agent_found:
                     break
-        # M1656-R5: stale detection counts only MAIN sessions across agents —
-        # e.g. claude-exec-X + openrouter-exec-X both alive = stale. Mother + her own
-        # children (same-agent OR cross-agent forks) is the NORMAL state, never stale.
-        if not _stale_agent_found:
-            _main_names = [f"{a}-exec-{proj_id}" for a in ("claude", "openrouter", "codex", "dsk")]
-            _alive_mains = [s for s in _live_sessions if s in _main_names]
-            if len(_alive_mains) > 1:
-                _stale_agent_found = True
+        # M1797-followup (M1797 bug found in M1797 self-audit): the "peer count > 1 = stale"
+        # rule above was wrong — it treated ANY two coexisting sessions for this project as
+        # stale, which kills legitimate multi-session assignments (e.g. two substars each
+        # assigned their own alive session) on every /execute call. M1656-R5/M1569 already
+        # established "two coexisting exec sessions is the NORMAL state, never stale" — that
+        # invariant was never mother/child-specific, so removing the mother/child concept in
+        # M1797 must not resurrect this false-positive kill. Multiple alive sessions are only
+        # stale when a DIFFERENT agent's session is alive (already handled above by
+        # _stale_agent_found); same-agent multi-session coexistence is intentional.
         if _stale_agent_found:
-            _kill_all_exec_sessions(proj_id, spare_children=True)  # M1656-R3: mother respawn must not kill children
+            _kill_all_exec_sessions(proj_id)  # M1797: no mother/child distinction — kill all stale sessions
         proj_dir = _get_project_dir(proj_id) or str(Path.home() / "Project" / proj_id)
 
         # M1096: badge-triggered execute must NOT spawn a dead session — only dispatch button may.
@@ -9448,23 +9893,32 @@ async def execute_project(proj_id: str, request: Request):
                         try:
                             _cur_agent = _si.get("agent", "claude")
                             _cur_model = _si.get("model", "")
-                            _cur_sid   = _si.get("from_id") or ""
+                            # M1796: match against live_session_id (covers both fresh --session-id
+                            # and resume --resume cases) rather than from_id alone (from_id is ""
+                            # for fresh sessions, causing false _options_changed=True on every
+                            # re-dispatch to the currently running fresh session).
+                            _cur_sid_live = _si.get("live_session_id") or _si.get("from_id") or ""
                             _new_agent = agent
                             _new_model = _get_project_model_value(proj_id) or ""
                             _new_sid   = explicit_session_id or ""
                             _options_changed = (
                                 _cur_agent != _new_agent or
                                 _cur_model != _new_model or
-                                (explicit_session_id and _cur_sid != _new_sid)
+                                (explicit_session_id and _cur_sid_live and _cur_sid_live != _new_sid)
                             )
                         except Exception:
                             pass
-                    # Explicit session choice must be honored. Do not inject into the
-                    # currently running tmux session when the user selected Fresh or a
-                    # specific prior session from the UI; restart below with that choice.
-                    if explicit_session_id or _options_changed:
-                        # M206: kill agent-prefixed sessions to prevent duplicate panes
-                        _kill_all_exec_sessions(proj_id, spare_children=True)  # M1656-R3
+                    # M1796: explicit_session_id is now ALWAYS provided (every session has a UUID
+                    # suffix). Kill+respawn only when options actually changed — not just because
+                    # the user clicked ▶ on the currently-running session's row (same uuid,
+                    # same model, same agent → inject without killing).
+                    if _options_changed:
+                        # M206: kill THIS session (options changed) — spare all OTHER alive sessions.
+                        # M1797-followup: kill only session_name; any sibling sessions for other
+                        # substars are unrelated and must survive this options-changed respawn.
+                        _spare_siblings = {s for s in _live_sessions if s != session_name
+                                           and f"-exec-{proj_id}" in s}
+                        _kill_all_exec_sessions(proj_id, spare=_spare_siblings)
                     else:
                         # Session alive with Claude running — inject trigger if milestones need attention
                         # M160: skip stones whose last conversation entry is from claude (awaiting user reply)
@@ -9553,7 +10007,7 @@ async def execute_project(proj_id: str, request: Request):
                                 f"  their text), dispatch them IN PARALLEL: emit multiple Agent / Task tool\n"
                                 f"  calls in a SINGLE message. Sub-agents share THIS session's token quota.\n"
                                 f"  After all parallel sub-agents return, you (the orchestrator) post ONE\n"
-                                f"  consolidated 1-line summary listing the completed MIDs.\n"
+                                f"  consolidated ≤3-line summary listing the completed MIDs.\n"
                                 f"  FALL BACK TO SEQUENTIAL when: (a) a substone whose mother is also queued\n"
                                 f"  (mother must wait — M468 commit-gate), (b) UI work needing the same\n"
                                 f"  browser session, (c) stones whose text references the same target file\n"
@@ -9596,7 +10050,7 @@ async def execute_project(proj_id: str, request: Request):
                                     f"COMPLETION — when each stone is done:\n"
                                     f"  mcp__ns-hub__report_task_complete(\n"
                                     f"    task_id='<MID>',\n"
-                                    f"    summary='<1-line past-tense>',\n"
+                                    f"    summary='<≤3-line past-tense>',\n"
                                     f"    evidence_url='<GDrive link>'  # REQUIRED if stone produced a file/image/doc/Excel/screenshot\n"
                                     f"  )\n"
                                     f"  RESULT UPLOAD (if artifact produced):\n"
@@ -9688,7 +10142,8 @@ async def execute_project(proj_id: str, request: Request):
                                 # courtesy boot-wake (found nothing queued, went idle) must not
                                 # block this now-genuinely-needed wake.
                                 try:
-                                    if _send_exec_wake(session_name, proj_id, force_dedup_reset=True):
+                                    if _send_exec_wake(session_name, proj_id, force_dedup_reset=True,
+                                                       _force_viewer_bypass=True):  # M1765: user-submitted stone
                                         _wake_sent = True
                                         _ns_push("session_running", proj_id=proj_id, kind="exec")
                                         _ns_push("milestone_updated", proj_id=proj_id)  # M1649: q-badge sync on dispatch
@@ -9727,6 +10182,30 @@ async def execute_project(proj_id: str, request: Request):
                                         continue
                                     if _br_check.returncode != 0:
                                         # M858 Stage 2: session dead → write prompt and spawn
+                                        # M1809: if _br_sess has no UUID suffix (legacy name pre-M1796),
+                                        # generate a new UUID-suffixed name and update assigned_session in DB
+                                        # so all future spawns for this substar use the consistent M1796 format.
+                                        import uuid as _uuid_br_m1809, re as _re_br_m1809
+                                        _br_suffix_pattern = _re_br_m1809.compile(r'-exec-[^-]+-[0-9a-f]{8}$')
+                                        if not _br_suffix_pattern.search(_br_sess):
+                                            _br_new_uuid = str(_uuid_br_m1809.uuid4()).replace("-", "")[:8]
+                                            _br_agent_pfx = agent or "claude"
+                                            _br_sess_new = f"{_br_agent_pfx}-exec-{proj_id}-{_br_new_uuid}"
+                                            # Update assigned_session in DB for all substars that pointed at the legacy name
+                                            try:
+                                                _br_proj_obj = _db_load_project(proj_id)
+                                                if _br_proj_obj:
+                                                    _br_changed = False
+                                                    for _br_ns_upd in (_br_proj_obj.get("north_stars") or []):
+                                                        if isinstance(_br_ns_upd, dict) and (_br_ns_upd.get("assigned_session") or "").strip() == _br_sess:
+                                                            _br_ns_upd["assigned_session"] = _br_sess_new
+                                                            _br_changed = True
+                                                    if _br_changed:
+                                                        _save_project(proj_id, _br_proj_obj)
+                                            except Exception:
+                                                pass
+                                            _server_log_action(proj_id, "", "exec:branch_sess_renamed", f"{_br_sess}→{_br_sess_new}")
+                                            _br_sess = _br_sess_new
                                         _br_short = _br_sess[-12:]
                                         _br_ns_ids = list(dict.fromkeys(m.get("substar_id","") for m in _br_stones if m.get("substar_id")))
                                         _br_ns_names = [(_ns_by_id_inj.get(sid) or {}).get("name") or sid[-8:] for sid in _br_ns_ids]
@@ -9755,13 +10234,24 @@ async def execute_project(proj_id: str, request: Request):
                                         # M1656-fork: fork from MOTHER conversation (--resume <sid> --fork-session)
                                         # so the child inherits mother context; falls back to --continue (M837-safe)
                                         _br_resume_args = _mother_fork_args(proj_id, _br_spawn_cwd)
+                                        # M1775: pre-assign session id when actually forking — see assign-spawn twin fix
+                                        _br_presigned_sid = ""
+                                        if "--fork-session" in _br_resume_args:
+                                            import uuid as _uuid_br
+                                            _br_presigned_sid = str(_uuid_br.uuid4())
+                                            _br_resume_args = [*_br_resume_args, "--session-id", _br_presigned_sid]
                                         # M1656-R9: session-scoped spawn-info record (see assign-spawn twin fix)
                                         _record_spawn_info(proj_id, _br_resume_args, agent="claude", session_name=_br_sess)
-                                        try:
-                                            _br_pre_files = {f.name for f in (Path.home() / ".claude" / "projects"
-                                                             / _encode_cwd_for_claude(str(_br_spawn_cwd))).glob("*.jsonl")}
-                                        except Exception:
-                                            _br_pre_files = set()
+                                        _br_tdir = Path.home() / ".claude" / "projects" / _encode_cwd_for_claude(str(_br_spawn_cwd))
+                                        _br_pre_files: set = set()
+                                        _br_marker = None
+                                        if not _br_presigned_sid:
+                                            try:
+                                                _br_pre_files = {f.name for f in _br_tdir.glob("*.jsonl")}
+                                            except Exception:
+                                                _br_pre_files = set()
+                                            # M1773-C: marker before Popen for ambiguity resolution
+                                            _br_marker = _write_spawn_marker(_br_tdir, _br_sess)
                                         _br_claude_cmd = (["claude", "--dangerously-skip-permissions"] + _DISALLOWED_TOOLS_ARGS
                                                           + _hub_mcp_spawn_args(proj_id, _br_sess)
                                                           + _br_resume_args + _get_project_model(proj_id))
@@ -9769,7 +10259,10 @@ async def execute_project(proj_id: str, request: Request):
                                             ["tmux", "new-session", "-d", "-s", _br_sess, "-c", _br_spawn_cwd]
                                             + _br_env + _br_claude_cmd
                                         )
-                                        _capture_live_session_id_bg(proj_id, _br_spawn_cwd, _br_sess, _br_pre_files)
+                                        if _br_presigned_sid:
+                                            _write_sid_direct(proj_id, _br_sess, _br_presigned_sid)
+                                        else:
+                                            _capture_live_session_id_bg(proj_id, _br_spawn_cwd, _br_sess, _br_pre_files, spawn_marker=_br_marker)
                                         await asyncio.to_thread(subprocess.run, ["tmux", "set-option", "-t", _br_sess, "history-limit", "2000"], capture_output=True, timeout=2)  # M1345
                                         # M1678: readiness-gated unified wake (was blind send-keys during boot — parked text in input box)
                                         threading.Thread(target=_spawn_wake_when_ready,
@@ -9830,12 +10323,16 @@ async def execute_project(proj_id: str, request: Request):
         # M858: substar-assigned queued stones with pending user replies are excluded from new_queued_top
         # (_awaits_user_reply=True) but their branched sessions must still be spawned so Claude can
         # reply AND continue implementation. Include them in the gate check.
+        # M1788: an explicit session pick (▶ click on a specific resume-list row, M1784) means the
+        # user wants THAT session spawned/resumed regardless of queue state — e.g. to keep chatting
+        # with it idle. Only the no-target dispatch path (no explicit_session_id) should stay gated
+        # on queued work; a human picking a specific row already expressed clear intent to spawn it.
         _substar_queued_top = [
             m for m in active_ms
             if m.get("status") == "queued" and m.get("substar_id")
             and not m.get("held") and str(m.get("text", "")).strip()
         ]
-        if not new_queued_top and not _substar_queued_top:
+        if not explicit_session_id and not new_queued_top and not _substar_queued_top:
             return JSONResponse({
                 "ok": True, "mode": "no_queued_work",
                 "tasks_created": 0,
@@ -9844,7 +10341,12 @@ async def execute_project(proj_id: str, request: Request):
                 "needs_clarification_count": len([m for m in active_ms if m.get("status") == "needs_clarification"]),
             })
 
-        if actionable:
+        # M1788: explicit_session_id (▶ click on a specific resume-list row, M1784) must be able
+        # to spawn/resume even with zero actionable stones — the human already expressed clear
+        # intent to open that session, e.g. to keep chatting with it idle. Without actionable work
+        # the per-stone prompt sections below are simply empty/no-op (task_file loop, _ms_snap,
+        # etc. all iterate empty lists harmlessly) — the tmux spawn/resume itself is unaffected.
+        if actionable or explicit_session_id:
             if agent == "codex":
                 # M473 follow-up: use _snap_text (1500-char cap) instead of [:70]
                 all_ms_lines = "\n".join(
@@ -9874,8 +10376,9 @@ async def execute_project(proj_id: str, request: Request):
                 )
                 spawn_cwd = proj_dir if Path(proj_dir).exists() else str(Path.home())
                 resume_args = _get_resume_args(proj_id, spawn_cwd, explicit_session_id, agent=agent)
-                _record_spawn_info(proj_id, resume_args, agent=agent, session_name=session_name)
-                _tmux_env = ["-e", f"NS_HUB_URL=http://{_tailscale_interface_ip()}:{PORT}"]
+                _record_spawn_info(proj_id, resume_args, agent=agent, session_name=session_name, is_mother=True)
+                _tmux_env = ["-e", f"NS_HUB_URL=http://{_tailscale_interface_ip()}:{PORT}",
+                             "-e", f"NS_SESSION_KEY={session_name}"]  # M1792: fix Stop hook key routing
                 for _k, _v in _get_project_spawn_env(proj_id).items():
                     _tmux_env += ["-e", f"{_k}={_v}"]
                 subprocess.Popen([
@@ -9911,7 +10414,7 @@ async def execute_project(proj_id: str, request: Request):
                     except Exception:
                         pass
                     resume_args = []
-                    _record_spawn_info(proj_id, resume_args, agent=agent, session_name=session_name)
+                    _record_spawn_info(proj_id, resume_args, agent=agent, session_name=session_name, is_mother=True)
                     subprocess.Popen([
                         "tmux", "new-session", "-d", "-s", session_name,
                         "-c", spawn_cwd,
@@ -9946,7 +10449,13 @@ async def execute_project(proj_id: str, request: Request):
                         "retried": False,
                         "error": "Codex failed to start in tmux pane (pane fell back to shell).",
                     }, status_code=502)
-                _send_exec_wake(session_name, proj_id)  # M1678: unified wake (was hardcoded "go")
+                # M1790: same idle-spawn wake-suppression as the claude branch below —
+                # skip the optimistic wake_sent busy record when there's nothing to claim.
+                # M1795: force_dedup_reset=True — a freshly-spawned session shares the same
+                # session_name as the just-killed session; _wake_last_sent[session_name] may
+                # still hold a timestamp <90s old, silently blocking the post-spawn wake.
+                if new_queued_top or _substar_queued_top:
+                    _send_exec_wake(session_name, proj_id, force_dedup_reset=True)  # M1678: unified wake (was hardcoded "go")
                 return JSONResponse({
                     "ok": True, "mode": "tmux",
                     "session": session_name,
@@ -9983,20 +10492,8 @@ async def execute_project(proj_id: str, request: Request):
             _ns_list = proj.get("north_stars") or []
             _ns_by_id: dict = {ns["id"]: ns for ns in _ns_list if ns.get("id")}
 
-            # M836.2: late guard kept as defense-in-depth — early auto-assign should have covered all,
-            # but if any slipped through (race / late substar add), apply auto-assign again here.
-            _unassigned_ids, _unassigned_names = _find_unassigned_substars(new_queued_top, _ns_list)
-            if _unassigned_ids:
-                _main_sess_name_late = f"{agent}-exec-{proj_id}"
-                for _ns in _ns_list:
-                    if _ns.get("id") in _unassigned_ids:
-                        _ns["assigned_session"] = _main_sess_name_late
-                proj["north_stars"] = _ns_list
-                _ns_by_id = {ns["id"]: ns for ns in _ns_list if ns.get("id")}
-                try:
-                    _save_project(proj_id, proj)
-                except Exception:
-                    pass
+            # M1802: late auto-assign removed — unassigned substars stay unassigned (manual only).
+            _ns_by_id = {ns["id"]: ns for ns in _ns_list if ns.get("id")}
 
             def _resolve_session_key(proj_id: str, substar_id: str, ns_by_id: dict) -> str:
                 """M792: return assigned_session for this substar.
@@ -10114,7 +10611,7 @@ async def execute_project(proj_id: str, request: Request):
                 f"SUB-AGENT PROTOCOL — each Agent call must:\n"
                 + _stone_impl_steps
                 + f"ORCHESTRATOR — after all waves complete:\n"
-                f"  Post ONE consolidated 1-line summary listing completed MIDs.\n\n"
+                f"  Post ONE consolidated ≤3-line summary listing completed MIDs.\n\n"
                 f"COMMENT RULE: append_message MUST be ≤3 lines.\n\n"
                 f"TOKEN DISCIPLINE: NO progress comments during work. ONE past-tense summary at completion.\n\n"
                 f"CAVEMAN LITE MODE (M582): Terse output — drop filler/politeness, keep technical precision. ~60% fewer output tokens.\n\n"
@@ -10183,12 +10680,14 @@ async def execute_project(proj_id: str, request: Request):
 
             # M255: kill agent-prefixed sessions before spawn — prevents orphaned cross-agent sessions
             # (e.g. codex-exec-FreeOS left alive when switching to claude-exec-FreeOS)
-            # M1656-R3: children spared — cross-agent orphan children are reaped by mother-death cascade
-            _kill_all_exec_sessions(proj_id, spare_children=True)
-            # M864: kill active substar sessions that have no queued work (unrelated sessions)
-            # M1656-R4: sessions ASSIGNED to a substar are deliberate children — an idle
-            # child waiting for future work must survive a mother respawn (was killed
-            # silently here with no action-log entry).
+            # M1797: no mother/child distinction — kill all sessions before spawning a new one
+            # M1807: spare branch sessions that already have queued work assigned — they were
+            # spawned via assign_spawn and must not be killed here only to be re-spawned under
+            # the main execute context.
+            # M1816: also spare sessions currently assigned to a substar (even with no queued work)
+            # — M1656-R4 intent was to protect idle assigned children but the _assigned_now set
+            # was only checked AFTER _kill_all_exec_sessions already ran, so idle assigned children
+            # were silently killed here before the M864 guard could protect them.
             _assigned_now: set = set()
             try:
                 _p864 = _db_load_project(proj_id)
@@ -10198,6 +10697,9 @@ async def execute_project(proj_id: str, request: Request):
                         _assigned_now.add(_a864)
             except Exception:
                 pass
+            _assigned_spare = (set(_session_qs.keys()) if _branch_substars else set()) | _assigned_now
+            _kill_all_exec_sessions(proj_id, spare=_assigned_spare)
+            # M864: kill active substar sessions that have no queued work AND no assignment
             _active_substars_now = _get_active_substar_sessions(proj_id)
             for _ss_short2, _ss_sname2 in _active_substars_now.items():
                 if _ss_sname2 not in _session_qs and _ss_sname2 not in _assigned_now:
@@ -10245,12 +10747,31 @@ async def execute_project(proj_id: str, request: Request):
             # When no prior session exists, it falls through all history lookups and returns
             # ["--continue"], which starts a new conversation. No try/except needed.
             resume_args = _get_resume_args(proj_id, spawn_cwd, explicit_session_id, agent=agent)
-            _record_spawn_info(proj_id, resume_args, agent=agent, session_name=session_name)
+            # M1775: resolve the live session id deterministically instead of the L10557
+            # sleep(2)+newest-mtime scan (same class of bug _capture_live_session_id_bg was
+            # built to fix for forks — see critique: mtime-scan can pick a sibling branch
+            # session's transcript, and 2s is not long enough to wait for a --resume spawn's
+            # first write). Two cases, both already fully known before Popen:
+            #  - resume_args == ["--resume", sid]: sid already exists (_get_resume_args'
+            #    _try_id verified t.exists() before returning it) — that IS the live id.
+            #  - resume_args == []: fresh conversation — pre-assign a UUID via --session-id
+            #    so the transcript filename is deterministic (verified: claude --help +
+            #    live fork test; applies equally to a fresh, non-forked spawn).
+            # M1796: _presigned_main_sid already set at L9794 (before session_name was formed)
+            # — reuse it; do NOT generate a second UUID here.
+            _was_true_resume = bool(resume_args and resume_args[0] == "--resume" and len(resume_args) > 1)
+            if not _was_true_resume and agent in (None, "claude", "openrouter") and not resume_args:
+                resume_args = ["--session-id", _presigned_main_sid]
+            _record_spawn_info(proj_id, resume_args, agent=agent, session_name=session_name, is_mother=True)
             _tmux_env = [
                 "-e", f"CLAUDE_CODE_TASK_LIST_ID=hub-exec-{proj_id}",
                 "-e", f"NS_HUB_URL=http://{_tailscale_interface_ip()}:{PORT}",
                 # M1184: PCT override only — window defaults to model's context size (no need to set explicitly)
                 "-e", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80",
+                # M1792: NS_SESSION_KEY was missing from main-session spawn — Stop hook fell back to
+                # CLAUDE_CODE_SESSION_ID (UUID), posting agent-busy to wrong key so _exec_was_running
+                # never became True and idle→Telegram notification never fired.
+                "-e", f"NS_SESSION_KEY={session_name}",
             ]
             for _k, _v in _get_project_spawn_env(proj_id).items():
                 _tmux_env += ["-e", f"{_k}={_v}"]
@@ -10287,8 +10808,11 @@ async def execute_project(proj_id: str, request: Request):
 
             # M181: auto-retry once with no resume args if first spawn failed
             # while resume args were in play (likely stale --resume target).
+            # M1775: gate on _was_true_resume (not resume_args' truthiness) — a fresh spawn's
+            # presigned --session-id is never the cause of a boot failure, so it must not
+            # trigger this retry path (retrying would just burn another 12s deadline wait).
             _retried = False
-            if not _post_alive and resume_args:
+            if not _post_alive and _was_true_resume:
                 # Kill pane, clear stale .last-session-id, respawn without resume
                 await asyncio.to_thread(  # M1345
                     subprocess.run, ["tmux", "kill-session", "-t", f"={session_name}"], capture_output=True, timeout=5)
@@ -10297,9 +10821,12 @@ async def execute_project(proj_id: str, request: Request):
                 except Exception:
                     pass
                 _retried = True
-                resume_args = []  # fresh spawn — no continuity
-                _record_spawn_info(proj_id, resume_args, agent=agent, session_name=session_name)
-                _tmux_env = ["-e", f"CLAUDE_CODE_TASK_LIST_ID=hub-exec-{proj_id}", "-e", f"NS_HUB_URL=http://{_tailscale_interface_ip()}:{PORT}"]
+                import uuid as _uuid_main_retry
+                _presigned_main_sid = str(_uuid_main_retry.uuid4())
+                resume_args = ["--session-id", _presigned_main_sid]  # fresh spawn — no continuity
+                _record_spawn_info(proj_id, resume_args, agent=agent, session_name=session_name, is_mother=True)
+                _tmux_env = ["-e", f"CLAUDE_CODE_TASK_LIST_ID=hub-exec-{proj_id}", "-e", f"NS_HUB_URL=http://{_tailscale_interface_ip()}:{PORT}",
+                             "-e", f"NS_SESSION_KEY={session_name}"]  # M1792: same fix as first spawn
                 for _k, _v in _get_project_spawn_env(proj_id).items():
                     _tmux_env += ["-e", f"{_k}={_v}"]
                 _mcp_args_retry = []
@@ -10310,6 +10837,7 @@ async def execute_project(proj_id: str, request: Request):
                     "-c", spawn_cwd,
                     *_tmux_env,
                     "claude", "--dangerously-skip-permissions", *_DISALLOWED_TOOLS_ARGS, *_get_project_model(proj_id), *_mcp_args_retry,
+                    *resume_args,
                 ])
                 subprocess.run(["tmux", "set-option", "-t", session_name, "history-limit", "2000"], capture_output=True, timeout=2)
                 elapsed = 0
@@ -10341,7 +10869,17 @@ async def execute_project(proj_id: str, request: Request):
             # the explicit tool-call instruction instead of bare "go".
             # M1230: auto-compact disabled by user request
             # M1114: two-step skill pre-inject
-            _send_exec_wake(session_name, proj_id)
+            # M1790: M1788's explicit_session_id idle-spawn path (▶ click, zero queued work)
+            # reaches this same call site — same class of gap M1688 already fixed for the
+            # assign-spawn wake path (_spawn_wake_when_ready): waking with nothing claimable
+            # only sets a 45s optimistic wake_sent busy record (M1675) for no reason, making a
+            # genuinely idle just-spawned session LOOK busy for 45s. Skip the wake entirely when
+            # there's no actionable work for THIS session to claim.
+            # M1795: force_dedup_reset=True — if user killed a session and re-spawned, the new
+            # session shares the same session_name; _wake_last_sent[session_name] may hold a
+            # timestamp <90s old, silently suppressing the post-spawn wake injection.
+            if new_queued_top or _substar_queued_top:
+                _send_exec_wake(session_name, proj_id, force_dedup_reset=True)
 
             # M747/M792: spawn per-session sessions after main session is live
             # M792: iterate session_qs (session_key -> stones); session_name IS the key
@@ -10383,12 +10921,13 @@ async def execute_project(proj_id: str, request: Request):
                                "-e", f"NS_SESSION_KEY={_skey}"]
                     for _k, _v in _get_project_spawn_env(proj_id).items():
                         _ss_env += ["-e", f"{_k}={_v}"]
-                    # M792: detect branch-from-main — if assigned_session ends with -branch,
-                    # look up branch_from_session_id on the substar and pass --resume <id>.
-                    # M833: prefer stored last_session_id from .branch-sessions.json (continuity across dispatches)
-                    # M837: use --continue for branched sessions to avoid thinking.signature API 400 errors.
-                    # --resume inherits old thinking blocks that may become invalidated across sessions.
-                    # --continue uses the most recent session transcript safely.
+                    # M1787: dead-session-reclaim --resume targeting now happens where the
+                    # assignment itself is made (update_north_star's manual-assign spawn path),
+                    # not here — this dispatch-time branch-spawn loop no longer auto-assigns
+                    # substars to a last-worked session (see M1787 note above), so any session
+                    # reaching this point either already spawned via that path (and lands in
+                    # _alive_branch_keys, skipping this loop entirely) or has no known prior
+                    # transcript to target — --continue is the correct fallback either way.
                     _ss_resume_args: list = ["--continue"]
                     _encoded_cwd = _encode_cwd_for_claude(spawn_cwd)
                     _transcripts_dir = Path.home() / ".claude" / "projects" / _encoded_cwd
@@ -10406,10 +10945,6 @@ async def execute_project(proj_id: str, request: Request):
                                    f"spawned {len(_newly_spawned)} new + {len(_alive_branch_keys)} reused sessions: "
                                    f"{','.join([s for s, _ in _newly_spawned]+list(_alive_branch_keys))}")
 
-            # Feature: record the new transcript ID so it appears in the resume list immediately
-            # (before Stop hook fires). Small delay to let Claude create the transcript file.
-            import asyncio as _aio2
-            await _aio2.sleep(2)
             # M256: use model from spawn-info (just written above) so the session is stored
             # under the correct model_key (e.g. "or-owl-alpha" not "").
             # M1685-j fix: was reading .last-spawn-info.json (the LEGACY mirror), which
@@ -10425,7 +10960,10 @@ async def execute_project(proj_id: str, request: Request):
             # (_read_spawn_info, the correct M1656-R9 counterpart) so the model always matches
             # what THIS session actually spawned with.
             _recorded_model = _read_spawn_info(proj_id, session_name).get("model", "") or _get_project_model_value(proj_id) or ""
-            _new_sid = _update_session_history_from_transcript(proj_id, spawn_cwd, _recorded_model)
+            # M1775: pass the already-known sid (pre-assigned via --session-id, or the verified
+            # --resume target) — no sleep(2) wait, no newest-mtime scan race against concurrently
+            # spawning branch sessions.
+            _new_sid = _update_session_history_from_transcript(proj_id, spawn_cwd, _recorded_model, known_sid=_presigned_main_sid)
             # M833: capture branch session IDs for --resume continuity on next dispatch
             if _branch_substars and _newly_spawned:
                 _br_encoded_cwd = _encode_cwd_for_claude(spawn_cwd)
@@ -10559,13 +11097,52 @@ async def fork_session(proj_id: str, request: Request):
 
     spawn_cwd = proj_dir if Path(proj_dir).exists() else str(Path.home())
 
-    # Branched session name — distinct tmux session so the source (mother) session is
-    # never killed by dispatch/restart (M1656-R3 spare_children already spares these).
-    suffix = _uuid_fork.uuid4().hex[:8]
-    session_name = f"{agent}-exec-{proj_id}-{suffix}"
-
     # Fork argv: inherit source conversation, write to OWN new session id.
-    resume_args = ["--resume", source_sid, "--fork-session"]
+    # M1775: pre-assign the new session id via --session-id so the transcript filename is
+    # known deterministically at spawn time — verified via `claude --help` + live test that
+    # --session-id composes with --resume/--fork-session.
+    presigned_sid = str(_uuid_fork.uuid4())
+
+    # M1792: branched tmux session name — distinct from the source session so it's
+    # never killed by dispatch/restart (M1797: all sessions are peers; kill-all clears all).
+    # Suffix now derives from presigned_sid (this fork's own live session id) instead of an
+    # unrelated random UUID — the sess popup tooltip already shows "own live session: <id>"
+    # separately from the tmux name, which was confusing when the two had nothing in common.
+    suffix = presigned_sid.replace("-", "")[:8]
+    session_name = f"{agent}-exec-{proj_id}-{suffix}"
+    _fork_source_sid = source_sid
+    # M1778: this endpoint (the "⑂ fork" button, M1699) never applied the M1679 truncation
+    # fix — that fix only wired into _mother_fork_args, used by the OTHER two spawn paths
+    # (assign-spawn/branch-spawn), so forking via this button always inherited whatever
+    # in-flight, unrelated work the source session was mid-turn on (reported: "fork session
+    # 에서 작업중이던 작업을 재개"). Apply the same truncate-before-claim logic here: if the
+    # source session is a live, busy tmux session with an in-flight stone claim, fork from a
+    # truncated copy that ends right before that claim instead of her live conversation.
+    try:
+        _src_sess_name = None
+        for _bsk, _brec in _agent_busy_sessions.items():
+            if _brec.get("proj_id") == proj_id:
+                _bsi = _read_spawn_info(proj_id, _bsk)
+                if (_bsi.get("live_session_id") or _bsi.get("from_id")) == source_sid:
+                    _src_sess_name = _bsk
+                    break
+        if _src_sess_name:
+            _src_rec = _agent_busy_sessions.get(_src_sess_name) or {}
+            _src_stone = _src_rec.get("stone_id")
+            if _session_is_busy(_src_sess_name):
+                # M1780: no-stone-claim case (direct interactive conversation) — see
+                # _mother_fork_args twin fix for the same extension and rationale.
+                if _src_stone:
+                    _cut_sid = _truncate_transcript_before_stone(src_t, _src_stone)
+                else:
+                    _cut_sid = _truncate_transcript_before_last_user_turn(src_t)
+                if _cut_sid:
+                    _server_log_action(proj_id, _src_stone or "", "exec:fork_truncated",
+                                       f"source:{_src_sess_name} orig_sid:{source_sid} cut_sid:{_cut_sid}")
+                    _fork_source_sid = _cut_sid
+    except Exception:
+        pass  # any failure — fall back to raw fork below (M1679 has the same fallback contract)
+    resume_args = ["--resume", _fork_source_sid, "--fork-session", "--session-id", presigned_sid]
     # Target model override (does NOT mutate project's stored model).
     model_args = _get_project_model(proj_id, override_model=target_model if target_model else None)
 
@@ -10573,15 +11150,20 @@ async def fork_session(proj_id: str, request: Request):
                        model=target_model if target_model else _get_project_model_value(proj_id) or "")
 
     # Env: splice target-model proxy routing (openrouter → LiteLLM proxy).
-    _tmux_env = ["-e", f"NS_HUB_URL=http://{_tailscale_interface_ip()}:{PORT}"]
+    # M1757: NS_SESSION_KEY must match session_name so agent-busy POST uses session-scoped key
+    # (not legacy::proj_id) — same as assign-spawn (L6449) and main-spawn (L10316).
+    _tmux_env = ["-e", f"NS_HUB_URL=http://{_tailscale_interface_ip()}:{PORT}",
+                 "-e", f"NS_SESSION_KEY={session_name}",
+                 "-e", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80"]
     for _k, _v in _get_project_spawn_env(proj_id, override_model=target_model if target_model else None).items():
         _tmux_env += ["-e", f"{_k}={_v}"]
 
     # M1116: write per-session MCP config for claude/openrouter fork (hub-mcp-server bridge)
     try:
-        _write_mcp_config(proj_id, session_name)
-        model_args = [*model_args, "--mcp-config",
-                      str(Path("/tmp/hub/mcp") / f"{session_name}.json")]
+        _mcp_cfg = _write_mcp_config(proj_id, session_name)
+        if _mcp_cfg:
+            model_args = [*model_args, "--mcp-config", _mcp_cfg,
+                          "--append-system-prompt", _HUB_EXEC_SYS_PROMPT]
     except Exception:
         pass
 
@@ -10608,14 +11190,11 @@ async def fork_session(proj_id: str, request: Request):
                        f"session:{session_name} from:{source_sid} model:{target_model or 'default'}")
     _ns_push("session_running", proj_id=proj_id, kind="exec")
 
-    # Capture the fork's live session id without clobbering the source's _current anchor.
-    pre_existing = set()
-    try:
-        _d = (Path.home() / ".claude" / "projects" / encoded).glob("*.jsonl")
-        pre_existing = {p.stem for p in _d}
-    except Exception:
-        pass
-    _capture_live_session_id_bg(proj_id, spawn_cwd, session_name, pre_existing, timeout=20.0)
+    # M1775: live session id is already known (pre-assigned via --session-id above) — write
+    # it directly instead of polling the transcript dir for the new file.
+    _write_sid_direct(proj_id, session_name, presigned_sid)
+    # M1757: fork-spawn was missing readiness-gated wake — parity with assign/branch paths
+    threading.Thread(target=_spawn_wake_when_ready, args=(session_name, proj_id), daemon=True).start()
     # M1743: record the fork in session-history AFTER _capture_live_session_id_bg confirms
     # the new transcript SID. Running both threads concurrently caused _update_session_history
     # to grab the pre-fork newest JSONL (old session) instead of the fork's actual new JSONL.
@@ -10651,27 +11230,24 @@ async def fork_session(proj_id: str, request: Request):
                             return  # wrong agent — abort, do not write
             except Exception:
                 pass
-            # Write fork SID under its model key without touching _current/_default
-            _hist_f = PROJECTS_DIR / proj_id / ".session-history.json"
-            _hist = {}
-            if _hist_f.exists():
-                try:
-                    _hist = json.loads(_hist_f.read_text())
-                except Exception:
-                    pass
-            _old = _hist.get(_fork_hist_key)
-            if _old and _old != _new_sid:
-                _hist[f"{_fork_hist_key}_prev"] = _old
-            _hist[_fork_hist_key] = _new_sid
+            # Write fork SID under its model key without touching _current/_default.
+            # M1804: locked read-mutate-write — see _update_session_history_locked.
             try:
-                _hist_f.write_text(json.dumps(_hist, ensure_ascii=False))
+                _update_session_history_locked(
+                    proj_id, lambda h: _push_session_history_ring(h, _fork_hist_key, _new_sid))
             except Exception:
                 pass
             return
 
     threading.Thread(target=_fork_hist_update_bg, daemon=True).start()
 
-    _send_exec_wake(session_name, proj_id)  # M1678: unified wake
+    # M1763: record fork spawn time so _send_exec_wake's 20s boot-grace fires correctly.
+    # Without this, _session_spawn_ts[session_name] == 0 → grace evaluates to ∞s ago →
+    # wake lands in the input box while the harness TUI is still initialising.
+    _session_spawn_ts[session_name] = time.time()
+    threading.Thread(
+        target=_spawn_wake_when_ready, args=(session_name, proj_id), daemon=True
+    ).start()  # M1763: use readiness-gated wake (same as fresh spawn) instead of blind immediate send
     return JSONResponse({
         "ok": True, "mode": "fork", "session": session_name,
         "source_session_id": source_sid, "target_model": target_model or "(default)",
@@ -11451,49 +12027,18 @@ async def kill_exec_session(proj_id: str):
 @app.delete("/api/northstar/{proj_id}/tmux-session/{session_name}")
 async def kill_named_tmux_session(proj_id: str, session_name: str):
     """M792: kill a specific named tmux session (used from session popup kill button).
-    M1019: cascade — also kill child branch sessions of this mother session, and
-    clear assigned_session on every substar that referenced the killed session(s).
-    Killing a session ≡ unassigning mother/child links."""
+    clear assigned_session on every substar that referenced the killed session."""
     killed = []
     cleared_substars = []
 
-    # Phase 1: figure out cascade BEFORE killing, so we can look up children.
-    cascade_targets = {session_name}
-    try:
-        p = _db_load_project(proj_id)
-        if p:
-            north_stars = p.get("north_stars") or []
-            # Find the substar (if any) whose assigned_session matches the requested session.
-            # If that substar has no branch_from_session_id, it IS a mother; kill its branches.
-            mother_ns = None
-            for ns in north_stars:
-                if isinstance(ns, dict) and (ns.get("assigned_session") or "") == session_name:
-                    if not ns.get("branch_from_session_id"):
-                        mother_ns = ns
-                    break
-            if mother_ns:
-                # Any substar whose branch_from_session_id == mother's substar id (or session id) → child.
-                mother_substar_id = mother_ns.get("id") or ""
-                for ns in north_stars:
-                    if not isinstance(ns, dict): continue
-                    if ns is mother_ns: continue
-                    bf = (ns.get("branch_from_session_id") or "").strip()
-                    if bf and (bf == mother_substar_id or bf == session_name):
-                        child_sess = (ns.get("assigned_session") or "").strip()
-                        if child_sess:
-                            cascade_targets.add(child_sess)
-    except Exception:
-        pass
+    # Kill the requested session.
+    result = subprocess.run(["tmux", "kill-session", "-t", f"={session_name}"], capture_output=True, timeout=5)
+    if result.returncode == 0:
+        killed.append(session_name)
+    _exec_idle_count.pop(session_name, None)
+    _exec_was_running.pop(session_name, None)
 
-    # Phase 2: kill all targeted sessions.
-    for sname in cascade_targets:
-        result = subprocess.run(["tmux", "kill-session", "-t", f"={sname}"], capture_output=True, timeout=5)
-        if result.returncode == 0:
-            killed.append(sname)
-        _exec_idle_count.pop(sname, None)
-        _exec_was_running.pop(sname, None)
-
-    # Phase 3: clear assigned_session on any substar that pointed at a killed session.
+    # Clear assigned_session on any substar that pointed at the killed session.
     try:
         p = _db_load_project(proj_id)
         if p:
@@ -11501,9 +12046,8 @@ async def kill_named_tmux_session(proj_id: str, session_name: str):
             changed = False
             for ns in north_stars:
                 if not isinstance(ns, dict): continue
-                if (ns.get("assigned_session") or "") in cascade_targets:
+                if (ns.get("assigned_session") or "") == session_name:
                     ns["assigned_session"] = None
-                    ns["branch_from_session_id"] = None
                     cleared_substars.append(ns.get("id") or "")
                     changed = True
             if changed:
@@ -11604,11 +12148,56 @@ async def get_session_contexts(proj_id: str):
     summaries = await _asyncio.gather(
         *[_asyncio.to_thread(_capture, sn) for sn, _, _ in targets]
     )
-    sessions = [{
-        "name": sn, "session": sn,  # M889: frontend reads s.session; alias name for compatibility
-        "created": ct, "activity": at,
-        "summary": summary or "(no output)",
-    } for (sn, ct, at), summary in zip(targets, summaries)]
+    # M1762: load spawn-info-by-session once and merge into each session entry so
+    # the frontend can show live_session_id immediately without a separate API call.
+    _spawn_info_all: dict = {}
+    try:
+        _si_f = PROJECTS_DIR / proj_id / ".spawn-info-by-session.json"
+        if _si_f.exists():
+            _spawn_info_all = json.loads(_si_f.read_text())
+    except Exception:
+        pass
+    _proj_dir_for_ctx = _get_project_dir(proj_id)
+    _ctx_enc = _encode_cwd_for_claude(str(_proj_dir_for_ctx)) if _proj_dir_for_ctx else None
+    sessions = []
+    for (sn, ct, at), summary in zip(targets, summaries):
+        _si = _spawn_info_all.get(sn, {})
+        _live_sid = _si.get("live_session_id", "")
+        # M1762-c: fallback when spawn-info has no live_session_id.
+        # resume mode does NOT create a new .jsonl — it continues from_id directly.
+        # fork/fresh/continue modes create a new .jsonl; scan for it excluding (1) from_id
+        # and (2) live_session_ids already claimed by sibling sessions.
+        if not _live_sid:
+            _si_mode = (_si or {}).get("mode", "")
+            _si_from = (_si or {}).get("from_id", "")
+            if _si_mode == "resume" and _si_from:
+                _live_sid = _si_from  # resume = continues existing conversation, live_id = from_id
+            elif _ctx_enc:
+                try:
+                    _td = Path.home() / ".claude" / "projects" / _ctx_enc
+                    _from_stem = _si_from.split("-")[0] if _si_from else ""
+                    _claimed = {v.get("live_session_id","")[:8] for v in _spawn_info_all.values() if v.get("live_session_id")}
+                    _candidates = [
+                        _f for _f in _td.glob("*.jsonl")
+                        if _f.stat().st_mtime > ct
+                        and (_from_stem == "" or not _f.stem.startswith(_from_stem))
+                        and _f.stem[:8] not in _claimed
+                    ]
+                    if len(_candidates) == 1:
+                        _live_sid = _candidates[0].stem
+                    elif len(_candidates) > 1 and _si_mode == "fresh":
+                        _live_sid = max(_candidates, key=lambda f: f.stat().st_mtime).stem
+                except Exception:
+                    pass
+        sessions.append({
+            "name": sn, "session": sn,
+            "created": ct, "activity": at,
+            "summary": summary or "(no output)",
+            "spawn_mode": _si.get("mode", ""),
+            "from_id": _si.get("from_id", ""),
+            "live_session_id": _live_sid,
+            "spawn_model": _si.get("model", ""),
+        })
     sessions.sort(key=lambda x: x["activity"], reverse=True)
     # M792: attach last_session_id from .last-session-id (main session) so branch-from-main button
     # can find the ID without an extra API call.
@@ -11859,7 +12448,10 @@ async def _start_exec_idle_detector():
                     # M1574: TTL-aware — _oob_is_busy returns False when stale (>120s) → idle=True
                     # M1656-fix (option②): pass session_name — this session's own report is authoritative,
                     # so an idle branched session no longer shows busy just because a sibling is running.
-                    idle = not _oob_is_busy(proj_id, session_name)
+                    # M1806: was still calling _oob_is_busy directly, whose sibling-scan fallback (no
+                    # TTL) applies whenever this session has no record of its own — the exact bug
+                    # M1771 fixed for the OTHER idle-display call site, unfixed here.
+                    idle = not _oob_is_busy_session_scoped(proj_id, session_name)
                     return session_name, proj_id, idle
 
                 _results = await _aio.gather(*[_check_one(sn, pid) for sn, pid in _session_entries])
@@ -12008,15 +12600,27 @@ async def get_exec_sessions():
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
         return stdout.decode("utf-8", errors="replace") if stdout else ""
 
+    # M1826: batch tmux queries — single list-sessions + single list-panes -a
+    # replaces N per-session list-panes subprocesses (was O(N) fork cost on cold path).
     try:
-        _ls_out = await _run("tmux", "list-sessions", "-F", "#{session_name}:#{session_created}:#{session_windows}")
+        _ls_out, _lp_out = await asyncio.gather(
+            _run("tmux", "list-sessions", "-F", "#{session_name}:#{session_created}:#{session_windows}"),
+            _run("tmux", "list-panes", "-a", "-F", "#{session_name} #{pane_current_command}"),
+        )
     except Exception:
-        _ls_out = ""
+        _ls_out = _lp_out = ""
+
+    # Build session → pane-commands map from the single batch call
+    _batch_pane_cmds: dict[str, list[str]] = {}
+    for _pl in (_lp_out or "").splitlines():
+        _pp = _pl.split(" ", 1)
+        if len(_pp) == 2:
+            _batch_pane_cmds.setdefault(_pp[0], []).append(_pp[1].strip())
 
     # Parse session lines and filter to exec sessions only
     # M1656-④: _parse_exec_session_name does longest-prefix match for branched child names
     _session_lines = []
-    for line in _ls_out.splitlines():
+    for line in (_ls_out or "").splitlines():
         parts = line.split(":", 2)
         session_name = parts[0] if parts else ""
         agent, proj_id = _parse_exec_session_name(session_name)
@@ -12031,11 +12635,8 @@ async def get_exec_sessions():
         from datetime import datetime as _dt
 
         # Check if the runtime is actually running — not just a shell prompt after exit
-        try:
-            _pane_cmds_out = await _run("tmux", "list-panes", "-t", session_name, "-F", "#{pane_current_command}")
-        except Exception:
-            _pane_cmds_out = ""
-        pane_cmds = _pane_cmds_out.splitlines()
+        # M1826: use pre-fetched batch pane map instead of per-session subprocess
+        pane_cmds = _batch_pane_cmds.get(session_name, [])
         cmds = [c.strip() for c in pane_cmds if c.strip()]
         runtime_running = any(c not in _SHELLS for c in cmds) if cmds else False
         # M1609: harness-agnostic idle-at-prompt detection.
@@ -12056,10 +12657,17 @@ async def get_exec_sessions():
         # M1656-R: DISPLAY is strictly per-session — a busy sibling must not make this
         # session look busy. Session has a record → its own state; no record → the
         # pane-activity / at-prompt heuristics below decide.
+        # M1771: _oob_is_busy's session-name branch only trusts a record for THIS session;
+        # with none, it falls through to "any busy session of the project" — the exact
+        # sibling-contamination the comment above says must not happen (same bug class
+        # M1678 already fixed for wake dispatch: a cold-start fork with zero hook events
+        # yet showed idle=false purely because its mother happened to be busy). A session
+        # that has never reported has no busy signal of its own — treat as idle here;
+        # the pane-active/at-prompt heuristics below still get their say via _oob_rec.
         if session_name in _agent_busy_sessions:
             idle = not _session_is_busy(session_name)
         else:
-            idle = not _oob_is_busy(proj_id, session_name)
+            idle = True
         # M1609: harness at prompt → force idle=True regardless of OOB (harness is alive but not executing)
         # M1635/M1656-R: skip override when THIS session has an in-flight stone
         # M1677: also skip for explicit busy signals (wake_sent/compacting/tool_start/
@@ -12082,17 +12690,25 @@ async def get_exec_sessions():
         # M1656-R: applies ONLY to sessions with NO own record — a session that reports
         # its own state must not be flipped busy by the proj-level record (which reflects
         # whichever sibling posted last, e.g. a busy child's heartbeat).
-        if idle and runtime_running and session_name not in _agent_busy_sessions:
+        # M1797: exclude sessions at harness prompt — definitionally idle; OOB busy here is
+        # sibling contamination (e.g. mother busy while fork sits at prompt).
+        if idle and runtime_running and session_name not in _agent_busy_sessions and not _harness_at_prompt:
             _oob_rec = _agent_busy_state.get(proj_id)
             _oob_age = (time.time() - _oob_rec.get("ts", 0)) if _oob_rec else float("inf")
             _oob_explicit_idle = _oob_rec and not _oob_rec.get("busy", True)
             if _oob_age < _OOB_STALE_SECS and not _oob_explicit_idle:  # OOB active within TTL → trust pane-active
                 idle = False
 
-        # M388: startup grace period
-        if idle and created_ts > 0:
-            if time.time() - created_ts < 30:
-                idle = False
+        # M1798: M388's 30s startup-grace force-busy removed. It was fully redundant with
+        # _send_exec_wake's own wake_sent optimistic busy record (M1675, 45s) for the real
+        # dispatch case — that record already exists the instant wake is injected, so idle
+        # never leaked through in that scenario even without this grace. The ONE case where
+        # M388 actually did something was M1790's idle-spawn path (▶ click, zero queued
+        # work) — there wake is deliberately never sent (M1790), so this grace was the sole
+        # reason a genuinely idle just-spawned session showed busy for 30s, directly
+        # defeating M1790's whole point. It had also already caused a real bug once before
+        # (M1717-b: a child's spawn could force-lock an unrelated idle mother's avatar into
+        # 'running' for up to 30s) — a pattern of overreach requiring follow-up patches.
 
         # Spawn info / model
         spawn_mode = None
@@ -12168,16 +12784,50 @@ async def get_exec_sessions():
         if not _live_session_id:
             try:
                 _base = Path.home() / ".claude" / "projects"
-                _candidates = [d for d in _base.iterdir() if d.name.lower().endswith(f"-project-{proj_id.lower()}")]
-                if not _candidates:
-                    _candidates = [d for d in _base.iterdir() if proj_id.lower() in d.name.lower() and "project" in d.name.lower()]
-                if _candidates:
-                    _transcript_dir = sorted(_candidates, key=lambda d: len(d.name))[0]
-                    _all = sorted(_transcript_dir.glob("*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)
-                    for _f in _all:
-                        if _f.stat().st_mtime > created_ts:
-                            _live_session_id = _f.stem
-                            break
+                # M1766: prefer exact encoding via _get_project_dir to avoid picking up
+                # sibling dirs like HugwartsBanana2 when project is VIDraft/HugwartsBanana.
+                _proj_dir_exact = _get_project_dir(proj_id)
+                _transcript_dir = None
+                if _proj_dir_exact:
+                    _enc_exact = _encode_cwd_for_claude(str(_proj_dir_exact))
+                    _exact_path = _base / _enc_exact
+                    if _exact_path.exists():
+                        _transcript_dir = _exact_path
+                if not _transcript_dir:
+                    _tdirs = [d for d in _base.iterdir() if d.name.lower().endswith(f"-project-{proj_id.lower()}")]
+                    if not _tdirs:
+                        _tdirs = [d for d in _base.iterdir() if proj_id.lower() in d.name.lower() and "project" in d.name.lower()]
+                    if _tdirs:
+                        _transcript_dir = sorted(_tdirs, key=lambda d: len(d.name))[0]
+                if _transcript_dir:
+                    # M1762-c: resume mode continues from_id (no new .jsonl created).
+                    # fork/fresh scan for new .jsonl excluding from_id + sibling-claimed IDs.
+                    _si_from = (si or {}).get("from_id", "")
+                    _si_stored_live = (si or {}).get("live_session_id", "")
+                    if (si or {}).get("mode") == "resume" and _si_from:
+                        _live_session_id = _si_from
+                    elif _si_stored_live:
+                        # Background capture already resolved it (fork/fresh both write here)
+                        _live_session_id = _si_stored_live
+                    else:
+                        _from_stem = _si_from.split("-")[0] if _si_from else ""
+                        try:
+                            _si_all_fb = json.loads((PROJECTS_DIR / proj_id / ".spawn-info-by-session.json").read_text())
+                            _claimed = {v.get("live_session_id","")[:8] for v in _si_all_fb.values() if v.get("live_session_id")}
+                        except Exception:
+                            _claimed = set()
+                        _new_files = [
+                            _f for _f in _transcript_dir.glob("*.jsonl")
+                            if _f.stat().st_mtime > created_ts
+                            and (_from_stem == "" or not _f.stem.startswith(_from_stem))
+                            and _f.stem[:8] not in _claimed
+                        ]
+                        if len(_new_files) == 1:
+                            _live_session_id = _new_files[0].stem
+                        elif len(_new_files) > 1 and (si or {}).get("mode") == "fresh":
+                            # M1766: fresh sessions with ambiguous scan — pick most-recently
+                            # written transcript (the active one is writing, others are idle)
+                            _live_session_id = max(_new_files, key=lambda f: f.stat().st_mtime).stem
             except Exception:
                 pass
 
@@ -12221,13 +12871,10 @@ async def get_exec_sessions():
         if k not in _alive_sessions:
             del _exec_notified[k]
     # M1158: also include all tmux sessions (main, branch, etc.) for sess badge
-    _all_sx = []
-    try:
-        _tmux_all_out = await _run("tmux", "list-sessions", "-F", "#{session_name}")
-        _proj_lower = p.id.lower()
-        _all_sx = [l for l in _tmux_all_out.splitlines() if _proj_lower in l.lower()]
-    except Exception:
-        pass
+    # M1826: reuse _ls_out from batch query above — no extra subprocess needed.
+    # M1826-fix: `p` is not in scope here (was NameError, silently caught). Return all
+    # exec-pattern sessions unfiltered; the UI filters by proj_id client-side.
+    _all_sx = [l.split(":")[0] for l in (_ls_out or "").splitlines() if l.split(":")[0]]
     _t_total = (time.perf_counter() - _t_start) * 1000
     if _t_total > 100:
         print(f"[M1493] exec-sessions handler: {_t_total:.0f}ms (sessions={len(sessions)})", flush=True)
@@ -12311,17 +12958,58 @@ async def get_resumable_sessions(proj_id: str, agent: str = "", model: str = "")
         except Exception:
             pass
 
+    # M1806: build spawn-info sid→model reverse lookup for high-fidelity model detection.
+    # spawn-info records the model that was explicitly passed at spawn time (--model flag),
+    # which is immune to --resume context inheritance contamination. Used as primary source;
+    # _detect_session_model() is fallback when no spawn-info entry exists for a sid.
+    _spawn_sid_to_model: dict[str, str] = {}
+    _spawn_info_file = pdir / ".spawn-info-by-session.json"
+    if _spawn_info_file.exists():
+        try:
+            _spawn_info_all = json.loads(_spawn_info_file.read_text())
+            for _si_model_val in _spawn_info_all.values():
+                _si_m = (_si_model_val.get("model") or "").strip() if isinstance(_si_model_val, dict) else ""
+                if not _si_m:
+                    continue
+                # M1806-fix: index only live_session_id; resume mode now sets live=from_id
+                # so from_id indexing is no longer needed.
+                # Skip fork entries where live_session_id == from_id — _capture_live_session_id_bg
+                # falls back to from_id when it can't distinguish new file; indexing it would
+                # map the parent session ID → child model, shadowing the parent's own entry.
+                _si_sid = (_si_model_val.get("live_session_id") or "").strip()
+                _si_fid = (_si_model_val.get("from_id") or "").strip()
+                _si_mode = (_si_model_val.get("mode") or "").strip()
+                if (_si_mode == "fork" and _si_sid == _si_fid):
+                    continue  # unresolved fork capture — skip to avoid parent ID collision
+                if _si_sid and len(_si_sid) > 10:
+                    _spawn_sid_to_model[_si_sid] = _si_m
+        except Exception:
+            pass
+
     # Read live exec sessions + capture spawn time for transcript scan
     # M1498: subprocess.run blocks the async event loop; wrap in asyncio.to_thread
+    # M1765: track ALL live sessions per agent (main + fork children), not just one
+    # M1821-P2: single list-panes -a batch replaces per-session subprocess loop.
     live_by_agent = set()
-    live_spawn_ts: dict[str, float] = {}  # agent → tmux session created epoch
+    live_sessions_by_agent: dict[str, list[dict]] = {}  # agent → [{name, created_ts}]
     try:
-        def _tmux_list_sessions():
-            return subprocess.run(
+        def _tmux_batch_query():
+            sess_r = subprocess.run(
                 ["tmux", "list-sessions", "-F", "#{session_name}:#{session_created}:#{session_windows}"],
                 capture_output=True, text=True, timeout=3
             )
-        tmux_out = await asyncio.to_thread(_tmux_list_sessions)
+            pane_r = subprocess.run(
+                ["tmux", "list-panes", "-a", "-F", "#{session_name} #{pane_current_command}"],
+                capture_output=True, text=True, timeout=3
+            )
+            return sess_r, pane_r
+        tmux_out, pane_out = await asyncio.to_thread(_tmux_batch_query)
+        # Build session_name → set(pane commands) map from the single batch call
+        _sess_pane_cmds: dict[str, set[str]] = {}
+        for _pl in pane_out.stdout.splitlines():
+            _parts = _pl.split(" ", 1)
+            if len(_parts) == 2:
+                _sess_pane_cmds.setdefault(_parts[0], set()).add(_parts[1].strip())
         for line in tmux_out.stdout.splitlines():
             parts = line.split(":", 2)
             sname = parts[0] if parts else ""
@@ -12329,63 +13017,94 @@ async def get_resumable_sessions(proj_id: str, agent: str = "", model: str = "")
             _sn_agent, _sn_proj = _parse_exec_session_name(sname)
             if _sn_agent and _sn_proj == proj_id:
                 # M342 fix: only mark live if the runtime is actually running (not a dead shell)
-                def _tmux_list_panes(sess=sname):
-                    return subprocess.run(
-                        ["tmux", "list-panes", "-t", sess, "-F", "#{pane_current_command}"],
-                        capture_output=True, text=True, timeout=2
-                    )
-                pane_cmds = (await asyncio.to_thread(_tmux_list_panes)).stdout.splitlines()
-                runtime_running = any(c.strip() and c.strip() not in _SHELLS for c in pane_cmds) if pane_cmds else False
+                pane_cmds_set = _sess_pane_cmds.get(sname, set())
+                runtime_running = any(c and c not in _SHELLS for c in pane_cmds_set)
                 if runtime_running:
                     live_by_agent.add(_sn_agent)
-                    live_spawn_ts[_sn_agent] = float(created_ts)
+                    live_sessions_by_agent.setdefault(_sn_agent, []).append({
+                        "name": sname, "created_ts": float(created_ts)
+                    })
     except Exception:
         pass
 
-    # M280: detect current live exec session ID by scanning transcript dir for
-    # JSONL files created AFTER the exec session spawn time.
-    # M1173: also verify model matches agent to prevent cross-agent contamination
-    # (e.g. openrouter transcript being picked as claude exec_live when OR spawns later)
-    live_exec_sid: dict[str, str] = {}  # agent → session_id
+    # M280/M1765: resolve live_session_id for each live tmux session.
+    # Uses spawn-info first (M1762-c logic), falls back to transcript scan.
+    # M1765: produces list per agent so fork children also appear in resume dropdown.
+    live_exec_sessions: dict[str, list[dict]] = {}  # agent → [{tmux_session, live_sid}]
     if live_by_agent:
         try:
             proj_dir_path = _get_project_dir(proj_id)
             if proj_dir_path:
                 encoded = _encode_cwd_for_claude(str(proj_dir_path))
                 transcript_dir = Path.home() / ".claude" / "projects" / encoded
-                if transcript_dir.exists():
-                    # Pre-collect OR/codex/claude SIDs from session history to fast-exclude without reading transcript
-                    _or_sids = {v.strip() for k, v in hist.items() if k.startswith("or-")}
-                    _codex_sids = {v.strip() for k, v in hist.items() if k.startswith("codex-")}
-                    # M1555: claude SIDs are hist entries that are NOT or-/codex- prefixed
-                    _claude_sids = {v.strip() for k, v in hist.items() if not k.startswith("or-") and not k.startswith("codex-")}
-                    for ag in live_by_agent:
-                        spawn_ts = live_spawn_ts.get(ag, 0)
-                        if not spawn_ts:
-                            continue
-                        best_sid, best_mtime = None, 0.0
-                        for f in transcript_dir.glob("*.jsonl"):
-                            mt = f.stat().st_mtime
-                            if mt >= spawn_ts - 5 and mt > best_mtime and f.stat().st_size > 0:
-                                # M1173: exclude transcripts that belong to a different agent
-                                # M1555: also exclude claude SIDs from openrouter/codex attribution
-                                fstem = f.stem
-                                if ag == "claude" and (fstem in _or_sids or fstem in _codex_sids):
-                                    continue
-                                if ag == "openrouter" and (fstem in _codex_sids or fstem in _claude_sids):
-                                    continue
-                                if ag == "codex" and (fstem in _or_sids or fstem in _claude_sids):
-                                    continue
-                                best_mtime = mt
-                                best_sid = fstem
-                        if best_sid:
-                            live_exec_sid[ag] = best_sid
+                # Load spawn-info for live_session_id resolution (M1762-c)
+                _si_all: dict = {}
+                try:
+                    _si_all = json.loads((PROJECTS_DIR / proj_id / ".spawn-info-by-session.json").read_text())
+                except Exception:
+                    pass
+                # Pre-collect agent SIDs for cross-agent exclusion (M1173/M1555)
+                _or_sids = {v.strip() for k, v in hist.items() if k.startswith("or-")}
+                _codex_sids = {v.strip() for k, v in hist.items() if k.startswith("codex-")}
+                _claude_sids = {v.strip() for k, v in hist.items() if not k.startswith("or-") and not k.startswith("codex-")}
+                for ag, _ag_sessions in live_sessions_by_agent.items():
+                    for _sess_info in _ag_sessions:
+                        sname = _sess_info["name"]
+                        created_ts = _sess_info["created_ts"]
+                        # Step 1: try spawn-info for this specific tmux session (M1762-c)
+                        _si = _si_all.get(sname, {})
+                        _si_mode = _si.get("mode", "")
+                        _si_from = _si.get("from_id", "")
+                        _live_sid = _si.get("live_session_id", "") or ""
+                        if not _live_sid:
+                            if _si_mode == "resume" and _si_from:
+                                _live_sid = _si_from  # resume = continues same conversation
+                            elif transcript_dir.exists():
+                                # Step 2: scan transcript dir for new .jsonl (fork/fresh)
+                                _claimed = {v.get("live_session_id","")[:8] for v in _si_all.values() if v.get("live_session_id")}
+                                _from_stem = _si_from.split("-")[0] if _si_from else ""
+                                _candidates = []
+                                for f in transcript_dir.glob("*.jsonl"):
+                                    mt = f.stat().st_mtime
+                                    if mt < created_ts - 5 or f.stat().st_size == 0:
+                                        continue
+                                    fstem = f.stem
+                                    if ag == "claude" and (fstem in _or_sids or fstem in _codex_sids):
+                                        continue
+                                    if ag == "openrouter" and (fstem in _codex_sids or fstem in _claude_sids):
+                                        continue
+                                    if ag == "codex" and (fstem in _or_sids or fstem in _claude_sids):
+                                        continue
+                                    if _from_stem and fstem.startswith(_from_stem):
+                                        continue
+                                    if fstem[:8] in _claimed:
+                                        continue
+                                    _candidates.append((mt, fstem))
+                                if len(_candidates) == 1:
+                                    _live_sid = _candidates[0][1]
+                        if _live_sid:
+                            live_exec_sessions.setdefault(ag, []).append({
+                                "tmux_session": sname, "live_sid": _live_sid,
+                                "spawn_mode": _si_mode,  # M1774: preserve for fork detection
+                            })
         except Exception:
             pass
+    # Compat shim: live_exec_sid[ag] = first live sid (used by existing injection guard below)
+    live_exec_sid: dict[str, str] = {
+        ag: entries[0]["live_sid"] for ag, entries in live_exec_sessions.items() if entries
+    }
 
     # Build groups per agent
     # M405: track which agents have had exec_live injected — inject only into first model group
     # M1080: global seen_sids per agent — prevent same session from appearing in multiple model groups
+    # M1765: build cross-agent live_sid→tmux_session lookup so transcript rows get tmux_session set
+    _live_sid_to_tmux: dict[str, str] = {}
+    for _ag_entries in live_exec_sessions.values():
+        for _e in _ag_entries:
+            # M1774: skip fork entries — forks share live_sid with mother but should not
+            # override the mother's tmux_session on the transcript row.
+            if _e.get("live_sid") and _e.get("tmux_session") and _e.get("spawn_mode") != "fork":
+                _live_sid_to_tmux[_e["live_sid"]] = _e["tmux_session"]
     _exec_live_injected: set[str] = set()
     for ag in agents:
         _global_seen_sids_for_agent: set[str] = set()
@@ -12468,8 +13187,9 @@ async def get_resumable_sessions(proj_id: str, agent: str = "", model: str = "")
                 else:
                     _foreign_sids = set()
                 if mkey:
-                    # M316: also include {mkey}_prev to preserve old session when new one spawned
-                    hist_keys = [mkey, f"{mkey}_prev"]
+                    # M1802: read the full 5-slot ring (was mkey + mkey_prev only, M316) — see
+                    # _push_session_history_ring for the write side.
+                    hist_keys = _session_history_slot_keys(mkey)
                 else:
                     # M323: include _current for empty model key — this is the default claude session.
                     # _current is set by _update_session_history_from_transcript only on claude spawns,
@@ -12492,58 +13212,101 @@ async def get_resumable_sessions(proj_id: str, agent: str = "", model: str = "")
                             # label reflects runtime model, not historical bucket key. Fixes
                             # case where a sonnet-bucket session is restarted with opus —
                             # bucket key stays "sonnet-4.6" but transcript records opus calls.
-                            _detected = _detect_session_model(t)
+                            # M1806: spawn-info is the highest-fidelity source — records the
+                            # --model flag at spawn time, immune to --resume context inheritance.
+                            # Falls back to _detect_session_model only when no spawn record exists.
+                            _detected = _spawn_sid_to_model.get(sid) or _detect_session_model(t)
+                            # M1760/M1750-c: OpenRouter upstream aliases hy3:free → claude-sonnet-5
+                            # in transcript model field. When the bucket is an OR agent, a detected
+                            # claude-* model is the upstream aliasing artifact — use the bucket key
+                            # (or-*) instead so the session label shows the correct OR model name.
+                            if ag == "openrouter" and _detected and not _detected.startswith("or-"):
+                                _detected = None
                             _effective_model = _detected if _detected else mkey
-                            sessions.append({
+                            _row: dict = {
                                 "id": sid,
                                 "type": "transcript",
                                 "label": sid[:12],
                                 "model": _effective_model,
                                 "activity": t.stat().st_mtime,  # M1018: unix epoch for last-used timestamp
-                            })
+                            }
+                            if sid in _live_sid_to_tmux:
+                                _row["tmux_session"] = _live_sid_to_tmux[sid]
+                            sessions.append(_row)
 
-            # M280/M405: inject live exec session row into the model group matching its
-            # actual detected runtime model — previously injected into first iterated bucket
-            # which caused mislabel when session restarted with different model (M1519).
-            live_sid = live_exec_sid.get(ag)
-            if live_sid and ag in live_by_agent and ag not in _exec_live_injected:
-                if not any(s["id"] == live_sid for s in sessions):
-                    # M1519: detect actual runtime model from live exec transcript so list
-                    # label matches pane label (was: mkey of arbitrary first bucket).
-                    _live_model = mkey
+            # M280/M405/M1765: inject live exec session rows (main + fork children) into the
+            # model group matching their actual runtime model (M1519).
+            # M1765: iterate all live sessions for this agent, not just the first one.
+            _known_keys = {x["key"] for x in agent_models}
+            _proj_dir_for_live = _get_project_dir(proj_id)
+            _proj_enc_live = _encode_cwd_for_claude(str(_proj_dir_for_live)) if _proj_dir_for_live else ""
+            for _live_entry in live_exec_sessions.get(ag, []):
+                live_sid = _live_entry["live_sid"]
+                _tmux_sess = _live_entry["tmux_session"]
+                # M1774: fork session shares live_sid with existing transcript row.
+                # Only treat as fork if spawn_mode=fork (not resume/fresh which legitimately share live_sid).
+                # M1784: previously emitted a SEPARATE "fork" type row alongside the existing
+                # transcript row for the same live_sid, so the same session showed twice in the
+                # resume list (once as "transcript", once as "fork") — filed as MOAT M1774
+                # ("Universeye resume session list 에 중복되는 세션이 확인됨"). Now that the UI no
+                # longer visually distinguishes fork rows (per-user direction: forks should just
+                # be visible, not specially tagged), mutate the existing row in place instead of
+                # inserting a duplicate.
+                _spawn_mode = _live_entry.get("spawn_mode", "")
+                _existing_row = next((s for s in sessions if s["id"] == live_sid), None) if _spawn_mode == "fork" else None
+                _is_fork_of_existing = _existing_row is not None
+                if _is_fork_of_existing:
+                    if _tmux_sess not in _exec_live_injected:
+                        _existing_row["tmux_session"] = _tmux_sess
+                        _exec_live_injected.add(_tmux_sess)
+                    continue
+                if live_sid in _global_seen_sids_for_agent:
+                    continue  # already shown in another model bucket for this agent (e.g. empty-model _current)
+                if _tmux_sess in _exec_live_injected:
+                    continue  # already injected this specific tmux session into some bucket
+                # M1519: detect actual runtime model from live exec transcript
+                # M1806: spawn-info takes priority over transcript scan for live sessions
+                _live_model = mkey
+                try:
+                    _live_model_from_spawn = _spawn_sid_to_model.get(live_sid)
+                    if _live_model_from_spawn:
+                        _live_model = _live_model_from_spawn
+                    elif _proj_enc_live:
+                        _live_t = Path.home() / ".claude" / "projects" / _proj_enc_live / f"{live_sid}.jsonl"
+                        if _live_t.exists() and _live_t.stat().st_size > 0:
+                            _detected_live = _detect_session_model(_live_t)
+                            if _detected_live and ag == "openrouter" and not _detected_live.startswith("or-"):
+                                _detected_live = None
+                            if _detected_live:
+                                _live_model = _detected_live
+                except Exception:
+                    pass
+                _bucket_match = (_live_model == mkey) or (not _live_model and not mkey)
+                _detect_unknown = _live_model and _live_model not in _known_keys
+                if _bucket_match or _detect_unknown:
+                    # M1765: inject as transcript type (same form as other resume rows) but
+                    # include tmux_session so UI can show process-alive dot without special styling.
+                    # Populate activity from transcript mtime so date column renders correctly.
+                    _inj_activity: float = 0.0
                     try:
-                        _proj_dir_for_live = _get_project_dir(proj_id)
-                        if _proj_dir_for_live:
-                            _live_t = Path.home() / ".claude" / "projects" / _encode_cwd_for_claude(str(_proj_dir_for_live)) / f"{live_sid}.jsonl"
-                            if _live_t.exists() and _live_t.stat().st_size > 0:
-                                _detected_live = _detect_session_model(_live_t)
-                                if _detected_live:
-                                    _live_model = _detected_live
+                        if _proj_enc_live:
+                            _inj_t = Path.home() / ".claude" / "projects" / _proj_enc_live / f"{live_sid}.jsonl"
+                            if _inj_t.exists():
+                                _inj_activity = _inj_t.stat().st_mtime
                     except Exception:
                         pass
-                    # M1519: only inject when detected model matches this bucket's mkey
-                    # (or both are empty for default bucket). Skip otherwise — next matching
-                    # bucket iteration will handle it. Falls back to first-bucket behavior
-                    # when no bucket matches (detected model unknown to agent_models).
-                    _bucket_match = (_live_model == mkey) or (not _live_model and not mkey)
-                    _known_keys = {x["key"] for x in agent_models}
-                    # M1555: _detect_unknown must also verify tmux session prefix matches current agent
-                    # — prevents claude transcript leaking into openrouter group when OR spawns after claude
-                    _agent_prefix_chk = {"claude": "claude-exec-", "codex": "codex-exec-", "openrouter": "openrouter-exec-", "dsk": "dsk-exec-"}.get(ag, "claude-exec-")
-                    _live_sess_name = f"{_agent_prefix_chk}{proj_id}"
-                    _live_sess_exists = bool(subprocess.run(["tmux", "has-session", "-t", f"={_live_sess_name}"], capture_output=True, timeout=2).returncode == 0)
-                    _detect_unknown = _live_model and _live_model not in _known_keys and _live_sess_exists
-                    if _bucket_match or _detect_unknown:
-                        # M283: include tmux_session name so UI can attach directly
-                        _agent_prefix = {"claude": "claude-exec-", "codex": "codex-exec-", "openrouter": "openrouter-exec-", "dsk": "dsk-exec-"}.get(ag, "claude-exec-")
-                        sessions.insert(0, {
-                            "id": live_sid,
-                            "type": "exec_live",
-                            "label": f"{live_sid[:12]}",
-                            "model": _live_model or mkey,
-                            "tmux_session": f"{_agent_prefix}{proj_id}",
-                        })
-                        _exec_live_injected.add(ag)
+                    _inj_row: dict = {
+                        "id": live_sid,
+                        "type": "transcript",
+                        "label": live_sid[:12],
+                        "model": _live_model or mkey,
+                        "tmux_session": _tmux_sess,
+                    }
+                    # M1804: fallback to spawn time when transcript not yet written (brand-new session)
+                    _inj_row["activity"] = _inj_activity if _inj_activity else time.time()
+                    sessions.insert(0, _inj_row)
+                    _global_seen_sids_for_agent.add(live_sid)
+                    _exec_live_injected.add(_tmux_sess)  # M1765: key by tmux name, not agent
 
             # Add fresh option
             sessions.append({
@@ -12823,6 +13586,11 @@ def _norm_session_model(raw: str) -> str:
     return raw
 
 
+# M1821-P1: mtime-keyed in-memory cache — avoids full JSONL re-read on every 15s poll.
+# Key: str(path), Value: (mtime_float, detected_model_str). Invalidated on mtime change.
+_session_model_cache: dict[str, tuple[float, str]] = {}
+
+
 def _detect_session_model(transcript_path: Path, max_lines: int = 50, prefer_tail: bool = True) -> str:
     """Detect which model was used in a Claude session transcript.
 
@@ -12831,7 +13599,25 @@ def _detect_session_model(transcript_path: Path, max_lines: int = 50, prefer_tai
     instead of the original spawning model. Falls back to head scan when no
     model field is found in the tail (e.g. very short transcripts).
     M1550: result is normalized via _norm_session_model so caller always gets a catalog key.
+    M1806: scan from the last session-boundary marker (type=mode or permission-mode)
+    forward, not just the tail. --resume sessions inherit context from the previous
+    session's JSONL entries (which carry the previous model), so a simple tail scan
+    picks up the inherited model instead of the current invocation's model. The
+    type=mode / permission-mode entries are emitted by Claude Code at the start of each
+    new invocation; entries after the LAST such marker belong to the current run.
+    M1821-P1: check mtime cache before reading file — active sessions update mtime on
+    each tool call; idle sessions' mtime is stable → cache hit rate is high in practice.
     """
+    # P1 cache check
+    _cache_key = str(transcript_path)
+    try:
+        _cur_mtime = transcript_path.stat().st_mtime
+        _cached = _session_model_cache.get(_cache_key)
+        if _cached and _cached[0] == _cur_mtime:
+            return _cached[1]
+    except Exception:
+        _cur_mtime = None
+
     def _extract_model(entry):
         if not isinstance(entry, dict):
             return ""
@@ -12848,41 +13634,64 @@ def _detect_session_model(transcript_path: Path, max_lines: int = 50, prefer_tai
             return ""
         return s
 
+    _SESSION_BOUNDARY_TYPES = {"mode", "permission-mode"}
+
+    _result = ""
     try:
         if prefer_tail:
-            # Tail-first scan: read last ~200KB and parse last max_lines entries
+            # M1806: read the full file to find the last session-boundary marker, then
+            # scan only entries after it. Boundary markers (type=mode / permission-mode)
+            # are emitted at the start of each Claude invocation; entries following the
+            # LAST marker belong exclusively to the current run — no inherited context.
+            # Falls back to raw tail scan when no boundary is found (e.g. old transcripts).
             try:
-                fsize = transcript_path.stat().st_size
-                read_bytes = min(fsize, 200_000)
-                with transcript_path.open("rb") as f:
-                    f.seek(fsize - read_bytes)
-                    chunk = f.read().decode("utf-8", errors="replace")
-                tail_lines = [ln for ln in chunk.splitlines() if ln.strip()][-max_lines:]
-                for line in reversed(tail_lines):
+                all_lines = transcript_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                last_boundary_idx = -1
+                for _i, _ln in enumerate(all_lines):
+                    if not _ln.strip():
+                        continue
+                    try:
+                        _e = json.loads(_ln)
+                        if isinstance(_e, dict) and _e.get("type") in _SESSION_BOUNDARY_TYPES:
+                            last_boundary_idx = _i
+                    except Exception:
+                        continue
+                # Scan entries after the last boundary (current-run entries only)
+                scan_lines = all_lines[last_boundary_idx + 1:] if last_boundary_idx >= 0 else all_lines[-max_lines:]
+                for line in reversed(scan_lines):
+                    if not line.strip():
+                        continue
                     try:
                         m = _extract_model(json.loads(line))
                         if m:
-                            return _norm_session_model(m)
+                            _result = _norm_session_model(m)
+                            break
                     except Exception:
                         continue
+                # No model found in current-run entries — fall through to head scan
             except Exception:
                 pass
         # Head scan fallback
-        with transcript_path.open("r", encoding="utf-8", errors="replace") as f:
-            for i, line in enumerate(f):
-                if i >= max_lines:
-                    break
-                if not line.strip():
-                    continue
-                try:
-                    m = _extract_model(json.loads(line))
-                    if m:
-                        return _norm_session_model(m)
-                except Exception:
-                    continue
+        if not _result:
+            with transcript_path.open("r", encoding="utf-8", errors="replace") as f:
+                for i, line in enumerate(f):
+                    if i >= max_lines:
+                        break
+                    if not line.strip():
+                        continue
+                    try:
+                        m = _extract_model(json.loads(line))
+                        if m:
+                            _result = _norm_session_model(m)
+                            break
+                    except Exception:
+                        continue
     except Exception:
         pass
-    return ""
+    # P1: store in cache keyed by mtime so next call on unchanged file is free
+    if _cur_mtime is not None:
+        _session_model_cache[_cache_key] = (_cur_mtime, _result)
+    return _result
 
 
 @app.get("/health/{service}")

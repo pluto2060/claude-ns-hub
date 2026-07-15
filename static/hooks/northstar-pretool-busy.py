@@ -27,8 +27,11 @@ try:
     if not proj_id:
         sys.exit(0)
 
-    sk, is_exec = "", False
-    if os.environ.get("TMUX"):
+    # M1766: NS_SESSION_KEY (set at spawn time) first — see northstar-stop-idle.py docstring.
+    sk, is_exec = os.environ.get("NS_SESSION_KEY", "").strip(), False
+    if sk:
+        is_exec = "-exec-" in sk
+    elif os.environ.get("TMUX"):
         try:
             import subprocess
             sk = subprocess.run(["tmux", "display-message", "-p", "#S"],

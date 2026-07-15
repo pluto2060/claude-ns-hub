@@ -322,6 +322,7 @@ header {
 .ns-sess-done      { background: #3b6a9a; color: #fff; }
 .ns-sess-detached  { background: #6b5ea8; color: #fff; }
 @keyframes sess-pulse { 0%,100%{opacity:1} 50%{opacity:.65} }
+@keyframes arc-spin { from { transform: rotate(-90deg); } to { transform: rotate(270deg); } }
 @keyframes ns-blink { 0%,100%{opacity:.85;border-color:var(--accent)} 50%{opacity:.4;border-color:var(--accent-deep)} }
 /* M370: mascot feeding animations */
 @keyframes mascot-happy { 0%,100%{transform:scale(1) rotate(0deg)} 25%{transform:scale(1.3) rotate(-15deg)} 75%{transform:scale(1.3) rotate(15deg)} }
@@ -539,25 +540,51 @@ header {
 @keyframes stop-pulse { from { opacity:.6; } to { opacity:1; } }
 /* M1418: tab-hidden animation pause via CSS custom property — covers all infinite animations */
 /* M1581: added .ns-node.circle-card.has-bang, .ss-cnt-blink, .live-dot */
-.ns-term.live, .ns-node-term.live,
+/* M1776-b: decorative-only — gated by --anim-state (paused on hidden tab OR foreground-idle).
+   These have no status meaning (spinners, mascot, generic loading dots), so freezing them
+   while the user isn't touching the screen is pure heat savings with no information loss. */
 .ns-card-pointer.on.bang,
 [style*="animation:dm-spin"], [style*="animation: dm-spin"],
-.dm-sess-row .ns-node-term.live,
-.ms-stone.active,
 .ns-mascot-wrap,
 .ns-mascot,
 .dm-spinner,
-.ns-node-term,
 .ns-node.circle-card.has-bang,
+.dm-btn.exec-loading,
+.nt-table tr.ss-row-blink td::before,
+#cg-loading-spin,
+[style*="animation:typingPulse"], [style*="animation: typingPulse"] { animation-play-state: var(--anim-state, running) !important; }
+/* M1776-b: genuine status indicators — gated ONLY by --busy-anim-state (hidden-tab only, never
+   foreground-idle). These communicate "something is actually running/needs attention right
+   now" (live session dot, busy avatar ring, unread evidence bang) — must keep pulsing whenever
+   a real background process is live, even while the user is just looking without touching.
+   Root cause this tier fixes: a genuinely busy session's avatar visually looked identical to
+   an idle one after 20s of no touch, only "recovering" on any interaction (reload, scroll),
+   which read as "avatar not lighting up / need to refresh to see it." */
+.ns-term.live, .ns-node-term.live,
+.dm-sess-row .ns-node-term.live,
+.ms-stone.active,
+.ns-node-term,
 .ss-cnt-blink,
 .live-dot,
+.ns-node.exec-live,
+.ns-card-pointer.on,
+.pty-load-dot,
+.ns-sess-running,
+.dm-section-label .live-dot,
+.avatar-ring.status-active,
+.ns-sess-mini-avatar.ns-sess-mini-active,
+.nt-msg-bang,
+.nt-evidence-bang,
+[style*="animation:sess-pulse"], [style*="animation: sess-pulse"],
 /* M1757: cg-* animations run while tab is backgrounded — no --anim-state gate was set */
 .cg-card.cg-blink-active,
 .cg-card.cg-blink-active .cg-ring,
 .cg-card.cg-link-src,
-.cg-card.cg-link-src .cg-ring { animation-play-state: var(--anim-state, running); }
+.cg-card.cg-link-src .cg-ring,
+/* M1831: arc-spin must also pause when tab hidden */
+.ns-node.exec-live .progress-arc-wrap svg { animation-play-state: var(--busy-anim-state, running) !important; }
 /* M1581: ms-running-highlight uses !important on animation shorthand — must match with !important */
-.nt-table tr.ms-running-highlight td { animation-play-state: var(--anim-state, running) !important; }
+.nt-table tr.ms-running-highlight td { animation-play-state: var(--busy-anim-state, running) !important; }
 /* Stone content */
 .ms-stone-body { padding-left: 4px; }
 .ms-stone-title {
@@ -1108,9 +1135,14 @@ header {
 .dm-pane-body { padding: 6px 10px; }
 .dm-sess-fresh { color: var(--yellow,#d4a574) !important; }
 .dm-sess-resume { color: var(--text) !important; }
-.dm-sess-row { display: flex; align-items: center; gap: 4px; padding: 5px 8px;
+/* M1775: grid instead of flex — model/date/button stay in fixed columns regardless of how
+   many optional badges (live, etc.) appear in the info cell, so rows align consistently
+   whether or not a row happens to be live. */
+.dm-sess-row { display: grid; grid-template-columns: 10px minmax(0,1fr) auto auto auto;
+  align-items: center; column-gap: 4px; padding: 5px 8px;
   border-radius: 4px; cursor: pointer; font-size: 9px; border: 1px solid transparent;
-  flex-wrap: nowrap; min-width: 0; }
+  min-width: 0; }
+.dm-sess-row-info { display: flex; align-items: center; gap: 4px; min-width: 0; overflow: hidden; }
 .dm-sess-row:hover { background: rgba(0,0,0,.06); }
 .dm-sess-row.picked {
   background: rgba(61,139,94,.12);
@@ -1557,19 +1589,21 @@ header {
    "링에 걸치지 말고" correction was catching. Fixed with actual internal-tangent-circle math:
    for a main circle radius R and inner circle radius r placed along the diagonal, the inner
    circle stays fully inside iff center-distance d = R-r (touches at exactly one point, no
-   overflow). Solved for R=36(-1px shadow-spread margin), r2=20 (40px, up from 38px per
-   "원 크기를 좀 더 키워도 될듯") → offset 5.39px from the ring's own edge; then recursed
-   one level for r3=9 (18px) inside the r2=20 box → offset 3.93px from the 2nd avatar's edge.
+   overflow). M1779: all inner avatars +25%, geometric ratio k=1.44 maintained (72:50:35).
+   R_eff=35 (72px ring -1px shadow), r2=25 (50px) → d=10 → offset 3.93px from ring edge;
+   r3=17.5 (35px = 50/1.44) inside r2=25 (50px) → d=7.5 → offset 2.20px from 2nd corner.
    State conveyed by opacity (matches the main avatar's own running=1/idle=0.3 convention). */
 .ns-sess-avatars { position:absolute; inset:0; z-index:5; pointer-events:none; }
-.ns-sess-mini-wrap { position:absolute; bottom:5.39px; right:5.39px; width:40px; height:40px; }
+.ns-sess-mini-wrap { position:absolute; bottom:3.93px; right:3.93px; width:50px; height:50px; }
 /* M1714-g: border color fixed — var(--bg) (dark) was invisible against the avatar art itself
    (also dark-toned), making the two overlapping circles blend into one blurry blob (user
    screenshot IMG_2283 confirmed this on a real 3-session test). Switched to a fixed light
    ring (rgba(255,255,255,.85)) which contrasts against both light AND dark avatar content,
    plus a darker outer shadow ring for separation against light backgrounds too. */
 .ns-sess-mini-avatar { position:absolute; inset:0; width:100%; height:100%; border-radius:50%; object-fit:cover; border:2px solid rgba(255,255,255,.85); box-shadow:0 0 0 1px rgba(0,0,0,.6), 0 1px 4px rgba(0,0,0,.5); background:var(--bg-deep); }
-.ns-sess-mini-avatar.ns-sess-nested { inset:auto; bottom:3.93px; right:3.93px; width:18px; height:18px; border-width:1.5px; box-shadow:0 0 0 1px rgba(0,0,0,.6), 0 1px 2px rgba(0,0,0,.5); }
+.ns-sess-mini-avatar.ns-sess-nested { inset:auto; bottom:2.20px; right:2.20px; width:35px; height:35px; border-width:1.5px; box-shadow:0 0 0 1px rgba(0,0,0,.6), 0 1px 2px rgba(0,0,0,.5); }
+/* M1838: 4th session avatar, r4=12 (24px), nested inside 3rd (35px). d=r3-r4=5.5 → offset=2.20px identical to 3rd level (same internal-tangent formula). */
+.ns-sess-mini-avatar.ns-sess-deep-nested { inset:auto; bottom:2.20px; right:2.20px; width:24px; height:24px; border-width:1px; box-shadow:0 0 0 1px rgba(0,0,0,.6), 0 1px 2px rgba(0,0,0,.5); }
 /* M1729: mirrors .avatar-ring.status-active (border=accent + sess-pulse) for running child sessions */
 .ns-sess-mini-avatar.ns-sess-mini-active { border-color:var(--accent); animation:sess-pulse 3s ease-in-out infinite; }
 .ns-sess-mini-fallback { display:flex; align-items:center; justify-content:center; font-family:var(--mono); font-size:11px; font-weight:700; color:var(--text-dim); }
@@ -1583,6 +1617,8 @@ header {
 .card-metric.ms { color:var(--accent); }
 .progress-arc-wrap { position:absolute; top:-22px; left:-22px; width:116px; height:116px; pointer-events:none; }
 .progress-arc-wrap svg { transform:rotate(-90deg); }
+/* M1831: arc-ring 360° rotation while exec session is running */
+.ns-node.exec-live .progress-arc-wrap svg { animation: arc-spin 4s linear infinite; animation-play-state: var(--busy-anim-state, running); }
 .arc-bg  { fill:none; stroke:var(--panel-border); stroke-linecap:butt; }
 .arc-fill{ fill:none; stroke-linecap:butt; transition:stroke-dashoffset .4s ease; }
 .arc-deadline { stroke:#4a9fd4; } .arc-star { stroke:var(--green); } .arc-milestone { stroke:var(--accent); }
@@ -1600,6 +1636,7 @@ header {
 }
 .ns-lane-nodes:has(.ns-card-pointer.on) .ns-node.circle-card:not(:has(.ns-card-pointer.on)):not(.ns-hidden) {
   animation: card-bg-sync 3s ease-in-out infinite;
+  animation-play-state: var(--anim-state, running); /* M1776: mobile-heat audit */
   border-radius: 12px;
 }
 .ns-lane-nodes:has(.ns-card-pointer.on) .ns-node.circle-card:not(:has(.ns-card-pointer.on)):not(.ns-hidden):hover {
@@ -2821,10 +2858,16 @@ function _buildRetiredRow(m, projId) {
 async function _restoreRetiredStone(projId, mid, btn) {
   if (btn) { btn.disabled = true; btn.textContent = '…'; }
   try {
+    // M1769: if stone previously reached pending_confirmation, restore to pc not pending
+    const _stoneSrc = ((window._doneStoneCache||{})[projId]||[]).find(s=>s.id===mid);
+    const _wasPC = !!(_stoneSrc && _stoneSrc.pending_confirm_at);
+    const _restorePayload = _wasPC
+      ? {done: false, status: 'pending_confirmation', pending_confirm_at: _stoneSrc.pending_confirm_at}
+      : {done: false, status: 'pending'};
     const r = await fetch(`/api/northstar/${encodeURIComponent(projId)}/milestones/${encodeURIComponent(mid)}`, {
       method: 'PATCH',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({done: false, status: 'queued'})
+      body: JSON.stringify(_restorePayload)
     });
     if (r.ok) {
       const row = btn ? btn.closest('tr') : null;
@@ -6342,6 +6385,7 @@ async function setProjectAgent(projId, agent, sel) {
   const sessBody = document.getElementById('dm-session-pane-body');
   if (sessBody) sessBody.innerHTML = `<div style="color:var(--text-dim);font-size:9px;opacity:.6;padding:2px 0;display:flex;align-items:center;gap:5px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;border:1px solid var(--text-dim);border-top-color:transparent;animation:dm-spin .7s linear infinite"></span>loading sessions…</div>`;
   if (typeof window._renderResumableSessions === 'function') window._renderResumableSessions();
+  _updateModelPaneSummary();
   if (status) { status.textContent = '…'; status.style.color = 'var(--text-dim)'; }
   // ── Persist to server in background ──────────────────────────────────────
   try {
@@ -6394,6 +6438,7 @@ async function setProjectModel(projId, model, sel) {
     if (window._selectedSession) window._selectedSession.model = model;
     // M233 v2: sync all per-session row selectors so they show the same value.
     document.querySelectorAll('.dm-model-select').forEach(s => { if (s !== sel) s.value = model; });
+    _updateModelPaneSummary();
     // If a session is alive, offer to restart so the new model env applies now.
     // Otherwise the change only takes effect on the next manual spawn.
     try {
@@ -6440,6 +6485,19 @@ async function setContinuityMode(projId, mode, sel) {
 }
 
 // Select a resumable session (agent + model + session_id) for the next Execute
+function _updateModelPaneSummary() {
+  const summary = document.getElementById('dm-model-pane-summary');
+  const paneBody = document.getElementById('dm-model-pane-body');
+  if (!summary || !paneBody) return;
+  const collapsed = paneBody.style.display === 'none';
+  if (!collapsed) { summary.style.display = 'none'; return; }
+  const agent = document.getElementById('dm-agent-select')?.value || '';
+  const model = document.getElementById('dm-model-select')?.value || '';
+  const agentLabel = agent === 'claude' ? 'Claude Code' : agent === 'openrouter' ? 'OpenRouter' : agent || 'claude';
+  const modelShort = model.replace(/^claude-/, '').replace(/^or-/, '').replace(/-\d{8}$/, '');
+  summary.textContent = agentLabel + ' · ' + (modelShort || '—');
+  summary.style.display = '';
+}
 function toggleDmPane(paneId) {
   const body = document.getElementById(paneId + '-body');
   // Generic caret: derive from pane id (dm-model-pane→dm-model-caret, etc.)
@@ -6649,16 +6707,57 @@ function _selectSession(agent, model, sessionId) {
     const dot = r.querySelector('span');
     if (dot) dot.style.color = isPicked ? 'var(--green)' : 'var(--text-dim)';
   });
-  // Sync agent selector only — M1746: do NOT sync model dropdown on session row click.
-  // Model dropdown is for dispatch target; session row click is for resume/fork targeting only.
-  const agentSel = document.getElementById('dm-agent-select');
-  if (agentSel) agentSel.value = agent;
+  // M1793: do NOT sync agent/model dropdowns on session row click.
+  // Both dropdowns are user-intent; row click sets resume target only.
   // Async re-render to sync server state
   if (typeof window._renderResumableSessions === 'function') window._renderResumableSessions();
 }
 
+// M1784: dispatch THIS resume-list row's session directly, replacing the old two-step
+// "click row to select, then click the separate global dispatch-all button" flow. Reuses
+// executeProject() as-is (same options-changed/kill-respawn/unassigned-substars/tmux-watch
+// handling that the old global button relied on) — only the target session_id changes,
+// from "whatever window._selectedSession happens to hold" to "the row that was clicked".
+function _dispatchRowSession(projId, agent, model, sessionId, btnEl) {
+  // M1834: suppress _renderResumableSessions' loading-clear path during dispatch.
+  // _selectSession (called next) synchronously calls _renderResumableSessions(), which starts
+  // a fetch. That fetch can complete while executeProject is still awaiting fetch('/api/exec-sessions')
+  // (the confirm-restart check at ~L6761), resolving with _hashChanged=true and clearing
+  // loadingOwner='dispatch' BEFORE startTmuxWatch ever promotes it to 'tmux' — spinner dies early.
+  // Setting this flag here (before _selectSession) makes _renderResumableSessions skip the
+  // loadingOwner clear for this transient call only. executeProject clears it once POST lands.
+  window._dispatchInFlight = true;
+  _selectSession(agent, model, sessionId);
+  // M1793: do NOT override #dm-model-select.value here. The old override (M1746 workaround)
+  // forced the row's session model into the dropdown, wiping any user-changed model selection.
+  // Now that the server's _options_changed check and kill+respawn path handle model mismatches,
+  // the dropdown value IS the user's intent — if it already matches the session model (M267
+  // sync), no change happens; if user changed it, the mismatch triggers kill+respawn correctly.
+  executeProject(projId, btnEl);
+}
+
 async function executeProject(projId, btn) {
   if (btn.classList.contains('running')) return;
+
+  // M1791: show loading state immediately — before any await — so mobile users get instant
+  // visual feedback. Previously btn.classList.add('running') and _dmLoadModal.classList.add('loading')
+  // came after the /api/exec-sessions await (~200-500ms on cellular), leaving the button
+  // unresponsive with no spinner during that gap.
+  btn.classList.add('running', 'exec-loading');
+  const _dmLoadModalEarly = document.getElementById('detail-modal');
+  if (_dmLoadModalEarly) {
+    _dmLoadModalEarly.classList.add('loading');
+    _dmLoadModalEarly.dataset.loadingOwner = 'dispatch';
+    // M1791-b/c: hard-stop fallback (_SPAWN_LOADING_TIMEOUT_MS) covers both 'dispatch'
+    // (pre-tmux) and 'tmux' (post-startTmuxWatch promotion) in case tmux never responds
+    // or the tab goes hidden and misses the running poll. No hardcoded literal here.
+    setTimeout(() => {
+      if (_dmLoadModalEarly.dataset.loadingOwner === 'dispatch' || _dmLoadModalEarly.dataset.loadingOwner === 'tmux') {
+        _dmLoadModalEarly.classList.remove('loading');
+        delete _dmLoadModalEarly.dataset.loadingOwner;
+      }
+    }, _SPAWN_LOADING_TIMEOUT_MS);
+  }
 
   // M284/M425: confirm at dispatch time if new options differ — use in-modal dialog (not browser confirm)
   window._execRestartOk = window._execRestartOk || {};
@@ -6679,6 +6778,13 @@ async function executeProject(projId, btn) {
         const _curModel = _live.model || '';
         if (_newAgent !== _curAgent || _newModel !== _curModel) {
           // M425: use in-card _nsConfirm instead of browser confirm()
+          // M1791: clear early-hoisted loading state — confirm dialog replaces the spinner
+          btn.classList.remove('running', 'exec-loading');
+          const _dmConfirmModal = document.getElementById('detail-modal');
+          if (_dmConfirmModal && _dmConfirmModal.dataset.loadingOwner === 'dispatch') {
+            _dmConfirmModal.classList.remove('loading');
+            delete _dmConfirmModal.dataset.loadingOwner;
+          }
           _nsConfirm(
             'Restart exec session?',
             `${_curAgent}/${_curModel||'default'} → ${_newAgent}/${_newModel||'default'}`,
@@ -6691,9 +6797,7 @@ async function executeProject(projId, btn) {
   }
   delete window._execRestartOk[projId]; // clear flag after passing check
 
-  btn.classList.add('running', 'exec-loading');
   const orig = btn.textContent;
-  btn.textContent = '◌ Launching…';
   try {
     // M219: snapshot session_id BEFORE any awaits that trigger _renderResumableSessions
     // (setProjectAgent/Model call _renderResumableSessions which can race-reset _selectedSession)
@@ -6705,43 +6809,42 @@ async function executeProject(projId, btn) {
     const agent = agentSel ? agentSel.value : 'claude';
     const model = modelSel ? modelSel.value : '';
     const continuity = contSel ? contSel.value : 'isolated';
-    // M1120 optimistic: immediately assign session name in local cache so the sess badge
-    // appears at once — before the execute POST returns (which can take 12s waiting for Claude).
-    // Server canonically writes assigned_session synchronously before tmux spawn; we just
-    // mirror that write client-side so the UI doesn't lag by the full startup wait time.
-    // M1225: only apply optimistic write when queued stones exist — prevents main→sess flicker
-    // on idle dispatch (0 queued) where server won't write assigned_session.
+    // M1120 optimistic: assign session name in local cache so sess badge appears quickly.
+    // M1796: session_name now includes a UUID suffix (unknown pre-POST); optimistic write is
+    // deferred to after the execute response arrives (see _applyOptSessAssign below).
+    // _optHasQueued still guards server-side server won't write assigned_session when idle.
     const _optHasQueued = (_msCacheByProject[projId] || []).some(m => m.status === 'queued' && !m.held && (m.text||'').trim());
-    const _optSessName = `${agent}-exec-${projId}`;
-    // M1148 fix: use _nsStarsCache directly (const in script scope) not window._nsStarsCache (always undefined)
-    const _optStars = _optHasQueued ? (_nsStarsCache[projId] || []) : [];
-    let _optChanged = false;
-    const _optExecPat = new RegExp(`-exec-${projId}$`);
-    const _optIsMain = _optExecPat.test(_optSessName);
-    const _optBtnLabel = _optIsMain ? 'main' : (_optSessName.replace(new RegExp(`.*-exec-${projId}-`), '') || 'branch');
-    const _optBtnColor = _optIsMain ? 'var(--green)' : '#7b9fd4';
-    const _optBtnBorder = _optIsMain ? 'rgba(61,139,94,.4)' : 'rgba(123,159,212,.4)';
-    const _optBtnBg = _optIsMain ? 'rgba(61,139,94,.12)' : 'rgba(123,159,212,.12)';
-    for (const ns of _optStars) {
-      if (ns && typeof ns === 'object' && !(ns.assigned_session || '').trim()) {
-        ns.assigned_session = _optSessName;
-        _optChanged = true;
-        // M1148: immediately update sessBtn DOM so badge reflects assignment without waiting for poll
-        const _sb = document.querySelector(`[data-ns-sess-btn="${ns.id}"]`);
-        if (_sb) {
-          _sb.textContent = _optBtnLabel;
-          _sb.title = `Assigned: ${_optSessName} — click to view/change`;
-          _sb.style.color = _optBtnColor;
-          _sb.style.borderColor = _optBtnBorder;
-          _sb.style.background = _optBtnBg;
-        }
-      }
-    }
-    if (_optChanged && typeof _renderSubStarsPaneFromCache === 'function') {
-      _renderSubStarsPaneFromCache(projId);
-    }
     // M1220: guard against hub-refresh overwriting optimistic assigned_session during POST window
     window._dispatchOptimisticUntil = Date.now() + 20000;
+    // Helper: apply session badge to unassigned substars once we know the real session_name
+    function _applyOptSessAssign(sessName) {
+      if (!sessName || !_optHasQueued) return;
+      const _optStars2 = _nsStarsCache[projId] || [];
+      let _optChanged2 = false;
+      const _optSuffix = sessName.replace(new RegExp(`.*-exec-${projId}-?`), '') || '';
+      const _optIsMain2 = !_optSuffix || _optSuffix === sessName; // shouldn't happen with M1796, but guard
+      const _optBtnLabel = _optIsMain2 ? 'main' : (_optSuffix || 'branch');
+      const _optBtnColor = 'var(--green)';
+      const _optBtnBorder = 'rgba(61,139,94,.4)';
+      const _optBtnBg = 'rgba(61,139,94,.12)';
+      for (const ns of _optStars2) {
+        if (ns && typeof ns === 'object' && !(ns.assigned_session || '').trim()) {
+          ns.assigned_session = sessName;
+          _optChanged2 = true;
+          const _sb = document.querySelector(`[data-ns-sess-btn="${ns.id}"]`);
+          if (_sb) {
+            _sb.textContent = _optBtnLabel;
+            _sb.title = `Assigned: ${sessName} — click to view/change`;
+            _sb.style.color = _optBtnColor;
+            _sb.style.borderColor = _optBtnBorder;
+            _sb.style.background = _optBtnBg;
+          }
+        }
+      }
+      if (_optChanged2 && typeof _renderSubStarsPaneFromCache === 'function') {
+        _renderSubStarsPaneFromCache(projId);
+      }
+    }
 
     // Persist choices so the server reads them on spawn
     if (agent !== (window.curAgent || 'claude')) {
@@ -6765,8 +6868,11 @@ async function executeProject(projId, btn) {
       body: JSON.stringify(body),
     });
     const d = await r.json();
+    // M1796: apply session badge optimistically now that real session_name is known from response
+    if (d.ok && d.session) _applyOptSessAssign(d.session);
     // M811: 409 = unassigned substars — simple notification modal (English, no session pickers)
     if (r.status === 409 && d.error === 'unassigned_substars') {
+      delete window._dispatchInFlight;
       btn.textContent = orig; btn.classList.remove('running', 'exec-loading');
       const _nsCount = (d.substar_ids || []).length;
       const _nsNames = (d.substar_names || d.substar_ids || []);
@@ -6801,6 +6907,7 @@ async function executeProject(projId, btn) {
       (d.mode === 'tmux_active' && (d.tasks_created || 0) === 0)
     );
     if (noWork) {
+      delete window._dispatchInFlight;
       btn.classList.remove('exec-loading');
       btn.textContent = 'no tasks';
       btn.title = 'No queued / pending stones to dispatch';
@@ -6810,42 +6917,25 @@ async function executeProject(projId, btn) {
     }
     if (d.ok) {
       btn.title = d.message;
+      // M1834: POST /execute landed — _dispatchInFlight guard no longer needed.
+      // From here loadingOwner is promoted to 'tmux' (startTmuxWatch below) so
+      // _renderResumableSessions' dispatch-clear path is already gated by owner check.
+      delete window._dispatchInFlight;
       if (d.mode === 'tmux' || d.mode === 'tmux_active') {
         // Keep loading state — startTmuxWatch will clear it once session is confirmed running
         window._execLaunchBtn = btn;
-        startTmuxWatch(projId);
+        startTmuxWatch(projId, d.session || '');
         // Refresh stone badges — server just acked/queued new pending stones
         loadMilestones(projId);
         // M1120: also refresh north-stars so sess badge ("main"/"branch") updates immediately
         if (typeof loadSubStars === 'function') loadSubStars(projId);
-        // M1159: optimistic exec-session pill — render immediately from dispatch response
-        // so user sees the live row in detail card without waiting for the next /api/exec-sessions
-        // poll (which has up to a multi-second lag on openrouter cold starts).
-        window._dispatchOptimisticAt = window._dispatchOptimisticAt || {};
-        window._dispatchOptimisticAt[projId] = Date.now();
-        const _optInfo = document.getElementById('dm-exec-sessions');
-        const _optSess = d.session || (d.spawned_sessions && d.spawned_sessions[0]) || '';
-        if (_optInfo && _optSess) {
-          const _optModel = (typeof fmtModelName === 'function' ? fmtModelName(window.curModel || '') : (window.curModel || ''));
-          const _optChip = _optModel
-            ? `<span style="font-family:var(--mono);font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.22);color:var(--text);letter-spacing:.03em;font-weight:500">${esc(_optModel)}</span>`
-            : '';
-          _optInfo.innerHTML = `<div style="margin-top:6px;border-radius:7px;overflow:hidden;border:1px solid rgba(61,139,94,.22)">
-            <div style="display:flex;align-items:center;gap:8px;padding:6px 10px;background:rgba(61,139,94,.06)"
-              onclick="_toggleTmux('${esc(projId)}','${esc(_optSess)}');event.stopPropagation()">
-              <span style="width:8px;height:8px;border-radius:50%;background:var(--green);flex-shrink:0;box-shadow:0 0 6px rgba(61,139,94,.5);animation:sess-pulse 3s ease-in-out infinite"></span>
-              <div style="flex:1;min-width:0;cursor:pointer" title="Click to open/close terminal overlay">
-                <div style="font-family:var(--mono);font-size:10px;color:var(--green);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(_optSess)}</div>
-                <div style="font-family:var(--mono);font-size:8px;color:var(--text-dim);margin-top:1px;letter-spacing:.03em;display:flex;align-items:center;gap:6px;flex-wrap:wrap">starting… ${_optChip}</div>
-              </div>
-              <span class="ns-node-term live" style="font-size:8px;padding:1px 6px;cursor:pointer;flex-shrink:0"
-                title="Attach to live exec session (in-page terminal)"
-                onclick="event.stopPropagation();openTerminal('${esc(projId)}',undefined,undefined,'${esc(_optSess)}')">⌨_</span>
-              <span class="ns-node-term live" style="display:none;font-size:8px;padding:1px 6px;cursor:pointer;flex-shrink:0"
-                title="Open in browser terminal (ttyd — best on mobile)"
-                onclick="event.stopPropagation();openTtydTerminal('${esc(_optSess)}','${esc(projId)}')">↗_</span>
-            </div></div>`;
-        }
+        // M1801: M1159's optimistic "starting…" pill removed — the M1796 card-wide loading
+        // overlay already covers the card until the session pane has real content, so this
+        // placeholder was redundant (and its own real-data-replacement timing bug was the
+        // subject of M1788/M1800: the two could race, leaving "starting…" visibly stuck for
+        // a moment even after the overlay had already cleared). dm-exec-sessions now stays
+        // empty until _refreshExecState's own poll (scheduled right below) fills it with the
+        // genuine session data — no synthetic intermediate state to keep in sync.
         // M220: refresh session pane — fast first poll (200ms) then slower follow-ups
         [200, 1500, 4000, 10000, 18000].forEach(d => setTimeout(() => {
           if (typeof window._renderResumableSessions === 'function') window._renderResumableSessions();
@@ -6862,6 +6952,11 @@ async function executeProject(projId, btn) {
       } else {
         btn.classList.remove('exec-loading');
         btn.textContent = d.mode === 'init' ? '⊕' : '✓';
+        // M1796: no tmux spawn happened (e.g. no_queued_work) — nothing will re-trigger
+        // _renderResumableSessions from this dispatch, so the overlay's one clear-point
+        // (inside that function's fetch .then()) will never fire from this path. Clear here.
+        const _dmLoadNoop = document.getElementById('detail-modal');
+        if (_dmLoadNoop) { _dmLoadNoop.classList.remove('loading'); delete _dmLoadNoop.dataset.loadingOwner; }
       }
       // Show results panel
       const resPanel = document.getElementById('dm-task-results');
@@ -6891,12 +6986,23 @@ async function executeProject(projId, btn) {
         }, 5000);
       }
     } else {
+      delete window._dispatchInFlight;
       btn.textContent = d.error?.includes('No active terminal') ? '⚠' : '!';
       btn.classList.remove('exec-loading');
       btn.title = d.error || 'Error';
       setTimeout(() => { btn.textContent = orig; btn.title = 'Execute'; btn.classList.remove('running'); }, 3000);
+      // M1796: server-level error (d.ok===false) — this path never reaches the session
+      // pane's fetch .then() clear-point, so clear the overlay directly here.
+      const _dmLoadErr = document.getElementById('detail-modal');
+      if (_dmLoadErr) { _dmLoadErr.classList.remove('loading'); delete _dmLoadErr.dataset.loadingOwner; }
     }
-  } catch(_) { btn.textContent = orig; btn.classList.remove('running', 'exec-loading'); }
+  } catch(_) {
+    delete window._dispatchInFlight;
+    btn.textContent = orig; btn.classList.remove('running', 'exec-loading');
+    // M1796: network/exception path — same direct clear as the server-error branch.
+    const _dmLoadCatch = document.getElementById('detail-modal');
+    if (_dmLoadCatch) { _dmLoadCatch.classList.remove('loading'); delete _dmLoadCatch.dataset.loadingOwner; }
+  }
 }
 
 async function runMilestone(projId, mid, btn) {
@@ -7486,7 +7592,7 @@ async function _loadClaudeUsage(force) {
     el.innerHTML = render.html;
     el.dataset.lastGood = '1';
     el.style.display = 'inline-flex';
-    try { localStorage.setItem(_USAGE_LS_KEY, JSON.stringify({html: render.html, ts: Date.now()})); } catch(_) {}
+    try { localStorage.setItem(_USAGE_LS_KEY, JSON.stringify({html: render.html, payload: d, ts: Date.now()})); } catch(_) {}
   } catch(_) {
     el.style.opacity = '1';     // network error — keep last good
   }
@@ -7504,6 +7610,7 @@ document.addEventListener('DOMContentLoaded', () => {
           el.innerHTML = cached.html;
           el.dataset.lastGood = '1';
           el.style.display = 'inline-flex';
+          if (cached.payload) _lastUsagePayload = cached.payload; // M1787: restore for reset popup
         }
       }
     } catch(_) {}
@@ -7513,8 +7620,46 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 // M1418: pause CSS animations when tab hidden — reduces SwiftShader compositing CPU load
 // M1581: also pause/resume tmux 1s poll to reduce mobile radio wakeups and CPU heat
+// M1776: extended to foreground-idle — M1418/M1581 only paused on visibilitychange (tab
+// backgrounded), so a phone with the dashboard open and on-screen but untouched for minutes
+// kept every infinite pulse/blink animation compositing continuously (the actual "kept open
+// in a browser tab" heat scenario the user reported — not covered by hidden-tab pausing).
+// _applyAnimState() is the single source of truth: paused whenever the tab is hidden OR the
+// foreground-idle timeout has elapsed; any user activity (mouse/touch/scroll/key) or the tab
+// becoming visible immediately resumes.
+let _fgIdleTimer = null;
+const _FG_IDLE_MS = 20000; // 20s of no interaction while the tab is foreground/visible
+// M1791-c: hard-stop fallback for the dispatch+tmux loading overlay. Covers cases where
+// tmux never responds (network hiccup, mobile background kill) so the spinner doesn't hang forever.
+const _SPAWN_LOADING_TIMEOUT_MS = 60000; // 60s — long enough for slow mobile spawns
+function _applyAnimState() {
+  // M1776-b: two tiers. --anim-state (idle+hidden gated) covers purely decorative animations
+  // (spinners, mascot, loading dots) — fine to freeze while the user isn't looking or touching.
+  // --busy-anim-state (hidden-only gated) covers genuine status indicators (live session dot,
+  // avatar busy ring, unread-evidence bang) that must keep visibly pulsing whenever a real
+  // background process is running, even if the user is just looking at the screen without
+  // touching it — freezing those on foreground-idle made an actively busy session look
+  // indistinguishable from idle (observed: UniversEye compacting, avatar pulse stopped after
+  // 20s of no touch, only "recovered" on any interaction like a reload — user reported "아바타가
+  // 안켜짐, 새로고침해야 반영되는건지").
+  const _shouldPauseDecorative = document.hidden || window._fgIdle;
+  document.body.style.setProperty('--anim-state', _shouldPauseDecorative ? 'paused' : 'running');
+  document.body.style.setProperty('--busy-anim-state', document.hidden ? 'paused' : 'running');
+}
+function _resetFgIdleTimer() {
+  if (document.hidden) return; // visibilitychange handler owns the hidden case
+  const _wasIdle = window._fgIdle;
+  window._fgIdle = false;
+  if (_wasIdle) _applyAnimState();
+  clearTimeout(_fgIdleTimer);
+  _fgIdleTimer = setTimeout(() => { window._fgIdle = true; _applyAnimState(); }, _FG_IDLE_MS);
+}
+['mousemove', 'mousedown', 'touchstart', 'touchmove', 'keydown', 'wheel', 'scroll'].forEach(ev =>
+  document.addEventListener(ev, _resetFgIdleTimer, { passive: true, capture: true }));
+_resetFgIdleTimer(); // arm on load
 document.addEventListener('visibilitychange', () => {
-  document.body.style.setProperty('--anim-state', document.hidden ? 'paused' : 'running');
+  if (!document.hidden) _resetFgIdleTimer(); // returning to foreground counts as activity
+  _applyAnimState();
   if (document.hidden) {
     // Pause 1s tmux poll — saves continuous LTE wakeups on mobile when app is backgrounded
     if (window._tmuxWatchActive && _tmuxWatchInterval) {
@@ -7569,38 +7714,27 @@ async function refreshSessionStatus() {
     // parent/child sessions were actually live. Build a parallel per-project session-state
     // LIST (not just the collapsed newExec[proj_id]) so the card renderer can draw one dot
     // per live session instead of one opacity value for the whole project.
+    // M1832: capture BEFORE overwrite so _prevSessListKeys reflects truly previous state.
+    const _prevSessListSnap = JSON.stringify(
+      Object.fromEntries(Object.entries(window._execSessionList || {}).map(([pid, sl]) => [pid, sl.map(s => s.idle)]))
+    );
     window._execSessionList = {};
     for (const s of (execData.sessions || [])) {
-      // M1717: main avatar ring must reflect the MOTHER session's own state only, not an
-      // any-session-running aggregate (M1656-R's "any running wins" rule was correct for
-      // that era, but M1714 since added a per-session mini-avatar stack that already shows
-      // each child's own state — collapsing them into the main ring too was now double
-      // information AND actively misleading: a busy child made the mother's own avatar look
-      // busy even while the mother itself sat idle). Mother session name is exactly
-      // "{agent}-exec-{proj_id}" with no "-{hash}" suffix; children always have the suffix.
-      const _isMother = s.session === `${s.agent||'claude'}-exec-${s.proj_id}`;
-      if (_isMother) {
-        newExec[s.proj_id] = s.idle ? 'idle' : 'running';
-        // M1741: mother session model → main avatar. Only mother sets _execModel so the
-        // ns-card avatar reflects the mother's model, not whichever child happened to
-        // overwrite it last in the loop (e.g. Clone: opus mother + sonnet child → avatar
-        // should show opus, the authoritative project-level model).
-        window._execModel[s.proj_id] = s.model || '';
-      } else if (!(s.proj_id in newExec)) {
-        // No mother session record yet (e.g. only children alive) — fall back to any-running-wins
-        // so the ring isn't blank; gets overwritten the instant a mother record appears.
-        if (!s.idle) newExec[s.proj_id] = 'running';
-        else if (!newExec[s.proj_id]) newExec[s.proj_id] = 'idle';
-        // No mother yet → use child's model as temporary stand-in
-        if (!window._execModel[s.proj_id]) window._execModel[s.proj_id] = s.model || '';
-      }
-      (window._execSessionList[s.proj_id] = window._execSessionList[s.proj_id] || []).push({idle: s.idle, model: s.model||'', session: s.session||'', isMother: _isMother});
+      // M1824: M1797 removed mother/child concept server-side; M1796 gave all sessions UUID
+      // suffixes so no session is ever named "{agent}-exec-{proj_id}" exactly. The old
+      // _isMother branch (M1717) would never fire, leaving _execStatus stuck on idle-fallback.
+      // Use any-busy-wins: one busy session → running; all idle → idle.
+      if (!s.idle) newExec[s.proj_id] = 'running';
+      else if (!newExec[s.proj_id]) newExec[s.proj_id] = 'idle';
+      // M1824: first non-empty model wins (no mother priority — all sessions are peers).
+      if (!window._execModel[s.proj_id]) window._execModel[s.proj_id] = s.model || '';
+      (window._execSessionList[s.proj_id] = window._execSessionList[s.proj_id] || []).push({idle: s.idle, model: s.model||'', session: s.session||'', live_session_id: s.live_session_id||'', isMother: false, created: s.created||''});
     }
-    // M1741: sort each project's session list so mother is always [0] (mini avatar shows [1]=first child).
-    // API response order is non-deterministic; without sorting, the child may land at [0] and the
-    // mother at [1], causing the mini overlay to render the mother again instead of the child.
     for (const pid of Object.keys(window._execSessionList)) {
-      window._execSessionList[pid].sort((a, b) => (b.isMother ? 1 : 0) - (a.isMother ? 1 : 0));
+      // M1827: sort by created ASC so the oldest (first-spawned) session is always [0] → stable main avatar.
+      // API return order varies per poll; without sort, a newer busy session could land at [0]
+      // and make the main avatar show busy even when the oldest session is idle (race condition).
+      window._execSessionList[pid].sort((a, b) => (a.created > b.created ? 1 : a.created < b.created ? -1 : 0));
     }
     // Clear model for projects whose exec session ended
     for (const pid of Object.keys(window._execModel)) {
@@ -7624,19 +7758,24 @@ async function refreshSessionStatus() {
     _prevExecStatus = { ...newExec };
     _prevPtyStatus = { ...newPty };
     _ptyStatus = newPty;
-    // M388: respect SSE spawn grace period — if server says not-running within 30s of spawn,
-    // keep 'running' from SSE to prevent idle flicker during Claude startup.
-    const _nowMs = Date.now();
-    const _graceMs = 30000;
-    for (const [pid, spawnTs] of Object.entries(window._execSpawnTime || {})) {
-      if (_nowMs - spawnTs < _graceMs && (!newExec[pid] || newExec[pid] === "idle")) {
-        newExec[pid] = 'running';  // preserve SSE optimistic state
-      }
-    }
+    // M1798: M388's 30s client-side grace override removed (server-side counterpart also
+    // removed — see server.py). This force-preserved 'running' even when the server's own
+    // /exec-sessions or SSE payload correctly reported idle, which directly defeated
+    // M1790's idle-spawn (▶ click, zero queued work → session genuinely idle at boot,
+    // no wake ever sent) — this client-side override would have re-masked it as 'running'
+    // for 30s regardless of the server fix. window._execSpawnTime is still set/read
+    // elsewhere (see M1717-b) for other grace-adjacent logic; only this override is removed.
     // M961 fix: re-render swimlane cards when exec status changes (avatar/model label brightness)
+    // M1832: also compare per-session idle states — M1827 made avatars use _sessList[0].idle
+    // directly, but the re-render gate only watched _execStatus (project-level any-busy-wins).
+    // If _execStatus[proj] stays 'running' but _sessList[0].idle flips, avatar stayed stale.
+    // _prevSessListSnap captured before _execSessionList was rebuilt (above) so diff is real.
     const _prevExecKeys = JSON.stringify(_execStatus);
+    const _newSessListKeys = JSON.stringify(
+      Object.fromEntries(Object.entries(window._execSessionList).map(([pid, sl]) => [pid, sl.map(s => s.idle)]))
+    );
     _execStatus = newExec;
-    if (JSON.stringify(newExec) !== _prevExecKeys) {
+    if (JSON.stringify(newExec) !== _prevExecKeys || _newSessListKeys !== _prevSessListSnap) {
       // M976 fix: use actual let var (not window.) to invalidate lane fingerprints
       Object.keys(_swimlaneLaneFp).forEach(k => delete _swimlaneLaneFp[k]);
       if (typeof render === 'function') render();
@@ -7842,9 +7981,9 @@ function nodeCard(p, idx) {
       ? (_modelAvatars[_mdlKey||''] || _modelAvatars['default'])
       : (_execKey ? _modelAvatars['default'] : null)
   ) || null;
-  const _avatarOpacity = _execKey === 'running' ? '1' : _execKey === 'idle' ? '0.3' : '0.4';
+  let _avatarOpacity = _execKey === 'running' ? '1' : _execKey === 'idle' ? '0.3' : '0.4';
   const _avatarUrl = _avatarChar;
-  const _statusCls = _execKey === 'running' ? 'status-active' : _execKey === 'idle' ? 'status-idle' : 'status-idle';
+  let _statusCls = _execKey === 'running' ? 'status-active' : _execKey === 'idle' ? 'status-idle' : 'status-idle';
   const _initials = (p.name||p.id||'?')[0].toUpperCase();
   const _avatarHtml = _avatarUrl
     ? `<img class="avatar-img" src="${esc(_avatarUrl)}" alt="${esc(p.name||p.id)}" loading="lazy" style="opacity:${_avatarOpacity}" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">`
@@ -7863,8 +8002,8 @@ function nodeCard(p, idx) {
     const circ = 2 * Math.PI * r;
     const offset = circ - circ * (rPct / 100);
     const sw = 3.5;
-    const _gapW = 3.0;
     const _segLen = circ / N;
+    const _gapW = Math.min(3.0, _segLen * 0.25);  // M1764: adaptive gap — cap at 25% so N=80 shows 2.35px color vs 0.14px before
     const _divider = `<circle cx="58" cy="58" r="${r}" fill="none" stroke="var(--bg-deep)" stroke-width="${sw + 2}" stroke-linecap="butt" stroke-dasharray="${_gapW.toFixed(1)} ${(_segLen - _gapW).toFixed(1)}" />`;
     return `<circle class="arc-bg" cx="58" cy="58" r="${r}" stroke-width="${sw}" stroke-dasharray="${circ.toFixed(1)}" />`
           +`<circle class="arc-fill ${cls}" style="stroke:${_arcColor(rPct)}" cx="58" cy="58" r="${r}" stroke-width="${sw}" stroke-dasharray="${circ.toFixed(1)}" stroke-dashoffset="${offset.toFixed(1)}" />`
@@ -7886,12 +8025,24 @@ function nodeCard(p, idx) {
   // same border+pulse animation the mother's avatar-ring.status-active gets — user
   // explicitly asked for child avatars to carry the same blink logic as mother's.
   const _sessList = (window._execSessionList || {})[p.id||p.name] || [];
-  // _mkMiniAvatarInner: the raw image/fallback content (no positioning), reused for both the
-  // 2nd-session box and the 3rd-session box nested inside it.
+  // M1827: each avatar slot represents one individual session, not a project-wide summary.
+  // Override _avatarOpacity/_statusCls with _sessList[0]'s own idle state now that _sessList is available.
+  if (_sessList.length > 0) {
+    const _s0Running = !_sessList[0].idle;
+    _avatarOpacity = _s0Running ? '1' : '0.3';
+    _statusCls = _s0Running ? 'status-active' : 'status-idle';
+  }
+  // _mkMiniAvatarInner: avatar div for one session. Optional innerHtml is appended inside the
+  // div so deeper nested avatars can be injected (M1838: 4th session = 4-level fractal chain).
   // M1741: _sessList is now [{idle, model, session, isMother}, ...] objects (was strings)
-  const _mkMiniAvatarInner = (sessObj, extraCls) => {
+  const _mkMiniAvatarInner = (sessObj, extraCls, innerHtml = '') => {
     const st = sessObj.idle ? 'idle' : 'running';
-    const _op = st === 'running' ? '1' : '0.3';
+    // M1829: opacity on the outer div makes its own background:var(--bg-deep) transparent too,
+    // so the 1st busy avatar bleeds through the idle 2nd at 30% opacity. Fix: keep outer div
+    // at opacity:1 (background stays opaque/blocking), apply dimming only to the inner <img>.
+    // grayscale filter stays on the outer div — affects the whole element including border.
+    const _imgOp = st === 'running' ? '1' : '0.4';
+    const _filter = st === 'idle' ? 'grayscale(1)' : 'none';
     const _runCls = st === 'running' ? ' ns-sess-mini-active' : '';
     // M1741: use per-session model avatar so Clone with opus+sonnet shows correct images per child
     const _sessModelAvatars = _nsModelAvatars();
@@ -7900,11 +8051,21 @@ function nodeCard(p, idx) {
     if (_sModel && _sessModelAvatars[_sModel]) { _sKey = _sModel; }
     else if (_sModel) { const _ks = Object.keys(_sessModelAvatars).sort((a,b)=>b.length-a.length); _sKey = _ks.find(k=>_sModel.includes(k))||null; }
     const _sUrl = (_sKey ? _sessModelAvatars[_sKey] : null) || _sessModelAvatars['default'] || _avatarUrl;
+    // Outer div: opacity:1 always (keeps background:var(--bg-deep) fully opaque → blocks 1st avatar).
+    // Inner img: opacity:_imgOp (dims avatar art while background stays solid).
+    // M1829-b: idle border explicitly dimmed — grayscale filter alone leaves white border too bright.
+    const _border = st === 'idle' ? 'border-color:rgba(255,255,255,.25)' : '';
+    // M1838: when this avatar hosts a nested child (innerHtml), drop overflow:hidden so the
+    // child's absolute position (bottom:2.20px;right:2.20px) isn't clipped by the parent div.
+    const _ovf = innerHtml ? '' : 'overflow:hidden;';
     return _sUrl
-      ? `<img class="ns-sess-mini-avatar${_runCls} ${extraCls}" style="opacity:${_op}" src="${esc(_sUrl)}" alt="">`
-      : `<div class="ns-sess-mini-avatar ns-sess-mini-fallback${_runCls} ${extraCls}" style="opacity:${_op}">${esc(_initials)}</div>`;
+      ? `<div class="ns-sess-mini-avatar${_runCls} ${extraCls}" style="filter:${_filter};${_ovf}padding:0;${_border}"><img style="width:100%;height:100%;border-radius:50%;display:block;object-fit:cover;opacity:${_imgOp}" src="${esc(_sUrl)}" alt="">${innerHtml}</div>`
+      : `<div class="ns-sess-mini-avatar ns-sess-mini-fallback${_runCls} ${extraCls}" style="filter:${_filter};opacity:${_imgOp};${_border}">${esc(_initials)}${innerHtml}</div>`;
   };
-  const _thirdHtml = _sessList.length > 2 ? _mkMiniAvatarInner(_sessList[2], 'ns-sess-nested') : '';
+  // M1838: 4th avatar (24px) nested inside 3rd (35px), same internal-tangent offset 2.20px.
+  // Fractal chain: 72→50→35→24px, ratio k≈1.44 maintained, minimum practical size reached at 4th level.
+  const _fourthHtml = _sessList.length > 3 ? _mkMiniAvatarInner(_sessList[3], 'ns-sess-deep-nested') : '';
+  const _thirdHtml = _sessList.length > 2 ? _mkMiniAvatarInner(_sessList[2], 'ns-sess-nested', _fourthHtml) : '';
   const _sessAvatarStackHtml = _sessList.length > 1
     ? `<div class="ns-sess-avatars" title="${_sessList.length} live sessions">
         <div class="ns-sess-mini-wrap">${_mkMiniAvatarInner(_sessList[1], '')}${_thirdHtml}</div>
@@ -8122,7 +8283,16 @@ function render() {
     // M988: session-assigned cards first (exec_session_id set), then by position_x (no stage sort per M978)
     lanes[l].sort((a, b) => {
       // M999: 4-tier sort — exec(0) > idle(1) > null(2), then pointer-ON(0)/OFF(1), then position_x
-      const _sessRank = p => { const s = _execStatus[p.id||p.name]; return s==='running'?0:s==='idle'?1:2; };
+      // M1820: use _execSessionList for "any-busy-wins" — _execStatus is mother-only (M1717),
+      // so a project with only UUID-suffix children (M1796) stays 'idle' in _execStatus even
+      // when a child is busy, causing busy ns-cards to sort behind idle ones.
+      const _sessRank = p => {
+        const _pid = p.id||p.name;
+        const _list = (window._execSessionList||{})[_pid];
+        if (_list && _list.length) return _list.some(s => !s.idle) ? 0 : 1;
+        const s = _execStatus[_pid];
+        return s==='running'?0:s==='idle'?1:2;
+      };
       const aHasSess = _sessRank(a.p);
       const bHasSess = _sessRank(b.p);
       const sd = aHasSess - bHasSess;
@@ -11290,7 +11460,7 @@ function closeDetail() {
   document.getElementById('cg-filter-banner')?.remove();
   // M215: ensure loading state is cleared so next open starts fresh.
   const _m = document.getElementById('detail-modal');
-  if (_m) _m.classList.remove('loading');
+  if (_m) { _m.classList.remove('loading'); delete _m.dataset.loadingOwner; }
   stopTmuxWatch();
   if (typeof stopTaskBoardPoll === 'function') stopTaskBoardPoll();
   // Stop the OSK upstream-error poll so it doesn't keep firing after the card closes.
@@ -12113,6 +12283,9 @@ function killAndNewSession() {
 }
 
 async function openDetail(idx) {
+  // M1821-P3: timing instrumentation for detail card load regression tracking
+  const _dtLabel = `openDetail[${idx}]`;
+  console.time(_dtLabel);
   activeIdx = idx;
   const p = projects[idx];
   _logAction(p?.id || '', '', 'detail_open', '');
@@ -12150,8 +12323,9 @@ async function openDetail(idx) {
   overlay.classList.add('show');
   _showColToggleBtn(); // M282: show floating col-toggle when detail opens
   // M215: full-card loading state until first batch of async fetches resolves.
+  // M1804: tag with 'open' owner so _refreshExecState doesn't clear before session pane loads.
   const modal = document.getElementById('detail-modal');
-  if (modal) modal.classList.add('loading');
+  if (modal) { modal.classList.add('loading'); modal.dataset.loadingOwner = 'open'; }
   document.getElementById('dm-title').textContent = p.name;
   const dirEl = document.getElementById('dm-proj-dir');
   if (dirEl) {
@@ -12208,19 +12382,24 @@ async function openDetail(idx) {
   // Detail card still needs OKRs (not in shared hydration). Reuse _nsStarsCache when hot —
   // ensureProjectHydrated above has either populated it or has it in-flight; we await both here.
   await (window._hydrationInFlight?.[p.id] || Promise.resolve());
+  console.timeLog(_dtLabel, 'hydration-await');
+  // M1821-P4: log cache status so we can confirm hot-path vs cold-fetch in console
+  const _nsCacheHit = !!(window._nsStarsCache?.[p.id]?.length);
+  if (!_nsCacheHit) console.warn(_dtLabel, 'P4 ns-cache MISS — fetching north-stars');
   const [nsRespEarly, okrData] = await Promise.all([
-    (window._nsStarsCache?.[p.id]?.length
+    (_nsCacheHit
       ? Promise.resolve({north_stars: window._nsStarsCache[p.id]})
       : fetch(`/api/northstar/${esc(p.id)}/north-stars`).then(r=>r.json()).catch(()=>({ok:false,north_stars:[]}))),
     fetch(`/api/northstar/${esc(p.id)}/okrs`).then(r=>r.json()).catch(()=>({ok:false,okrs:[]})),
   ]);
+  console.timeLog(_dtLabel, 'north-stars+okrs');
 
   // M215: first batch resolved.
   // M1528 v2: do NOT drop loading overlay yet — keep it until _refreshExecState first
   // resolves so exec pane is fully populated before user sees the card. _refreshExecState
   // will clear modal.loading itself on first successful fetch (see L13130 onwards).
   // If exec fetch is slow or fails, fail-safe timeout drops it after 5s.
-  setTimeout(() => { if (modal && modal.classList.contains('loading')) modal.classList.remove('loading'); }, 5000);
+  setTimeout(() => { if (modal && modal.classList.contains('loading')) { modal.classList.remove('loading'); delete modal.dataset.loadingOwner; } }, 5000);
 
   // M137: abort if another project was opened while we were waiting
   if (_activeDetailProjId !== myProjId) return;
@@ -12231,6 +12410,7 @@ async function openDetail(idx) {
   // Load milestones + substars now that cache is populated
   loadMilestones(p.id);
   loadSubStars(p.id);
+  console.timeLog(_dtLabel, 'loadMilestones+loadSubStars-fired');
 
   // Render right column then load milestones
   renderRight(p);
@@ -12248,6 +12428,7 @@ async function openDetail(idx) {
   } else {
     // OKR tree inside NS layer
   }
+  console.timeEnd(_dtLabel);
 }
 
 function renderHierarchy(p) {
@@ -12508,6 +12689,8 @@ function _closeCommentPopupNow() {
     if (_cur.length) sessionStorage.setItem(_pendingKey, JSON.stringify(_cur));
     else sessionStorage.removeItem(_pendingKey);
   }
+  // M1822: clean up drag-origin tracker before removing popup
+  document.getElementById('comment-popup')?._cleanupDragTracker?.();
   document.getElementById('comment-popup')?.remove();
   window._commentPendingAttachments = []; // M1708: clear in-memory state — next open restores from sessionStorage instead of carrying stale refs across different stones
   _openCommentMid = null;
@@ -12831,17 +13014,41 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
       document.removeEventListener('keydown', _escClose);
       document.removeEventListener('click', _hComment);
       document.removeEventListener('touchstart', _hComment);
+      document.removeEventListener('pointerdown', _trackPointerDown, { capture: true });
+      document.removeEventListener('pointerup',   _trackPointerUp,   { capture: true });
     }
   };
   document.addEventListener('keydown', _escClose);
+  // M1830: track pointer-down origin (capture phase so stopPropagation in children can't block it)
+  // and pointer-up target to distinguish intentional drag-select from outside-click.
+  // Prior M1822 approach used bubble-phase mousedown + click — failed when:
+  //   (a) child elements called stopPropagation on mousedown before _trackDragOrigin fired, or
+  //   (b) no click event fired after long drag (suppressed by browser), leaving flag stale.
+  // New approach: capture-phase pointerdown tracks origin; pointerup tracks where release landed;
+  // click handler checks BOTH — only close if release was also outside the popup.
+  let _pdInsidePopup = false;   // pointerdown started inside
+  let _puInsidePopup = false;   // pointerup ended inside
+  function _trackPointerDown(e) { _pdInsidePopup = popup.contains(e.target); }
+  function _trackPointerUp(e)   { _puInsidePopup = popup.contains(e.target); }
+  document.addEventListener('pointerdown', _trackPointerDown, { capture: true });
+  document.addEventListener('pointerup',   _trackPointerUp,   { capture: true });
+  popup._cleanupDragTracker = () => {
+    document.removeEventListener('pointerdown', _trackPointerDown, { capture: true });
+    document.removeEventListener('pointerup',   _trackPointerUp,   { capture: true });
+  };
   function _hComment(e) {
     // M258: skip close if skill/agent picker modal is open
     if (window._skillModalActive) return;
+    // M1830: if the pointer-down OR pointer-up was inside the popup, this is a drag-select
+    // ending outside — do not close. Reset flags so the NEXT genuine outside-click closes.
+    if (_pdInsidePopup || _puInsidePopup) { _pdInsidePopup = false; _puInsidePopup = false; return; }
     if (!popup.contains(e.target)) {
       _closeCommentPopupNow(); // M1740: use canonical close so sessionStorage is saved
       document.removeEventListener('click', _hComment);
       document.removeEventListener('touchstart', _hComment);
       document.removeEventListener('keydown', _escClose);
+      document.removeEventListener('pointerdown', _trackPointerDown, { capture: true });
+      document.removeEventListener('pointerup',   _trackPointerUp,   { capture: true });
     }
   }
   setTimeout(() => {
@@ -13270,6 +13477,17 @@ function startTmuxWatch(projId, tmuxSession) {
   output.style.letterSpacing = '';
   output.textContent = 'Connecting to session…';
   if (_tmuxWatchInterval) clearInterval(_tmuxWatchInterval);
+  // M1791-b: escalate loadingOwner to 'tmux' so _renderResumableSessions' _hashChanged path
+  // cannot clear the overlay while tmux hasn't confirmed running yet. The dispatch-hoisted
+  // 'dispatch' owner (set at executeProject entry) is cleared by _renderResumableSessions on
+  // ANY _hashChanged — including stale fetches triggered by _selectSession BEFORE the
+  // POST /execute even lands, causing the overlay to vanish 18ms after it appeared.
+  // Promotion to 'tmux' here means only the first d.running=true poll (below) can clear it.
+  const _dmWatchModal = document.getElementById('detail-modal');
+  if (_dmWatchModal && (_dmWatchModal.dataset.loadingOwner === 'dispatch' || _dmWatchModal.dataset.loadingOwner === 'tmux')) {
+    _dmWatchModal.classList.add('loading');
+    _dmWatchModal.dataset.loadingOwner = 'tmux';
+  }
   const _tmuxQ = tmuxSession ? `&tmux_session=${encodeURIComponent(tmuxSession)}` : '';
   window._tmuxWatchActive = true; // M1581: visibility handler checks this
   window._tmuxWatchPaused = false;
@@ -13297,11 +13515,23 @@ function startTmuxWatch(projId, tmuxSession) {
         if (window._refreshExecState) window._refreshExecState();
         return;
       }
-      // First confirmed-running poll: clear loading state on execute button
-      if (window._execLaunchBtn) {
-        window._execLaunchBtn.textContent = '▶▶';
-        window._execLaunchBtn.classList.remove('exec-loading');
-        window._execLaunchBtn = null;
+      // M1791-c: only clear the loading overlay once the pane has actual content —
+      // d.running=true only means the tmux session exists (has-session exit 0), but the
+      // pane may still be blank while the shell/Claude process is starting. Waiting for
+      // non-empty output ensures the spinner persists until claude-exec-{proj} is truly loaded.
+      const _paneReady = d.running && d.output && d.output.trim().length > 0;
+      if (_paneReady) {
+        if (window._execLaunchBtn) {
+          window._execLaunchBtn.textContent = '▶▶';
+          window._execLaunchBtn.classList.remove('exec-loading');
+          window._execLaunchBtn = null;
+        }
+        // M1791-b/c: tmux pane has output — session is truly loaded, clear the overlay.
+        const _dmTmuxClear = document.getElementById('detail-modal');
+        if (_dmTmuxClear && _dmTmuxClear.dataset.loadingOwner === 'tmux') {
+          _dmTmuxClear.classList.remove('loading');
+          delete _dmTmuxClear.dataset.loadingOwner;
+        }
       }
       const newText = d.output || '(waiting for output…)';
       if (output.textContent !== newText) {
@@ -13324,6 +13554,13 @@ function stopTmuxWatch() {
   if (_tmuxWatchInterval) { clearInterval(_tmuxWatchInterval); _tmuxWatchInterval = null; }
   window._tmuxWatchActive = false; window._tmuxWatchPaused = false;
   window._tmuxWatchPollFn = null; window._schedTmuxPoll = null; // M1581/M1757
+  // M1791-b: if tmux session ended before ever confirming running (d.running=false on first
+  // poll), the 'tmux' overlay was never cleared by the running-poll path — clear it now.
+  const _dmStopClear = document.getElementById('detail-modal');
+  if (_dmStopClear && _dmStopClear.dataset.loadingOwner === 'tmux') {
+    _dmStopClear.classList.remove('loading');
+    delete _dmStopClear.dataset.loadingOwner;
+  }
   const overlay = document.getElementById('tmux-live-overlay');
   if (overlay) overlay.style.display = 'none';
   const liveBackdrop = document.getElementById('tmux-live-backdrop');
@@ -13461,9 +13698,11 @@ function renderRight(p) {
   // Inject execute buttons into left panel slot
   const specSlot = document.getElementById('dm-spec-slot');
   if (specSlot) {
-    const execBtn = `<button class="dm-btn" id="dm-exec-btn"
-      style="background:var(--green-soft);border-color:var(--green);color:var(--green);font-weight:500"
-      onclick="executeProject('${esc(p.id)}',this)" title="Dispatch all queued stones at once (or init milestones for empty projects)">→ dispatch-all</button>`;
+    // M1784: the global "→ dispatch-all" button was removed — its spawn role moved to a
+    // per-row ▶ button in the resume-session list (see _dispatchRowSession), which also
+    // fixes the busy-session lockout the old button had (getElementById('dm-exec-btn')
+    // poll callback below used to set b.disabled=true whenever ANY session for the project
+    // was busy, blocking new-session spawn entirely — a per-row button has no such gate).
     // Use pty_agent for PTY (terminal) spawns; fall back to agent, then claude.
     // M273: agent is for Execute dispatch (exec dropdown); pty_agent is runtime for PTY terminal only.
     const curAgent = (p.agent || 'claude').trim();  // use exec agent, NOT pty_agent
@@ -13525,8 +13764,9 @@ function renderRight(p) {
     specSlot.innerHTML = `
       <div id="dm-model-slot" style="margin-top:4px;display:flex;flex-direction:column;gap:4px">
         <div class="dm-toggle-pane" id="dm-model-pane">
-          <div class="dm-pane-header" onclick="toggleDmPane('dm-model-pane')">
+          <div class="dm-pane-header" onclick="toggleDmPane('dm-model-pane');_updateModelPaneSummary()">
             <span class="dm-pane-label">model</span>
+            <span id="dm-model-pane-summary" style="flex:1;font-family:var(--mono);font-size:9px;color:var(--accent);opacity:.85;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-left:6px;text-align:center;display:none"></span>
             <span class="dm-pane-caret" id="dm-model-caret">▾</span>
           </div>
           <div class="dm-pane-body" id="dm-model-pane-body" style="display:none">
@@ -13540,7 +13780,6 @@ function renderRight(p) {
           </div>
           <div class="dm-pane-body" id="dm-session-pane-body" style="display:none;
             max-height:140px;overflow-y:auto;padding:4px 0;scrollbar-width:thin;scrollbar-color:var(--panel-border) transparent">
-            <div class="dm-sess-spinner" style="color:var(--text-dim);font-size:9px;opacity:.6;padding:2px 0;display:flex;align-items:center;gap:5px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;border:1px solid var(--text-dim);border-top-color:transparent;animation:dm-spin .7s linear infinite"></span>loading sessions…</div>
           </div>
         </div>
         <div class="dm-toggle-pane" id="dm-adj-pane">
@@ -13549,13 +13788,13 @@ function renderRight(p) {
             <span class="dm-pane-caret" id="dm-adj-caret">▾</span>
           </div>
           <div class="dm-pane-body" id="dm-adj-pane-body" style="display:none;padding:0">
-            <div style="color:var(--text-dim);font-size:9px;opacity:.6;padding:4px 8px">loading…</div>
           </div>
         </div>
       </div>
-      <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:8px">${execBtn}</div>
       <div id="dm-api-error-banner" style="display:none;margin-top:6px;padding:6px 10px;border-radius:4px;background:rgba(192,57,43,.12);border:1px solid rgba(192,57,43,.45);font-family:var(--mono);font-size:10px;color:var(--red,#c0392b)"></div>
-      <div id="dm-exec-sessions" style="margin-top:5px"><div class="dm-exec-spinner" style="color:var(--text-dim);font-size:9px;opacity:.6;padding:2px 0;display:flex;align-items:center;gap:5px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;border:1px solid var(--text-dim);border-top-color:transparent;animation:dm-spin .7s linear infinite"></span>loading…</div></div>`;
+      <div id="dm-exec-sessions" style="margin-top:5px"></div>`;
+    // M1813: show selected agent+model on collapsed model pane header
+    _updateModelPaneSummary();
     // M214 follow-up: probe OSK proxy and disable gpt-* options when down,
     // so users don't silently pick a broken model. Also surface upstream
     // errors (quota/rate-limit/auth/5xx) as a banner so users learn WHY a
@@ -13617,44 +13856,21 @@ function renderRight(p) {
       ]).then(([d, d2]) => { d.all_sessions = d2.sessions||[]; return d; })
         .then(d=>{
         // M1528 v2: drop detail card loading overlay now that exec pane data has arrived.
+        // M1796: skip when dispatch-owned — cleared by _renderResumableSessions instead.
+        // M1791-b: also skip 'tmux'-owned — cleared only by startTmuxWatch's running poll.
         const _dmModal = document.getElementById('detail-modal');
-        if (_dmModal && _dmModal.classList.contains('loading')) _dmModal.classList.remove('loading');
-        const b = document.getElementById('dm-exec-btn');
+        const _dmOwner = _dmModal && _dmModal.dataset.loadingOwner;
+        // M1812: 'open' owner cleared here — exec-sessions (live session block) now rendered,
+        // card is fully loaded. Previously cleared by _renderResumableSessions (session rows only),
+        // causing overlay to drop before the live session adj block appeared.
+        if (_dmModal && _dmModal.classList.contains('loading') && _dmOwner !== 'dispatch' && _dmOwner !== 'tmux') {
+          _dmModal.classList.remove('loading');
+          delete _dmModal.dataset.loadingOwner;
+        }
         const info = document.getElementById('dm-exec-sessions');
         const running = (d.sessions||[]).filter(s => s.proj_id === p.id || ['claude-exec-','codex-exec-','openrouter-exec-','dsk-exec-'].some(pfx => (s.session||'').toLowerCase().startsWith(pfx + p.id.toLowerCase() + '-')));
         const _allSess = (d.all_sessions||[]).filter(s => s.includes(p.id));
-        // M1533-bug2: if within spawn grace period, treat poll result as running (not idle).
-        // Prevents poll (5s interval) from downgrading SSE optimistic state during startup.
-        const _nowMsBug2 = Date.now();
-        const _graceBug2 = 30000;
-        let _forceRunning = false;
-        if (window._execSpawnTime && window._execSpawnTime[p.id] && (_nowMsBug2 - window._execSpawnTime[p.id] < _graceBug2)) {
-          _forceRunning = true;
-        }
         const _hasAnySess = running.length > 0 || _allSess.length > 0;
-        if (b && (running.length > 0 || _forceRunning)) {
-          // M1675: was `running.some(s => s.idle)` — "ANY session idle" wrongly showed
-          // the whole project idle even while the mother was actively working a stone,
-          // as long as ANY sibling child happened to be idle. Multi-session (M1656)
-          // requires "ALL sessions idle" for the project to be considered dispatchable.
-          const _busySess = running.find(s => !s.idle);
-          const isIdle = _forceRunning ? false : (running.length > 0 && !_busySess);
-          b.textContent = isIdle ? 'idle' : 'live';
-          b.style.opacity = isIdle ? '1' : '0.5';
-          b.style.color = isIdle ? 'var(--text-dim)' : '';
-          b.style.cursor = isIdle ? '' : 'not-allowed';
-          b.disabled = !isIdle;
-          b.title = isIdle
-            ? `Session idle — click to dispatch queued stones`
-            : `Session live since ${((_busySess||running[0]).created||'').slice(11,16)||'?'} (busy: ${(_busySess||running[0]).session||''})`;
-        } else if (b) {
-          b.textContent = '→ dispatch-all';
-          b.style.color = '';
-          b.style.borderColor = '';
-          b.style.background = '';
-          b.style.opacity = '';
-          b.disabled = false;
-        }
         // M1158: update sessBtn in section bars immediately — reflects live session state every poll
         { const _nsForSess = _nsStarsCache[_projId] || [];
           const _execProjPatSess = new RegExp(`-exec-${_projId}$`);
@@ -13703,16 +13919,9 @@ function renderRight(p) {
             for (const s of running) {
               if (!s.idle) _projAgg[s.proj_id] = 'running';
               else if (!_projAgg[s.proj_id]) _projAgg[s.proj_id] = 'idle';
-              // M1754-b: apply the same _isMother guard as the poller (L7581-7595).
-              // Without it, the SSE path's last-write-wins over all sessions caused the
-              // non-mother child (e.g. or-hy3 fork) to overwrite _execModel, making the
-              // main avatar show hy3 even when the mother/first-child was sonnet.
-              const _ssIsMother = s.session === `${s.agent||'claude'}-exec-${s.proj_id}`;
-              if (_ssIsMother) {
-                window._execModel[s.proj_id] = s.model || ''; // mother → definitive
-              } else if (!window._execModel[s.proj_id]) {
-                window._execModel[s.proj_id] = s.model || ''; // no mother yet → temporary stand-in
-              }
+              // M1824: mother/child concept removed (M1797/M1796). All sessions are peers;
+              // first non-empty model wins (same logic as poller path).
+              if (!window._execModel[s.proj_id]) window._execModel[s.proj_id] = s.model || '';
             }
             Object.assign(_execStatus, _projAgg);
             // M267: sync agent+model from the LIVE (non-idle) exec session so detail card reflects what's running
@@ -13800,7 +14009,14 @@ function renderRight(p) {
               // M1685-f: liveChip normalized to _badgeBase (was font-size:7px/padding:0 3px, the
               // shortest badge — the mismatch with its OWN parent spawn-badge was the most
               // visible unevenness in the row).
-              const liveChip = (slive && slive !== sfrom) ? `<span style="${_badgeBase};color:var(--accent);background:rgba(123,159,212,.1);border:1px solid rgba(123,159,212,.25)" title="Current live session ID (new transcript)">→ ${esc(slive.slice(0,8))}</span>` : '';
+              // M1762: resume sessions show liveChip even when slive===sfrom (same transcript ID is still useful info)
+              // M1774: when live_session_id not yet resolved (capture still in bg), show pending "→ ···" badge
+              //         so the user sees the slot rather than nothing — dotted border = "not confirmed yet"
+              const liveChip = slive
+                ? `<span style="${_badgeBase};color:var(--accent);background:rgba(123,159,212,.1);border:1px solid rgba(123,159,212,.25)" title="Current live session ID">→ ${esc(slive.slice(0,8))}</span>`
+                : (sm === 'fork' || sm === 'resume' || sm === 'fresh')
+                  ? `<span style="${_badgeBase};color:var(--accent);opacity:.5;background:rgba(123,159,212,.05);border:1px dashed rgba(123,159,212,.35)" title="Live session ID pending capture…">→ ···</span>`
+                  : '';
               const spawnBadge = sm === 'resume'
                 ? `<span style="${_badgeBase};color:var(--green);background:rgba(61,139,94,.10);border:1px solid rgba(61,139,94,.30)" title="Spawned with --resume ${esc(sfrom)} → live session: ${esc(slive)}">↻ resume${sfrom?` ${esc(sfrom.slice(0,8))}`:''}</span>${liveChip}`
                 : sm === 'fork'
@@ -13808,7 +14024,7 @@ function renderRight(p) {
                 : sm === 'continue'
                 ? `<span style="${_badgeBase};color:var(--text-dim);background:rgba(0,0,0,.04);border:1px solid var(--panel-border)" title="Claude picked most recent session">↻ resume</span>`
                 : sm === 'fresh'
-                ? `<span style="${_badgeBase};color:var(--yellow,#d4a574);background:rgba(212,165,116,.10);border:1px solid rgba(212,165,116,.30)" title="New session, no prior context">✦ new</span>`
+                ? `<span style="${_badgeBase};color:var(--yellow,#d4a574);background:rgba(212,165,116,.10);border:1px solid rgba(212,165,116,.30)" title="New session, no prior context">✦ new</span>${liveChip}`
                 : `<span style="${_badgeBase};color:var(--text-dim);opacity:.45;background:none;border:none;padding:1px 0">— unknown</span>`;
               // M1656-R: accurate state chip — which stone is being worked on right now
               // M1685-f: normalized to _badgeBase (was padding:1px 5px + bold — kept font-weight:600
@@ -13835,6 +14051,10 @@ function renderRight(p) {
                 </div>
                 <div style="grid-column:2;grid-row:2;min-width:0;cursor:pointer;font-family:var(--mono);font-size:8px;color:var(--text-dim);letter-spacing:.03em;display:flex;align-items:center;gap:6px;flex-wrap:wrap" title="Click to open/close terminal overlay">${_stoneChip} ${spawnBadge} ${modelChip}</div>
                 <div style="grid-column:3;grid-row:1/3;display:flex;align-items:center;gap:3px;align-self:center">
+                  ${(slive||sfrom) ? `<span class="ns-fork-btn" data-sid="${esc(slive||sfrom)}" data-proj="${esc(p.id)}"
+                    title="Fork this session on a new model/agent"
+                    onclick="event.stopPropagation();_showForkPicker(this,'${esc(p.id)}','${esc(slive||sfrom)}')"
+                    style="font-family:var(--mono);font-size:9px;padding:2px 7px;border-radius:3px;border:1px solid rgba(123,159,212,.5);background:rgba(123,159,212,.1);color:#7b9fd4;cursor:pointer;flex-shrink:0;user-select:none;font-weight:500">⑂ fork</span>` : ''}
                   <span class="ns-node-term ${_termClass}" title="${_termTitle}"
                     style="font-size:8px;padding:1px 6px;cursor:pointer;flex-shrink:0"
                     onclick="event.stopPropagation();openTerminal('${esc(p.id)}'${_tmuxArg})">⌨_</span>
@@ -13846,10 +14066,7 @@ function renderRight(p) {
               </div>`;
             }).join('') + `</div>`;
           } else {
-            // M1159: hold the optimistic pill for up to 12s after dispatch — tmux can take
-            // a moment to become detectable, especially on openrouter cold starts.
-            const _dispatchedAt = window._dispatchOptimisticAt?.[_projId] || 0;
-            if (!_dispatchedAt || (Date.now() - _dispatchedAt) > 12000) info.innerHTML = '';
+            info.innerHTML = '';
           }
         }
       }).catch(()=>{});
@@ -13908,11 +14125,7 @@ function renderRight(p) {
     const _renderResumableSessions = () => {
       const curAgent = window.curAgent || 'claude';
       const curModel = window.curModel || '';
-      // M1493: show spinner until fetch resolves — only on first load (no prior render)
       const _sessBodyPre = document.getElementById('dm-session-pane-body');
-      if (_sessBodyPre && !_sessBodyPre.querySelector('.dm-sess-spinner') && !_sessBodyPre.dataset.resumableHash) {
-        _sessBodyPre.innerHTML = `<div class="dm-sess-spinner" style="color:var(--text-dim);font-size:9px;opacity:.6;padding:2px 0;display:flex;align-items:center;gap:5px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;border:1px solid var(--text-dim);border-top-color:transparent;animation:dm-spin .7s linear infinite"></span>loading sessions…</div>`;
-      }
       fetch(`/api/northstar/${encodeURIComponent(_projId)}/resumable-sessions?agent=${encodeURIComponent(curAgent)}`)
         .then(r=>r.json()).then(d=>{
           const sessBody = document.getElementById('dm-session-pane-body');
@@ -13938,15 +14151,17 @@ function renderRight(p) {
               }
             }
           }
-          // M419: exec_live rows removed from session list (redundant with exec info panel below)
-          // Terminal button moved to exec info panel row instead.
-          const resumeRows = rows.filter(r => r.session.type !== 'fresh' && r.session.type !== 'exec_live');
-          // M1018 cur-fix: track the actual live exec session ID so 'cur' badge is shown only there
-          const _liveExecSid = (rows.find(r => r.session.type === 'exec_live')?.session.id) || '';
-          // M1018: sort resume rows by most recent activity desc only.
-          // Do NOT factor in selSess — clicking a session changes selSess which re-triggers
-          // sort and jumps the clicked session to top, causing visible list reorder on click.
+          // M1765: all running sessions appear in resume list (same form as other resume rows).
+          // Server injects them as transcript type with tmux_session field set.
+          const resumeRows = rows.filter(r => r.session.type !== 'fresh');
+          // M1765: build live-sid set from rows that have a tmux_session (process alive indicator)
+          const _liveExecSids = new Set(rows.filter(r => r.session.tmux_session).map(r => r.session.id));
+          const _liveExecSid = [..._liveExecSids][0] || '';
+          // M1018: sort resume rows — live (has tmux_session) first, then by activity desc.
           resumeRows.sort((a, b) => {
+            const aLive = a.session.tmux_session ? 1 : 0;
+            const bLive = b.session.tmux_session ? 1 : 0;
+            if (aLive !== bLive) return bLive - aLive; // live first
             const aAct = a.session.activity || 0;
             const bAct = b.session.activity || 0;
             return bAct - aAct;
@@ -13991,7 +14206,12 @@ function renderRight(p) {
           for (const row of allRows) {
             const { agent, model_key, model_label, has_live, session: s } = row;
             const isFresh = s.type === 'fresh';
-            const isExecLive = s.type === 'exec_live'; // M233: current running exec session
+            // M1775: fork rows (s.type === 'fork') no longer get special-cased UI treatment —
+            // they render through the same path as resume rows now that the backend correctly
+            // gives forks their own live_session_id (see server.py M1775). The live dot/badge/
+            // tmux-suffix chip already key off _liveExecSids/tmux_session, which fork rows set
+            // correctly, so no isFork branching is needed here anymore.
+            const isExecLive = false; // M1765: exec_live type retired — all sessions use transcript form
             // M1453: session_id is unique — model_key may be '' for older sessions causing mismatch
             const isPicked = _curSess.session_id ? (_curSess.session_id === s.id) : (_curSess.model === model_key && _curSess.agent === agent);
             const isCurrentModel = (model_key === curModel);
@@ -14001,8 +14221,7 @@ function renderRight(p) {
               ? `✦ new session`
               : isExecLive
                 ? `⟳ ${esc(s.label || s.id.slice(0,12))} `
-                : `↻ resume`; // M1737: restored per user request
-            // M342: removed ● live from subLabel — exec button already shows IDLE/LIVE state; duplicate badge causes confusion
+                : `↻ resume`; // M1737: restored per user request; M1775: fork rows now match (live badge is the only distinguishing signal)
             // M436: model name more vivid — remove dim opacity, use accent-soft color for selected
             const _mlColor = isPicked ? 'var(--accent)' : 'var(--text-soft,var(--text-dim))';
             // M1071: prefer session's own detected model (e.g. claude-opus-4-7) over group bucket label
@@ -14014,9 +14233,8 @@ function renderRight(p) {
             if (!isFresh && !isExecLive && s.activity) {
                 const _d = new Date(s.activity * 1000);
                 const _pad = n => String(n).padStart(2,'0');
-                _lastUsed = `<span style="font-size:8px;color:var(--text-soft,var(--text-dim));font-family:var(--mono);flex-shrink:0;white-space:nowrap;width:80px;text-align:right" title="last used (local time)">${String(_d.getFullYear()).slice(2)}/${_pad(_d.getMonth()+1)}/${_pad(_d.getDate())} ${_pad(_d.getHours())}:${_pad(_d.getMinutes())}</span>`;
+                _lastUsed = `<span style="font-size:8px;color:var(--text-soft,var(--text-dim));font-family:var(--mono);white-space:nowrap" title="last used (local time)">${String(_d.getFullYear()).slice(2)}/${_pad(_d.getMonth()+1)}/${_pad(_d.getDate())} ${_pad(_d.getHours())}:${_pad(_d.getMinutes())}</span>`;
             }
-            const subLabel = (isFresh || isExecLive) ? '' : `<span style="font-size:8px;color:${_mlColor};margin-left:4px;font-weight:${isPicked?'600':'400'};flex-shrink:0;width:68px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(_effectiveModelLabel)}</span>${_lastUsed}`;
             // M183: ›_ button on right of each session row; resume rows pass session_id → --resume
             const _ptySessionArg = isFresh ? '' : `,'${esc(s.id)}'`;
             // M283: exec_live rows attach to tmux session directly (enables typing into live exec session)
@@ -14032,12 +14250,13 @@ function renderRight(p) {
               + (isExecLive && _tmuxSession ? `<span class="ns-node-term live" style="font-size:8px;padding:1px 6px;cursor:pointer;flex-shrink:0;margin-left:3px"
                   title="Open in browser terminal (ttyd — mobile-friendly with virtual keyboard)"
                   onclick="event.stopPropagation();openTtydTerminal('${esc(_tmuxSession)}','${esc(_projId)}')">↗_</span>` : '');
-            // M1756: ⑂ Fork button restored — model/agent picker moved here from sess badge popup.
-            // Only shown on transcript resume rows (not fresh, not exec_live).
-            const _forkRowBtn = (!isFresh && !isExecLive && s.id)
-              ? `<span class="ns-fork-btn" data-sid="${esc(s.id)}" data-proj="${esc(_projId)}"
+            const _transcriptRowBtn = '';
+            // M1756: ⑂ Fork button — shown on exec_live row only (running session pane), not on resume rows.
+            const _forkSid = isExecLive ? (_liveExecSid || s.id) : '';
+            const _forkRowBtn = (isExecLive && _forkSid)
+              ? `<span class="ns-fork-btn" data-sid="${esc(_forkSid)}" data-proj="${esc(_projId)}"
                   title="Fork this session on a new model/agent"
-                  onclick="event.stopPropagation();_showForkPicker(this,${JSON.stringify(_projId)},${JSON.stringify(s.id)})"
+                  onclick="event.stopPropagation();_showForkPicker(this,'${esc(_projId)}','${esc(_forkSid)}')"
                   style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:3px;border:1px solid var(--panel-border);background:none;color:var(--text-dim);cursor:pointer;flex-shrink:0;user-select:none">⑂</span>`
               : '';
             // M253: for fresh rows, use current dropdown agent/model so switching to openrouter
@@ -14053,28 +14272,54 @@ function renderRight(p) {
             const _sessOnclick = isFresh
               ? `_selectSession(window.curAgent||'${esc(agent)}',document.getElementById('dm-model-select')?.value||window.curModel||'${esc(model_key)}','${esc(s.id)}')`
               : `_selectSession('${esc(agent)}',${_execLiveModel},'${esc(s.id)}')`;
+            // M1784: ▶ per-row spawn/dispatch button — replaces the old single project-wide
+            // "dispatch-all" button's spawn role. Not shown on exec_live rows (already running,
+            // nothing to spawn — use the ⌨_/↗_ buttons to attach instead). Dispatches THIS exact
+            // row's agent/model/session_id via the same executeProject() path the old global
+            // button used, scoped to one session instead of whatever window._selectedSession
+            // happened to hold. Uses the same agent/model expression as _sessOnclick so the
+            // dispatched session matches what the row visually represents.
+            const _spawnRowAgent = isFresh ? `window.curAgent||'${esc(agent)}'` : `'${esc(agent)}'`;
+            const _spawnRowModel = isFresh
+              ? `document.getElementById('dm-model-select')?.value||window.curModel||'${esc(model_key)}'`
+              : _execLiveModel;
+            const _spawnRowBtn = (!isExecLive) ? `<span class="ns-node-term" style="font-size:8px;padding:1px 6px;cursor:pointer;flex-shrink:0"
+                  title="${isFresh ? 'Spawn a new session' : 'Resume this session'}"
+                  onclick="event.stopPropagation();_dispatchRowSession('${esc(_projId)}',${_spawnRowAgent},${_spawnRowModel},'${esc(s.id)}',this)">▶</span>` : '';
+            // M1775: grid row — dot / info(flex) / model / date / buttons each in a fixed
+            // column, so optional badges (live) inside the info cell never shift the
+            // model/date/button columns out of alignment with sibling rows.
+            const _dotHtml = (() => {
+              // M1499/M1775: left dot = process alive indicator, same rule for fork and resume
+              // rows alike — green ● if this session id has a live tmux process, dim ○ otherwise.
+              // exec_live row: always green ● (process confirmed running/idle in tmux)
+              // fresh row: no dot glyph, but the grid cell itself must still be emitted (empty
+              // span) — an omitted child shifts every subsequent element into the wrong fixed
+              // grid column (M1775 regression: fresh row's label landed in the 10px dot column
+              // instead of the flexible info column, clipping "new session" to invisible).
+              if (isFresh) return `<span></span>`;
+              if (isExecLive) return `<span style="color:var(--green);font-size:9px" title="Process alive in tmux">●</span>`;
+              const _hasProcess = _liveExecSids.size > 0 && _liveExecSids.has(s.id);
+              const _dotColor = _hasProcess ? 'var(--green)' : 'var(--text-dim)';
+              const _dotTitle = _hasProcess ? 'Process alive in tmux' : 'No active process (orphaned transcript)';
+              return `<span style="color:${_dotColor};font-size:9px" title="${_dotTitle}">${_hasProcess ? '●' : '○'}</span>`;
+            })();
+            const _labelIdHtml = (isFresh || isExecLive)
+              ? `<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 0;min-width:0">${label}</span>`
+              : `<span style="flex-shrink:0;white-space:nowrap">${label}</span><span style="flex:1 1 0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono);color:var(--text-dim);margin-left:4px" title="${esc(s.id)}">${esc(_sessDisplayId)}</span>`;
+            const _liveBadgeHtml = (isExecLive || (_liveExecSids.size > 0 && _liveExecSids.has(s.id)))
+              ? `<span style="font-size:8px;color:var(--green);font-weight:600;flex-shrink:0">live</span>` : '';
+            const _modelCellHtml = (isFresh || isExecLive) ? '' :
+              `<span style="font-size:8px;color:${_mlColor};font-weight:${isPicked?'600':'400'};overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(_effectiveModelLabel)}">${esc(_effectiveModelLabel)}</span>`;
+            const _dateCellHtml = _lastUsed;
             html += `<div class="dm-sess-row${isPicked?' picked':''}" data-agent="${esc(agent)}" data-model="${esc(model_key)}" data-session="${esc(s.id)}"
               onclick="${_sessOnclick}"
               style="color:${isFresh?'var(--yellow,#d4a574)':isExecLive?'var(--green)':'var(--text)'}">
-              ${(() => {
-                // M1499: left dot = process alive indicator
-                // exec_live row: always green ● (process confirmed running/idle in tmux)
-                // transcript row: green ● if session id matches live exec session (has alive process), dim ○ otherwise
-                // fresh row: no dot
-                if (isFresh) return '';
-                if (isExecLive) return `<span style="color:var(--green);font-size:9px;flex-shrink:0" title="Process alive in tmux">●</span>`;
-                const _hasProcess = _liveExecSid && s.id === _liveExecSid;
-                const _dotColor = _hasProcess ? 'var(--green)' : 'var(--text-dim)';
-                const _dotTitle = _hasProcess ? 'Process alive in tmux' : 'No active process (orphaned transcript)';
-                return `<span style="color:${_dotColor};font-size:9px;flex-shrink:0" title="${_dotTitle}">${_hasProcess ? '●' : '○'}</span>`;
-              })()}
-              ${(isFresh || isExecLive)
-                ? `<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 0;min-width:0">${label}</span>`
-                : `<span style="flex-shrink:0;white-space:nowrap">${label}</span><span style="flex:1 1 0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono);color:var(--text-dim);margin-left:4px" title="${esc(s.id)}">${esc(_sessDisplayId)}</span>`
-              }
-              ${isExecLive ? `<span style="font-size:8px;color:var(--green);font-weight:600;flex-shrink:0">live</span>` : ''}
-              ${subLabel}
-              <span style="margin-left:auto;display:flex;align-items:center;gap:3px;flex-shrink:0">${_forkRowBtn}${_ptyRowBtn}</span>
+              ${_dotHtml}
+              <span class="dm-sess-row-info">${_labelIdHtml}${_liveBadgeHtml}</span>
+              <span style="width:68px;overflow:hidden">${_modelCellHtml}</span>
+              <span style="width:80px;text-align:right">${_dateCellHtml}</span>
+              <span style="display:flex;align-items:center;gap:3px">${_spawnRowBtn}${_forkRowBtn}${_transcriptRowBtn}${_ptyRowBtn}</span>
             </div>`;
           }
           // M257: include PTY state in hash so color/label changes force re-render
@@ -14082,11 +14327,43 @@ function renderRight(p) {
           const _ptyHashKey = window._ptyStatus?.[_projId] || '';
           // M1499: include _liveExecSid in hash so dot color updates when exec session changes
           const newHash = html.length + ':' + _ptyHashKey + ':' + (_curSess.session_id || '') + ':' + (_liveExecSid || '');
-          if (sessBody.dataset.resumableHash !== newHash || sessBody.querySelector('.dm-sess-spinner')) {
+          const _hashChanged = sessBody.dataset.resumableHash !== newHash || !sessBody.dataset.resumableHash;
+          if (_hashChanged) {
             sessBody.innerHTML = html;
             sessBody.dataset.resumableHash = newHash;
           }
-        }).catch(()=>{});
+          // M1799: was clearing on every fetch .then() regardless of whether this specific
+          // call actually rewrote sessBody.innerHTML — a fetch that landed with a same-hash
+          // (stale/unchanged) result still cleared the overlay, satisfied by round-trip
+          // completion alone rather than "the pane now shows the real post-dispatch state"
+          // (reported: overlay ends before session pane finishes loading — reproduced live,
+          // 18ms clear via MutationObserver, from _selectSession's own pre-existing call to
+          // this same function landing before executeProject's overlay-clearing scheduled
+          // polls even fire). Only clear when this call actually rewrote the row list.
+          if (_hashChanged) {
+            const _dmLoadRR = document.getElementById('detail-modal');
+            // M1791-b: only clear 'dispatch' owner here — 'tmux' owner must survive until
+            // startTmuxWatch's first d.running=true poll. Clearing on _hashChanged alone
+            // was the bug: stale fetches (from _selectSession's own pre-existing call)
+            // resolved with _hashChanged=true and cleared the overlay in ~18ms.
+            // M1812: 'open' owner now cleared by _refreshExecState (after exec-sessions renders).
+            // M1834: skip clear if _dispatchInFlight — this fetch was triggered by _selectSession
+            // inside _dispatchRowSession, racing against executeProject's await. The flag is
+            // cleared by executeProject once POST /execute lands and startTmuxWatch takes over.
+            if (_dmLoadRR && _dmLoadRR.dataset.loadingOwner === 'dispatch' && !window._dispatchInFlight) {
+              _dmLoadRR.classList.remove('loading');
+              delete _dmLoadRR.dataset.loadingOwner;
+            }
+          }
+        }).catch(() => {
+          // M1796: fetch failure — clear any non-tmux dispatch overlay so it isn't stuck.
+          const _dmLoadRRErr = document.getElementById('detail-modal');
+          // M1812: 'open' owner cleared by _refreshExecState; only clear 'dispatch' on fetch failure.
+          if (_dmLoadRRErr && _dmLoadRRErr.dataset.loadingOwner === 'dispatch') {
+            _dmLoadRRErr.classList.remove('loading');
+            delete _dmLoadRRErr.dataset.loadingOwner;
+          }
+        });
     };
     _renderResumableSessions();
     clearInterval(window._resumablePoll);
@@ -14486,15 +14763,18 @@ document.addEventListener('input', e => {
       fetch('/api/exec-sessions').then(r => r.json()).then(d => {
         const mine = (d.sessions || []).filter(s => s.proj_id === projId);
         if (!mine.length) return; // no live sessions at all — leave as-is (idle is correct)
-        // M1717-b: was any-running-wins (`mine.some(s => !s.idle)`), same bug class as
-        // refreshSessionStatus's now-fixed poll aggregate — a child's SSE transition alone
-        // would flip the WHOLE project (including an idle mother) to 'running' here, since
-        // this correction function ran on every session_running/session_idle SSE event
-        // regardless of which session fired it. Now mirrors the mother-only rule: prefer the
-        // mother session's own state; only fall back to any-running-wins if no mother record
-        // exists yet (orphaned children only).
-        const mother = mine.find(s => s.session === `${s.agent||'claude'}-exec-${projId}`);
-        const anyRunning = mother ? !mother.idle : mine.some(s => !s.idle);
+        // M1833: any-running-wins — mirrors refreshSessionStatus (L7709, M1824).
+        // M1717-b changed this to mother-only, but M1824 already reverted the poll path to
+        // any-busy-wins after M1797 removed the distinct mother/child server concept. Keeping
+        // mother-only here created an asymmetry: a UUID-suffix child busy → SSE fires →
+        // _correctExecStatusFor found the legacy bare-name session (idle) as "mother" →
+        // anyRunning=false → card showed idle despite the child being active. Delay = up to
+        // 8s (next natural poll). Fix: revert to any-busy-wins here, consistent with poll.
+        // The original M1717-b concern (child SSE flipping idle mother to running) is already
+        // handled at the session_running handler (L14836) by calling _correctExecStatusFor
+        // instead of blindly setting _execStatus='running', so this function itself is safe
+        // to use any-busy-wins without re-introducing the M1717 regression.
+        const anyRunning = mine.some(s => !s.idle);
         const correctKey = anyRunning ? 'running' : 'idle';
         // M1717-b: the M388 spawn-grace period (refreshSessionStatus ~7586) force-preserves
         // 'running' for 30s after a session_running SSE event, regardless of mother/child —
@@ -14503,6 +14783,16 @@ document.addEventListener('input', e => {
         // idle mother's avatar into showing 'running' for up to 30s even after this fetch
         // correctly identified it as idle.
         if (!anyRunning && window._execSpawnTime) delete window._execSpawnTime[projId];
+        // M1832-b: update _execSessionList from this authoritative fetch so SSE-triggered
+        // render() uses fresh per-session idle states (not stale poll values up to 8s old).
+        // mini avatar (_sessList[1~2]) idle state was the main SSE gap identified in review.
+        const _prevSnap = JSON.stringify((window._execSessionList[projId] || []).map(s => s.idle));
+        window._execSessionList[projId] = mine.map(s => ({
+          idle: s.idle, model: s.model||'', session: s.session||'',
+          live_session_id: s.live_session_id||'', isMother: false, created: s.created||''
+        })).sort((a, b) => (a.created > b.created ? 1 : a.created < b.created ? -1 : 0));
+        const _newSnap = JSON.stringify(window._execSessionList[projId].map(s => s.idle));
+        const _sessChanged = _newSnap !== _prevSnap;
         if (_execStatus[projId] !== correctKey) {
           _execStatus[projId] = correctKey;
           const cardNode = document.querySelector(`.ns-node[data-pid="${CSS.escape(projId)}"]`);
@@ -14510,6 +14800,10 @@ document.addEventListener('input', e => {
             cardNode.classList.toggle('exec-live', anyRunning);
             cardNode.classList.toggle('exec-idle', !anyRunning);
           }
+          Object.keys(_swimlaneLaneFp).forEach(k => delete _swimlaneLaneFp[k]);
+          if (typeof render === 'function') render();
+        } else if (_sessChanged) {
+          // _execStatus unchanged but per-session idle states shifted — re-render for mini avatars
           Object.keys(_swimlaneLaneFp).forEach(k => delete _swimlaneLaneFp[k]);
           if (typeof render === 'function') render();
         }
@@ -14611,6 +14905,16 @@ document.addEventListener('input', e => {
       if (typeof window._refreshExecState === 'function' && window._detailModalOpenProjId) {
         window._refreshExecState();
       }
+      // M1778: M1686 only covered the detail-modal session pane (gated on
+      // _detailModalOpenProjId) — the swimlane ns-card avatars have the exact same gap
+      // (SSE closed while hidden → any busy/idle transition during that window is
+      // missed → avatar sits stale until a manual reload), just via a different render
+      // path (refreshSessionStatus → _execStatus → render(), not _refreshExecState).
+      // Reported: "session busy 전환후 avatar가 새로고침을 해야 busy로 보인다" — reconcile
+      // the swimlane state the same way on regaining visibility.
+      if (typeof refreshSessionStatus === 'function') {
+        refreshSessionStatus().then(() => { if (typeof render === 'function') render(); }).catch(() => {});
+      }
     }
   });
 })();
@@ -14674,27 +14978,16 @@ async function _refreshDetailCard(projId) {
 
 // M135: standalone 15s auto-refresh removed — hub drives refresh via hub-refresh postMessage (8s cycle)
 
-// M135: real-time clock — rAF-based (M1581: replaced 1s setInterval). M1742: rAF loop now pauses
-// entirely when tab is hidden — previously called requestAnimationFrame unconditionally, keeping
-// the 60Hz loop alive even with document.hidden=true (iOS ran full GPU frame budget in background).
-(function _clockRaf() {
-  let _lastClockSec = -1;
-  let _rafId = null;
-  function _tick() {
-    if (document.hidden) { _rafId = null; return; } // stop loop; visibilitychange will restart
-    const now = new Date();
-    const sec = now.getSeconds();
-    if (sec !== _lastClockSec) {
-      _lastClockSec = sec;
-      const el = document.getElementById('updated-at');
-      if (el) el.textContent = now.toLocaleTimeString('en-GB', { hour12: false });
-    }
-    _rafId = requestAnimationFrame(_tick);
-  }
-  function _start() { if (!_rafId && !document.hidden) _rafId = requestAnimationFrame(_tick); }
-  document.addEventListener('visibilitychange', _start);
-  _start();
-})();
+// M135/M1581/M1742/M1780: this used to be a periodic clock (setInterval(1000) → 60Hz rAF →
+// hidden-gated rAF) driving #updated-at. M1780 audit: #updated-at is CSS `display:none`
+// (see its own comment at the markup site — "time removed from header, kept hidden for any
+// consumers still reading the element") and has zero actual .textContent readers in this
+// file — both writers found were this periodic tick and a one-shot update inside loadData()
+// (fires every ~15s hub-refresh cycle). A dedicated per-second timer for a value nobody reads
+// and nobody sees was pure overhead (measured: 60 requestAnimationFrame calls/sec while this
+// ran as rAF, 59 of them no-ops) — removed entirely; loadData()'s existing one-shot write is
+// the sole remaining updater, more than sufficient for the stated "kept for any consumers"
+// fallback purpose.
 
 // ── M541: MoSCoW badge ───────────────────────────────────────────────────────
 const _MOSCOW_CYCLE = [null, 'M', 'S', 'C', 'W'];
@@ -14928,7 +15221,10 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
         const _assignedSess = ns.assigned_session.trim();
         const _execProjPattern = new RegExp(`-exec-${_proj}$`);
         const _isMain = _execProjPattern.test(_assignedSess);
-        _btnLabel = _isMain ? 'main' : (_assignedSess.replace(new RegExp(`.*-exec-${_proj}-`), '') || 'branch');
+        // M1762: show live_session_id (UUID prefix) instead of tmux suffix so user sees the actual session transcript ID
+        const _sessEntry = ((window._execSessionList||{})[_proj]||[]).find(x => x.session === _assignedSess);
+        const _liveSuffix = (_sessEntry && _sessEntry.live_session_id) ? _sessEntry.live_session_id.slice(0,8) : '';
+        _btnLabel = _isMain ? 'main' : (_liveSuffix || _assignedSess.replace(new RegExp(`.*-exec-${_proj}-`), '') || 'branch');
         _btnColor = _isMain ? 'var(--green)' : '#7b9fd4';
         _btnBorder = _isMain ? 'rgba(61,139,94,.4)' : 'rgba(123,159,212,.4)';
         _btnBg = _isMain ? 'rgba(61,139,94,.12)' : 'rgba(123,159,212,.12)';
@@ -14959,14 +15255,21 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
         document.body.appendChild(_skPop);
         let sessions = [];
         let _sessSubstarCounts = {};  // M806: session name → count of substars assigned
-        let _sessBranchFrom = {};  // M792: session_name → branch_from short UUID
         let _mainLastSessId = '';  // M806: resume session ID for main session
         let _allNs = [];  // M826: all substars — used for cross-substar placeholder injection
+        // M1787: fetch the "직전 세션" (last-worked session) candidate for THIS substar in
+        // parallel with the other two — pure read, server never auto-assigns/auto-spawns it
+        // (M1780: surface it for a human to pick, don't silently auto-spawn on unassigned).
+        let _lastWorked = null;
         try {
-          const [d, nsD] = await Promise.all([
+          const [d, nsD, lw] = await Promise.all([
             fetch(`/api/northstar/${encodeURIComponent(_sessBtnProj)}/session-contexts`).then(r=>r.json()),
-            fetch(`/api/northstar/${encodeURIComponent(_sessBtnProj)}/north-stars`).then(r=>r.json()).catch(()=>([]))
+            fetch(`/api/northstar/${encodeURIComponent(_sessBtnProj)}/north-stars`).then(r=>r.json()).catch(()=>([])),
+            ns?.id
+              ? fetch(`/api/northstar/${encodeURIComponent(_sessBtnProj)}/north-stars/${encodeURIComponent(ns.id)}/last-worked-session`).then(r=>r.json()).catch(()=>null)
+              : Promise.resolve(null),
           ]);
+          _lastWorked = (lw && lw.ok && lw.session_name) ? lw : null;
           sessions = d.sessions || [];
           _mainLastSessId = d.main_last_session_id || '';
           // M806: count substar assignments; M792: map branch origins
@@ -14984,7 +15287,6 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
           _allNs.forEach(ns => {
             if (ns.assigned_session) {
               _sessSubstarCounts[ns.assigned_session] = (_sessSubstarCounts[ns.assigned_session] || 0) + 1;
-              if (ns.branch_from_session_id) _sessBranchFrom[ns.assigned_session] = ns.branch_from_session_id.slice(0,8);
             }
           });
         } catch(_) {}
@@ -15038,6 +15340,18 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
         if (_assignedSess && !_sortedSessions.some(s => s.name === _assignedSess)) {
           _sortedSessions.unshift({name: _assignedSess, activity: null, summary: '(assigned — not yet spawned)'});
         }
+        // M1787: substar is UNASSIGNED — surface the last-worked session as a distinctly
+        // tagged pick instead of the server silently auto-assigning/auto-spawning it (M1780).
+        // isLastWorked marks the row for a separate visual badge below; unshifted so it's
+        // the first thing the user sees, same as the M814 "assigned" placeholder above.
+        if (!_assignedSess && _lastWorked && !_sortedSessions.some(s => s.name === _lastWorked.session_name)) {
+          _sortedSessions.unshift({
+            name: _lastWorked.session_name,
+            activity: null,
+            summary: _lastWorked.is_live ? '(last session — live)' : '(last session — not yet spawned)',
+            isLastWorked: true,
+          });
+        }
         // M826: inject placeholders for ALL other substars' assigned sessions not in live list
         // so each substar's sess picker shows sibling substars' sessions even when dead
         _allNs.forEach(otherNs => {
@@ -15054,12 +15368,15 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
           const isAssigned = _assignedSess && s.name === _assignedSess;
           const isMain = _isMainSess(s.name);
           const row = document.createElement('div');
-          row.style.cssText = `padding:7px 10px;border-bottom:1px solid var(--panel-border);cursor:pointer${isAssigned ? ';border-left:3px solid var(--accent);background:rgba(var(--accent-rgb,255,149,0),.15)' : (isMain ? ';border-left:3px solid var(--text-dim)' : '')}`;
-          row.onmouseenter = () => row.style.background = isAssigned ? 'rgba(var(--accent-rgb,255,149,0),.25)' : 'var(--panel-soft)';
-          row.onmouseleave = () => row.style.background = isAssigned ? 'rgba(var(--accent-rgb,255,149,0),.15)' : '';
+          row.style.cssText = `padding:7px 10px;border-bottom:1px solid var(--panel-border);cursor:pointer${isAssigned ? ';border-left:3px solid var(--accent);background:rgba(var(--accent-rgb,255,149,0),.15)' : (s.isLastWorked ? ';border-left:3px solid #7b9fd4;background:rgba(123,159,212,.12)' : (isMain ? ';border-left:3px solid var(--text-dim)' : ''))}`;
+          row.onmouseenter = () => row.style.background = isAssigned ? 'rgba(var(--accent-rgb,255,149,0),.25)' : (s.isLastWorked ? 'rgba(123,159,212,.2)' : 'var(--panel-soft)');
+          row.onmouseleave = () => row.style.background = isAssigned ? 'rgba(var(--accent-rgb,255,149,0),.15)' : (s.isLastWorked ? 'rgba(123,159,212,.12)' : '');
           const ago = s.activity ? Math.round((Date.now()/1000 - s.activity)/60) : null;
           const agoTxt = ago !== null ? (ago < 60 ? `${ago}m ago` : `${Math.round(ago/60)}h ago`) : '';
           const assignedTag = isAssigned ? `<span style="background:var(--accent);color:#000;font-size:8px;padding:1px 4px;border-radius:2px;margin-left:5px;font-weight:700">assigned</span>` : '';
+          // M1787: "직전 세션" badge — distinguishes the last-worked-session pick from a
+          // regular resumable row so the user understands why it's pinned at top.
+          const lastWorkedTag = s.isLastWorked ? `<span style="background:#7b9fd4;color:#000;font-size:8px;padding:1px 4px;border-radius:2px;margin-left:5px;font-weight:700" title="Most recently worked this substar's stones">last session</span>` : '';
           const mainTag = isMain ? `<span style="background:var(--text-dim);color:var(--bg);font-size:8px;padding:1px 4px;border-radius:2px;margin-left:5px;font-weight:700">main</span>` : '';
           // M806: substar count badge — brighter so it's readable
           const _subCount = _sessSubstarCounts[s.name] || 0;
@@ -15071,13 +15388,13 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
           const _dispId = s.name;
           // M831.2: branch-from session id tag removed per user request — clutter on right side
           row.innerHTML = `<div style="display:flex;align-items:center;justify-content:space-between;gap:4px">
-            <div style="color:${isAssigned ? 'var(--accent)' : 'var(--text)'};font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;display:flex;align-items:center;gap:0"><span style="color:var(--text-dim);font-size:9px;font-weight:400;margin-right:5px">#${_sessIdx}</span>${esc(_dispId)}${mainTag}${assignedTag}${subCountTag}</div>
+            <div style="color:${isAssigned ? 'var(--accent)' : 'var(--text)'};font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;display:flex;align-items:center;gap:0"><span style="color:var(--text-dim);font-size:9px;font-weight:400;margin-right:5px">#${_sessIdx}</span>${esc(_dispId)}${mainTag}${assignedTag}${lastWorkedTag}${subCountTag}</div>
             <div style="display:flex;gap:3px;flex-shrink:0">
               <button class="_sess-rename-btn" title="Rename session" style="font-family:var(--mono);font-size:9px;padding:1px 5px;border-radius:3px;border:1px solid var(--panel-border);background:none;color:var(--text-dim);cursor:pointer;line-height:1.4">✎</button>
               <button class="_sess-kill-btn" title="Kill session" style="font-family:var(--mono);font-size:9px;padding:1px 5px;border-radius:3px;border:1px solid rgba(192,57,43,.4);background:none;color:var(--red,#c0392b);cursor:pointer;line-height:1.4">✕</button>
             </div>
           </div>
-          <div style="color:var(--text-dim);font-size:9px;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${agoTxt ? agoTxt + ' · ' : ''}${esc(s.summary || '—')}</div>`;
+          <div style="color:${(s.summary||'').includes('not') && (s.summary||'').includes('spawn') ? '#e74c3c' : 'var(--text-dim)'};font-size:9px;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;${(s.summary||'').includes('not') && (s.summary||'').includes('spawn') ? 'font-weight:600' : ''}">${agoTxt ? agoTxt + ' · ' : ''}${esc(s.summary || '—')}</div>`;
           row.title = isAssigned ? 'Currently assigned session — click to reassign' : (isMain ? 'Project main session — click to assign to this substar' : 'Click to assign this session to the section');
           row.onclick = async (ev) => {
             ev.stopPropagation();
@@ -15232,6 +15549,10 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
             _closeSessionModal();
             // M860: if killed session was being watched, stop the overlay
             if (s.name && typeof stopTmuxWatch === 'function' && _tmuxWatchSession === s.name) stopTmuxWatch();
+            // M1818: show spinner in session pane immediately after kill — persists until
+            // _refreshExecState re-renders the pane (clears naturally when data arrives).
+            { const _killInfo = document.getElementById('dm-exec-sessions');
+              if (_killInfo) _killInfo.innerHTML = `<div style="color:var(--text-dim);font-size:9px;opacity:.6;padding:4px 0;display:flex;align-items:center;gap:5px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;border:1px solid var(--text-dim);border-top-color:transparent;animation:dm-spin .7s linear infinite"></span>stopping…</div>`; }
             // M897: burst-poll from 0ms so exec sessions pane clears immediately
             if (window._refreshExecState) {
               [0, 400, 1200, 3000].forEach(d => setTimeout(window._refreshExecState, d));
@@ -15247,6 +15568,36 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
           emptyDiv.style.cssText = 'padding:10px;text-align:center;color:var(--text-dim);font-size:10px';
           emptyDiv.textContent = 'No active sessions for this project';
           popup.appendChild(emptyDiv);
+        }
+        // M1802: Unassign button — shown only when a session is currently assigned to this substar
+        if (_assignedSess && ns) {
+          const _unassignDiv = document.createElement('div');
+          _unassignDiv.style.cssText = 'padding:8px 10px;border-top:1px solid var(--panel-border);display:flex;align-items:center;justify-content:space-between;gap:8px';
+          _unassignDiv.innerHTML = `<span style="color:var(--text-dim);font-size:9px">Assigned: <span style="color:var(--accent);font-weight:600">${esc(_assignedSess)}</span></span>`;
+          const _unassignBtn = document.createElement('button');
+          _unassignBtn.textContent = 'Unassign';
+          _unassignBtn.title = 'Remove session assignment from this substar';
+          _unassignBtn.style.cssText = 'font-family:var(--mono);font-size:9px;padding:2px 8px;border-radius:3px;border:1px solid rgba(192,57,43,.5);background:none;color:var(--red,#c0392b);cursor:pointer;flex-shrink:0';
+          _unassignBtn.onclick = async (ev) => {
+            ev.stopPropagation();
+            try {
+              const _r = await fetch(`/api/northstar/${encodeURIComponent(_sessBtnProj)}/north-stars/${encodeURIComponent(ns.id)}`,
+                {method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({assigned_session:null})});
+              if (!_r.ok) { _unassignBtn.textContent = 'Error'; return; }
+              ns.assigned_session = null;
+              if (window._nsMap && window._nsMap[ns.id]) window._nsMap[ns.id].assigned_session = null;
+              { const _cn = (_nsStarsCache[_sessBtnProj] || []).find(n => n.id === ns.id);
+                if (_cn) _cn.assigned_session = null; }
+              delete _groupingFingerprint[_sessBtnProj];
+              if (typeof _fastReapplyGrouping === 'function') try { _fastReapplyGrouping(_sessBtnProj); } catch(_) {}
+              { const _sb = document.querySelector(`[data-ns-sess-btn="${ns.id}"]`);
+                if (_sb) { _sb.textContent = 'sess'; _sb.title = 'View / assign a session'; _sb.style.borderColor='var(--panel-border)'; _sb.style.color='var(--text-dim)'; _sb.style.background='none'; } }
+              if (typeof loadMilestones === 'function') { try { loadMilestones(_sessBtnProj); } catch(_) {} }
+              _closeSessionModal();
+            } catch(e) { _unassignBtn.textContent = 'Error'; }
+          };
+          _unassignDiv.appendChild(_unassignBtn);
+          popup.appendChild(_unassignDiv);
         }
         // M1756: Assign button + agent/model picker removed — fork function moved to session pane Fork button.
         // Sess badge popup is now assign-by-click-only (existing sessions list above).
@@ -15265,6 +15616,36 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
       addMsBtn.onclick = e => { e.stopPropagation(); addMilestone(_projH, 0, null, _nsIdH); };
       btnWrap.appendChild(addMsBtn);
       btnWrap.appendChild(sessBtn);
+      // M1759: auto-open sess popup when substar has queued stones but no session assigned
+      // M1805: _hasSess/_autoQueuedCount here are a render-time snapshot from two
+      // independently-fetched caches (_nsStarsCache vs _msCacheByProject) — this function
+      // runs from 7+ independent trigger sites (poll/SSE/card-open), and a render that lands
+      // in the narrow window where one cache updated but the other hasn't yet can see a
+      // substar as "unassigned" even though the server-side assigned_session is already set
+      // (reported live: popup auto-opening for a substar already showing assigned to main).
+      // Re-verify against a fresh server read right before actually opening — the auto-open
+      // is a convenience nudge, not a hot path, so one extra fetch here is cheap insurance
+      // against snapshot staleness that a purely client-cache-based check can't rule out.
+      if (!_hasSess && ns?.id) {
+        const _autoQueuedCount = (_msCacheByProject[_proj] || [])
+          .filter(m => m.substar_id === ns.id && m.status === 'queued' && !m.done && !m.held).length;
+        if (_autoQueuedCount > 0) {
+          const _autoNsId = ns.id, _autoProj = _proj;
+          setTimeout(() => {
+            // M1771 lesson applied: a fresh-looking re-check is worthless if the fetch
+            // itself can return a stale (browser-cached) response — no-store matches the
+            // established convention used by every other correctness-sensitive fetch in
+            // this file (milestones, blink_state, etc.), not a stylistic choice here.
+            fetch(`/api/northstar/${encodeURIComponent(_autoProj)}/north-stars`, {cache: 'no-store'})
+              .then(r => r.json())
+              .then(d => {
+                const _freshNs = (d.north_stars || []).find(n => n.id === _autoNsId);
+                if (_freshNs && !(_freshNs.assigned_session || '').trim()) sessBtn.click();
+              })
+              .catch(() => {});
+          }, 0);
+        }
+      }
       if (ns) {
         // M885: agt button removed
         const editBtn = document.createElement('button');
@@ -16003,11 +16384,11 @@ function _showForkPicker(triggerEl, projId, sourceSid) {
   _agSel.onchange = () => { _mdSel.innerHTML = _buildMdOpts(_agSel.value, ''); };
   // Fork button
   const _forkBtn = document.createElement('button');
-  _forkBtn.textContent = '⑂ Fork';
-  _forkBtn.style.cssText = 'font-family:var(--mono);font-size:9px;padding:3px 8px;border-radius:3px;border:1px solid var(--accent);background:none;color:var(--accent);cursor:pointer;align-self:flex-end';
+  _forkBtn.textContent = 'confirm';
+  _forkBtn.style.cssText = 'font-family:var(--mono);font-size:9px;padding:3px 8px;border-radius:3px;border:1px solid rgba(123,159,212,.5);background:rgba(123,159,212,.1);color:#7b9fd4;cursor:pointer;align-self:flex-end;font-weight:500';
   _forkBtn.onclick = async () => {
     _forkBtn.disabled = true;
-    _forkBtn.textContent = 'Forking…';
+    _forkBtn.textContent = 'forking…';
     try {
       const r = await fetch(`/api/northstar/${encodeURIComponent(projId)}/fork-session`, {
         method: 'POST', headers: {'Content-Type':'application/json'},
@@ -16044,6 +16425,7 @@ function _showForkPicker(triggerEl, projId, sourceSid) {
     document.addEventListener('mousedown', _close);
   }, 0);
 }
+
 
 function _nsModelAvatars() {
   return _nsAvatarCache;

@@ -106,13 +106,16 @@ TOOLS = [
             "For updates, delete the old GDrive file (rclone deletefile) then re-upload so a new GDrive ID is always assigned. "
             "NOTE: ❌ rclone link is prohibited — returns open?id= format that breaks on mobile. "
             "✅ Always use rclone lsjson | python3 pipeline (steps ①② above) to get the /file/d/.../view?usp=sharing URL. "
-            "If you already called this tool and got requires_evidence=True: re-run steps ①② then call again with evidence_url."
+            "If you already called this tool and got requires_evidence=True: re-run steps ①② then call again with evidence_url. "
+            "LONG-FORM OVERFLOW (M1817): if analysis is too detailed for 3 lines, write full detail to "
+            "docs/ns-replies/<YYYYMMDD>-<MID>.md first, then reference it in the ≤3-line summary "
+            "(e.g. '분석 완료. 상세: docs/ns-replies/20260715-M1814.md'). Never attempt reply_to_stone AFTER report_task_complete."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "task_id": {"type": "string"},
-                "summary": {"type": "string", "description": "1-line past-tense summary including key result/finding — match user's stone input language. Text/analysis results: include the actual conclusion, not just 'done'."},
+                "summary": {"type": "string", "description": "≤3-line past-tense summary including key result/finding — match user's stone input language. Text/analysis results: include the actual conclusion, not just 'done'. One line is ideal; 3 lines is the hard cap (M1709/M1817)."},
                 "status": {"type": "string", "enum": ["pending_confirmation", "skipped"], "description": "default: pending_confirmation"},
                 "evidence_url": {"type": "string", "description": "GDrive URL (https://drive.google.com/file/d/<ID>/view?usp=sharing) — paste here, NOT inside summary text. REQUIRED for Layer A stones; omitting returns ok=False. ❌ DO NOT use rclone link (returns open?id= format that breaks on mobile). ✅ Use: rclone lsjson 'gdrive:...' --include '<file>' | python3 -c \"import sys,json;d=json.load(sys.stdin);print('https://drive.google.com/file/d/'+d[0]['ID']+'/view?usp=sharing')\""},
                 "evidence_filename": {"type": "string", "description": "Local filename of the uploaded file (e.g. 'M1234-report.xlsx'). Pass this so the UI shows the real filename instantly without a GDrive API call."},
@@ -311,6 +314,31 @@ def _score_sentence(sent: str, role: str) -> float:
     return max(0.0, score)
 
 
+_GDRIVE_URL_RE = re.compile(r'https://drive\.google\.com/(?:file/d/|open\?id=)\S+')
+
+
+def _url_param_gap_warning(message_text: str, evidence_url_param: str) -> str:
+    """M1798: reply_to_stone/report_task_complete already accept evidence_url/evidence_filename
+    as first-class params (M1638/M1699/M1133/M1304) — a single call can both post the reply
+    AND set the result badge. Observed failure (FromScratch M140, 2026-07-13): the LLM had a
+    GDrive URL in hand (from a manual rclone upload after avoiding the GDrive-MCP-prohibited
+    path) and pasted it directly into the message/summary text instead of passing it via
+    evidence_url — the badge then depended on the async GDrive lookup (M1697) instead of being
+    set immediately. This is a soft nudge, not a hard block: a URL in the text isn't always
+    evidence (could be a reference link), so we warn rather than reject.
+    Returns a warning string, or "" if nothing looks off."""
+    if evidence_url_param:
+        return ""  # already using the parameter — nothing to warn about
+    if _GDRIVE_URL_RE.search(message_text or ""):
+        return (
+            "M1798: a GDrive URL appears in your message/summary text but evidence_url was not "
+            "passed as a parameter. Pass the URL via evidence_url (and evidence_filename) in the "
+            "SAME call instead of pasting it into the text — this sets the result badge "
+            "immediately instead of leaving it dependent on an async GDrive lookup."
+        )
+    return ""
+
+
 def _extract_key_sentence(text: str, role: str, max_chars: int = 200) -> str:
     """M1193 v2: Extract the single most important sentence from a turn using importance scoring.
     Falls back to first sentence if no scored sentence is found."""
@@ -392,8 +420,14 @@ def _session_identity() -> tuple:
     global _SESSION_IDENTITY_CACHE
     if _SESSION_IDENTITY_CACHE is not None:
         return _SESSION_IDENTITY_CACHE
-    sk, is_exec = "", False
-    if os.environ.get("TMUX"):
+    # M1766: NS_SESSION_KEY (set at spawn time) first — zero subprocess cost, zero timeout
+    # risk. tmux display-message only as fallback. A transient tmux timeout used to silently
+    # misroute the busy-state write to a wrong/legacy key, leaving the real session's stale
+    # busy record uncleared (root cause of a session stuck "busy" ~7min after work finished).
+    sk, is_exec = os.environ.get("NS_SESSION_KEY", "").strip(), False
+    if sk:
+        is_exec = "-exec-" in sk
+    elif os.environ.get("TMUX"):
         try:
             import subprocess
             sk = subprocess.run(["tmux", "display-message", "-p", "#S"],
@@ -489,6 +523,22 @@ def handle_get_pending_task(proj_id: str, hub_url: str) -> dict:
             _post_busy(proj_id, hub_url, True, "pending_task_received", stone_id=stone.get("id", ""))
         # M1114: surface skill_refs as a structured field (not buried in text annotations)
         _srefs = stone.get("skill_refs") or ([stone["skill_ref"]] if stone.get("skill_ref") else [])
+        # M1825: suppress skill_refs re-injection when the skill was already invoked for this stone
+        # and the stone has at least one claude conversation turn (i.e. work is in progress / was done).
+        # Prevents compaction-boundary re-trigger: action_log already records invoked_skill per stone_id
+        # (M1221 infrastructure). Only suppress when conv has a prior claude turn — a fresh stone with
+        # no history must always get the skill, even if action_log has a stale entry from a prior run.
+        if _srefs and _full_conv and any(c.get("role") == "claude" for c in _full_conv if isinstance(c, dict)):
+            try:
+                _stone_id = stone.get("id", "")
+                _already_invoked = _hub_request(
+                    f"{hub_url}/api/action-log?stone_id={_stone_id}&limit=1&action=invoked_skill",
+                    method="GET",
+                )
+                if _already_invoked.get("rows"):
+                    _srefs = []  # suppress — skill already ran for this stone in a prior turn
+            except Exception:
+                pass  # fail-open: if check fails, inject skill_refs as normal
         # M1414: adj_refs — stone-level overrides global dp_adj_selected user-setting
         _adj_refs = stone.get("adj_refs") or []
         if not _adj_refs:
@@ -515,6 +565,18 @@ def handle_get_pending_task(proj_id: str, hub_url: str) -> dict:
                 "ONLY call reply_to_stone(task_id, message). "
                 "Do NOT call report_task_complete — it will be auto-completed server-side after your reply."
             )
+        elif _last_conv_role == "claude":
+            # M1817-P1: stone was re-queued after a prior claude turn (e.g. user re-ran it).
+            # The stone has context history but the TASK field above is what to execute now.
+            # DO NOT attempt to reply_to_stone or report_task_complete based on the old turn —
+            # implement the task fresh. M190 gate will block any claude→claude append if you
+            # try to "complete" without new user input. Treat as a new impl task.
+            result["_claude_last_warning"] = (
+                "M1817-P1: conv[-1].role=='claude' — this stone was re-queued after a prior completion. "
+                "Execute the TASK field as a fresh implementation. "
+                "Do NOT call reply_to_stone (no user question pending). "
+                "Call report_task_complete when your new work is done."
+            )
         # M1712: AskUserQuestion blocks this exec session's turn until a human answers in the
         # terminal — unlike report_task_complete/reply_to_stone, it has no queue-continuation
         # path, so the session sits fully idle from the hub's perspective for however long the
@@ -528,9 +590,20 @@ def handle_get_pending_task(proj_id: str, hub_url: str) -> dict:
             "calling AskUserQuestion — that tool blocks this exec session's turn until a human "
             "answers in the terminal, with no hub-side queue-continuation while blocked."
         )
-        # Backward compat: keep text/conversation for any callers that read them
-        result["text"] = _stone_text
-        result["conversation"] = _llm_conv
+        # M1799: removed result["text"] (was an unlabeled duplicate of original_stone, with
+        # zero consumers in hub-mcp-server.py or server.py — confirmed via grep, same dead-
+        # code pattern M1782 found for the old `conversation` key). Unlike original_stone,
+        # this field had no "background only" qualifier anywhere the LLM could see, and no
+        # mention in the tool's schema description — a real residual risk that the LLM could
+        # treat it as equally actionable as `task`, especially right after context compaction.
+        # This is the same failure class observed on UniversEye M166: Claude answered the
+        # stone's original creation-time question instead of the latest user comment.
+        # M1782: expose last_user_comment directly instead of the full conversation array —
+        # stone-ctx-hook.py only ever needed this one string (for CTX/BM25 query-building),
+        # not the whole context blob, which duplicated the AI conversation_summary already
+        # present in `context` (both keys held the same _llm_conv list, so any summary entry
+        # was delivered to the LLM twice per get_pending_task() call).
+        result["last_user_comment"] = _last_user_comment or ""
         # M1414: inject adj_refs into task text as style instruction (appended, not replacing)
         if _adj_refs:
             result["adj_refs"] = _adj_refs
@@ -646,6 +719,9 @@ def handle_report_task_complete(
             # (M1697's warning), making it indistinguishable from a genuine missing-URL case.
             resp["ok"] = True
             resp["proof_warning"] = result.get("proof_warning")
+        _url_gap = _url_param_gap_warning(summary, evidence_url)
+        if _url_gap:
+            resp["evidence_param_warning"] = _url_gap
         # M1533 v4: agent reports completion → idle. Toggle OFF for poller dispatch readiness.
         # SKIP when task did NOT actually complete: Layer A blocked (requires_evidence) → agent
         # will re-upload and call again. Setting busy=false here would race-fire immediate dispatch
@@ -842,6 +918,9 @@ def handle_reply_to_stone(proj_id: str, hub_url: str, task_id: str, message: str
         out = {"ok": result.get("ok", False), "task_id": task_id}
         if result.get("proof_warning"):
             out["proof_warning"] = result.get("proof_warning")
+        _url_gap = _url_param_gap_warning(message, evidence_url)
+        if _url_gap:
+            out["evidence_param_warning"] = _url_gap
         return out
     except HubHTTPError as e:
         # M1709: surface the server's structured 422/409 body (error code + detail +
