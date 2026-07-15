@@ -1992,7 +1992,7 @@ header {
     </div>
   </div>
   <div id="dm-tmux-output" style="font-size:10px;font-family:var(--mono);color:#d4cfc8;padding:10px;
-    max-height:50vh;overflow-y:auto;white-space:pre-wrap;line-height:1.5;-webkit-overflow-scrolling:touch;touch-action:pan-y;overscroll-behavior:contain;will-change:scroll-position"></div>
+    max-height:75vh;overflow-y:auto;white-space:pre-wrap;line-height:1.5;-webkit-overflow-scrolling:touch;touch-action:pan-y;overscroll-behavior:contain;will-change:scroll-position"></div>
 </div>
 
 <!-- Kill session confirm dialog (fixed viewport overlay) -->
@@ -15400,6 +15400,47 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
             ev.stopPropagation();
             // M792 fix: await + response.ok + optimistic local cache update + visible feedback
             if (ns) {
+              // M1838: check for stale claims on this substar's queued stones before assigning.
+              // If another session holds an active claim, warn the user — server will auto-clear
+              // it on PATCH, but user should know the prior session's work will be interrupted.
+              try {
+                const _clrCheck = await fetch(`/api/action-log?proj_id=${encodeURIComponent(_sessBtnProj)}&action=task%3Aclaimed&limit=5`).then(r=>r.json()).catch(()=>null);
+                // Check milestones for stale claims on this substar
+                const _msCheck = await fetch(`/api/northstar/${encodeURIComponent(_sessBtnProj)}/milestones?status=queued`).then(r=>r.json()).catch(()=>null);
+                const _msArr = (_msCheck && (_msCheck.milestones || _msCheck)) || [];
+                const _now_ui = Date.now() / 1000;
+                const _staleClaimStones = Array.isArray(_msArr) ? _msArr.filter(m =>
+                  (m.substar_id || '') === ns.id &&
+                  m.claimed_by_session && m.claimed_by_session !== s.name &&
+                  m.claimed_at && (_now_ui - m.claimed_at) < 120
+                ) : [];
+                if (_staleClaimStones.length > 0) {
+                  const _claimedBy = _staleClaimStones[0].claimed_by_session || '?';
+                  const _claimedSuffix = _claimedBy.replace(/.*-exec-[^-]+-/, '') || _claimedBy.slice(-8);
+                  const _confirmed = await new Promise(res => {
+                    const _ov = document.createElement('div');
+                    _ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:10020;display:flex;align-items:center;justify-content:center';
+                    const _box = document.createElement('div');
+                    _box.style.cssText = 'background:var(--panel);border:1px solid #e67e22;border-radius:8px;padding:16px;width:280px;font-family:var(--mono);font-size:11px;color:var(--text)';
+                    _box.innerHTML = `<div style="color:#e67e22;font-weight:700;margin-bottom:8px">세션 재할당 확인</div><div style="margin-bottom:12px;line-height:1.5">세션 <b>${esc(_claimedSuffix)}</b>이(가) 이 서브스타의 스톤 ${_staleClaimStones.length}개를 처리 중입니다.<br><br>재할당하면 기존 클레임이 초기화되고 <b>${esc(s.name.replace(/.*-exec-[^-]+-/,'') || s.name.slice(-8))}</b> 세션이 작업을 인계합니다.</div>`;
+                    const _br = document.createElement('div');
+                    _br.style.cssText = 'display:flex;gap:8px;justify-content:flex-end';
+                    const _cancel = document.createElement('button');
+                    _cancel.textContent = '취소';
+                    _cancel.style.cssText = 'font-family:var(--mono);font-size:10px;padding:4px 10px;border-radius:4px;border:1px solid var(--panel-border);background:none;color:var(--text-dim);cursor:pointer';
+                    const _ok = document.createElement('button');
+                    _ok.textContent = '재할당';
+                    _ok.style.cssText = 'font-family:var(--mono);font-size:10px;padding:4px 10px;border-radius:4px;border:1px solid #e67e22;background:rgba(230,126,34,.1);color:#e67e22;cursor:pointer';
+                    _cancel.onclick = () => { _ov.remove(); res(false); };
+                    _ok.onclick = () => { _ov.remove(); res(true); };
+                    _ov.addEventListener('keydown', e => { if (e.key==='Escape') _cancel.onclick(); else if (e.key==='Enter') _ok.onclick(); });
+                    _br.appendChild(_cancel); _br.appendChild(_ok); _box.appendChild(_br);
+                    _ov.appendChild(_box); document.body.appendChild(_ov);
+                    setTimeout(() => _ok.focus(), 10);
+                  });
+                  if (!_confirmed) return;
+                }
+              } catch (_chk_e) { /* fail-open — proceed with assign even if check fails */ }
               try {
                 const _r = await fetch(`/api/northstar/${encodeURIComponent(_sessBtnProj)}/north-stars/${encodeURIComponent(ns.id)}`,
                   {method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({assigned_session:s.name})});

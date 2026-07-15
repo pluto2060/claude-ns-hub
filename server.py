@@ -3871,6 +3871,11 @@ _EXEC_ATTACH_STALE_SECS = 900  # 15min — well past any real interactive termin
 # this alongside list-clients so both viewer paths block wake injection.
 _tmux_output_viewers: dict[str, float] = {}  # session_name → last_poll_time
 _TMUX_OUTPUT_VIEWER_TTL = 30.0  # seconds of inactivity before no longer "watching"
+# M1836-v2: per-session ring buffer that survives ESC[3J scrollback wipe.
+# On each poll, new lines are appended; the buffer is served as the terminal output.
+_pane_ring_buf: dict[str, list] = {}   # session_name → list of lines (capped at _PANE_BUF_MAX)
+_pane_ring_prev: dict[str, str] = {}   # session_name → last raw capture (for diff)
+_PANE_BUF_MAX = 2000                   # max lines retained per session
 
 
 def _kill_session(proj_id: str) -> None:
@@ -6737,6 +6742,44 @@ async def update_north_star(proj_id: str, ns_id: str, request: Request):
             _save_project(proj_id, proj)
             _server_log_action(proj_id, ns_id, "exec:assign_sess_renamed", f"{_new_assigned}→{_asn_new}")
             _new_assigned = _asn_new
+        # M1838: clear stale claims on this substar's queued stones when session changes.
+        # A stale claim from the OLD session blocks the NEW session from picking up stones
+        # until claim TTL (120s) expires. Since the user explicitly reassigned the substar,
+        # claims from any session other than _new_assigned are now dead weight — clear them.
+        try:
+            _now_clr = time.time()
+            _clr_conn = sqlite3.connect(str(_NS_EVENTS_DB))
+            _clr_rows = _clr_conn.execute(
+                "SELECT stone_id, data_json FROM milestones_store "
+                "WHERE proj_id=? AND status='queued' AND done=0",
+                (proj_id,)
+            ).fetchall()
+            _clr_count = 0
+            for _sid_clr, _dj_clr in _clr_rows:
+                try:
+                    _m_clr = json.loads(_dj_clr)
+                except Exception:
+                    continue
+                if (_m_clr.get("substar_id") or "") != ns_id:
+                    continue
+                _cb_clr = (_m_clr.get("claimed_by_session") or "").strip()
+                _ca_clr = _m_clr.get("claimed_at") or 0
+                # Only clear if claimed by a DIFFERENT session and still within TTL
+                if _cb_clr and _cb_clr != _new_assigned and (_now_clr - _ca_clr) < _CLAIM_TTL_SECS:
+                    _m_clr["claimed_by_session"] = None
+                    _m_clr["claimed_at"] = None
+                    _clr_conn.execute(
+                        "UPDATE milestones_store SET data_json=? WHERE proj_id=? AND stone_id=?",
+                        (json.dumps(_m_clr, ensure_ascii=False), proj_id, _sid_clr)
+                    )
+                    _clr_count += 1
+            _clr_conn.commit()
+            _clr_conn.close()
+            if _clr_count:
+                _server_log_action(proj_id, ns_id, "exec:assign_claim_cleared",
+                                   f"cleared {_clr_count} stale claim(s) for {_new_assigned}")
+        except Exception as _clr_e:
+            pass  # fail-open — don't abort the assign for a claim-clear error
         try:
             _chk = subprocess.run(["tmux", "has-session", "-t", f"={_new_assigned}"],
                                    capture_output=True, timeout=2)
@@ -9386,50 +9429,53 @@ async def get_tmux_output(proj_id: str, lines: int = 20, tmux_session: str = "")
     # blocked wakes when the user wasn't at the terminal.
     if tmux_session.strip():
         _tmux_output_viewers[session_name] = time.time()
-    # Capture pane output
+    # Capture pane output — always request 500 lines from tmux scrollback
     result = await asyncio.to_thread(
         subprocess.run,
-        ["tmux", "capture-pane", "-p", "-t", session_name, "-S", f"-{lines}"],
-        capture_output=True, text=True,timeout=2
+        ["tmux", "capture-pane", "-p", "-t", session_name, "-S", "-500"],
+        capture_output=True, text=True, timeout=2
     )
-    output = result.stdout.strip()
-    # M1836: when ESC[3J (Claude Code startup) wiped scrollback (history_size=0) and the
-    # captured pane is short (≤ pane_height lines ≈ idle state), prepend recent
-    # completion-log entries as a "prior work" header so the user can see what this session
-    # last accomplished without needing to reopen a transcript.
-    # Only inject when tmux_session is explicit (user has the LIVE SESSION panel open)
-    # and the pane command is a shell (Claude is at-prompt, not actively processing).
+    raw_capture = result.stdout.rstrip("\n")
+    # M1836-v2: maintain a server-side ring buffer that survives ESC[3J scrollback wipes.
+    # Strategy: diff the current capture against the previous one.
+    # • Normal append: current capture ends with the same lines as previous → new suffix is appended.
+    # • ESC[3J wipe: current capture is short and doesn't match prev tail → treat entire capture
+    #   as new content (Claude restarted; the new session context starts here).
     if tmux_session.strip():
-        try:
-            _hist_r = await asyncio.to_thread(
-                subprocess.run,
-                ["tmux", "display-message", "-t", session_name, "-p", "#{history_size}:#{pane_current_command}"],
-                capture_output=True, text=True, timeout=2
-            )
-            _hist_parts = (_hist_r.stdout.strip() or "0:bash").split(":", 1)
-            _hist_size = int(_hist_parts[0]) if _hist_parts[0].isdigit() else 0
-            _pane_cmd = _hist_parts[1] if len(_hist_parts) > 1 else "bash"
-            # M1836: "at prompt" = shell idle OR claude CLI at-prompt (both show no active work)
-            _at_prompt = _pane_cmd in _SHELLS or _pane_cmd == "claude"
-            if _at_prompt and _hist_size == 0:
-                # Session is idle at shell prompt with no scrollback — inject completion-log
-                _clog = PROJECTS_DIR / proj_id / "completion-log.jsonl"
-                if _clog.exists():
-                    _entries = []
-                    for _line in _clog.read_text().splitlines()[-8:]:
-                        try:
-                            _e = json.loads(_line)
-                            _ts = _e.get("timestamp", "")[:16].replace("T", " ")
-                            _mid = _e.get("milestone_id", "?")
-                            _ev = (_e.get("evidence") or "")[:120]
-                            _entries.append(f"[{_ts}] {_mid}: {_ev}")
-                        except Exception:
-                            pass
-                    if _entries:
-                        _header = "── recent completions (scrollback cleared by ESC[3J) ──\n" + "\n".join(_entries) + "\n──────────────────────────────────────────────────────\n"
-                        output = _header + output
-        except Exception:
-            pass
+        prev_lines = _pane_ring_prev.get(session_name)  # None = first poll; [] = known-empty
+        buf        = _pane_ring_buf.get(session_name, [])
+        cur_lines  = [l.rstrip() for l in raw_capture.splitlines()] if raw_capture else []
+        if prev_lines is None:
+            # First poll — seed buffer with current content
+            buf = cur_lines[:]
+        elif cur_lines == prev_lines:
+            pass  # Identical content — nothing to append
+        else:
+            # Find the longest suffix of buf that matches a prefix of cur_lines.
+            # This covers the typical "new lines appended" case.
+            overlap = 0
+            max_look = min(len(buf), len(cur_lines))
+            for look in range(max_look, 0, -1):
+                if buf[-look:] == cur_lines[:look]:
+                    overlap = look
+                    break
+            new_lines = cur_lines[overlap:]
+            if new_lines:
+                buf.extend(new_lines)
+                if len(buf) > _PANE_BUF_MAX:
+                    buf = buf[-_PANE_BUF_MAX:]
+            elif not overlap and cur_lines:
+                # No overlap at all — content completely replaced (ESC[3J or new session).
+                # Extend with the full current pane content; duplicates accepted since user
+                # wants full history, and truly identical lines are rare in active sessions.
+                buf.extend(cur_lines)
+                if len(buf) > _PANE_BUF_MAX:
+                    buf = buf[-_PANE_BUF_MAX:]
+        _pane_ring_buf[session_name] = buf
+        _pane_ring_prev[session_name] = cur_lines  # store stripped list, not raw string
+        output = "\n".join(buf)
+    else:
+        output = raw_capture
     return JSONResponse({"ok": True, "running": True, "session": session_name, "output": output})
 
 
@@ -12074,6 +12120,8 @@ async def kill_named_tmux_session(proj_id: str, session_name: str):
         killed.append(session_name)
     _exec_idle_count.pop(session_name, None)
     _exec_was_running.pop(session_name, None)
+    _pane_ring_buf.pop(session_name, None)   # M1836-v2: clear ring buffer so new session starts fresh
+    _pane_ring_prev.pop(session_name, None)
 
     # Clear assigned_session on any substar that pointed at the killed session.
     try:
