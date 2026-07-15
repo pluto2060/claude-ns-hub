@@ -4079,6 +4079,32 @@ async def _ensure_litellm_proxy():
 
 
 @app.on_event("startup")
+async def _start_bg_tmux_poller():
+    """M1826-v2: Background tmux state refresher — pre-fetches list-sessions + list-panes every 3s
+    so the /api/exec-sessions handler reads from memory (0 subprocess cost) instead of forking tmux
+    at request time (was 30-300ms under load)."""
+    async def _poll():
+        while True:
+            try:
+                async def _run(*cmd):
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
+                    return stdout.decode("utf-8", errors="replace") if stdout else ""
+                ls, lp = await asyncio.gather(
+                    _run("tmux", "list-sessions", "-F", "#{session_name}:#{session_created}:#{session_windows}"),
+                    _run("tmux", "list-panes", "-a", "-F", "#{session_name} #{pane_current_command}"),
+                )
+                _bg_tmux_state["ls"] = ls
+                _bg_tmux_state["lp"] = lp
+                _bg_tmux_state["ts"] = time.monotonic()
+            except Exception:
+                pass
+            await asyncio.sleep(_BG_TMUX_INTERVAL)
+    asyncio.ensure_future(_poll())
+
+
+@app.on_event("startup")
 async def _start_milestone_watcher():
     """Background poller (every 5 min): auto-ack pending milestones + promote answered clarifications + completion-log sync."""
     async def _watch():
@@ -6814,6 +6840,36 @@ async def update_north_star(proj_id: str, ns_id: str, request: Request):
                 _sp_last = _last_worked_session_for_substar(proj_id, ns_id, _sp_active_ms)
                 if _sp_last and _sp_last[0] == _new_assigned and _sp_last[1]:
                     _sp_resume_args = ["--resume", _sp_last[1]]
+                    # M1796-assign: align session name suffix with resume transcript UUID so
+                    # tmux session name and live_session_id are consistent (same as /execute path).
+                    # _sp_last[1] is the full UUID string; take first 8 hex chars after stripping dashes.
+                    _sp_resume_suffix = _sp_last[1].replace("-", "")[:8]
+                    _sp_aligned_name = f"claude-exec-{proj_id}-{_sp_resume_suffix}"
+                    if _sp_aligned_name != _new_assigned:
+                        _old_pf = PROJECTS_DIR / proj_id / f"pending-execute-prompt-{_new_assigned[-12:]}.txt"
+                        try:
+                            _old_pf.unlink(missing_ok=True)  # remove stale file written under old name
+                        except Exception:
+                            pass
+                        _new_assigned = _sp_aligned_name
+                        ns["assigned_session"] = _new_assigned
+                        proj["north_stars"] = ns_list
+                        _save_project(proj_id, proj)
+                        _server_log_action(proj_id, ns_id, "exec:assign_sess_aligned",
+                                           f"suffix aligned to resume sid → {_new_assigned}")
+                        # NS_SESSION_KEY was built with the pre-alignment name — patch it now
+                        _sp_env = [
+                            e if not e.startswith(f"NS_SESSION_KEY=") else f"NS_SESSION_KEY={_new_assigned}"
+                            for e in _sp_env
+                        ]
+                        # re-write spawn-prompt file with corrected name
+                        _pf = PROJECTS_DIR / proj_id / f"pending-execute-prompt-{_new_assigned[-12:]}.txt"
+                        _pf.write_text(
+                            _load_stone_memory(proj_id)
+                            + f"[EXECUTE SYNC] Project {proj_id} — Session '{_new_assigned}' just assigned.\n"
+                            f"Call get_pending_task() to find your assigned stones.",
+                            encoding="utf-8",
+                        )
                 else:
                     # M1656-fork: inherit mother conversation context via fork (fallback --continue)
                     _sp_resume_args = _mother_fork_args(proj_id, _spawn_cwd)
@@ -12122,6 +12178,7 @@ async def kill_named_tmux_session(proj_id: str, session_name: str):
     _exec_was_running.pop(session_name, None)
     _pane_ring_buf.pop(session_name, None)   # M1836-v2: clear ring buffer so new session starts fresh
     _pane_ring_prev.pop(session_name, None)
+    _live_sid_cache.pop(session_name, None)  # M1826-v2: clear cached live_session_id on kill
 
     # Clear assigned_session on any substar that pointed at the killed session.
     try:
@@ -12663,7 +12720,14 @@ def _push_session_idle(session_name: str, proj_id: str) -> bool:
 
 
 _exec_sessions_cache: dict = {"ts": 0.0, "data": None}
-_EXEC_SESSIONS_TTL = 2.0  # M1493: 2s cache — UI polls every 2-3s, saves 500ms fork cost per poll
+_EXEC_SESSIONS_TTL = 5.0  # M1826-v2: 5s cache — UI polls every 8s; 2s was always-cold vs 8s browser poll
+# M1826-v2: background-refreshed tmux state — avoids 30ms subprocess fork at request time.
+# Updated every 3s by _bg_tmux_poller; handler reads synchronously (zero subprocess cost).
+_bg_tmux_state: dict = {"ls": "", "lp": "", "ts": 0.0}
+_BG_TMUX_INTERVAL = 3.0  # seconds between background list-sessions + list-panes refreshes
+# M1826-v2: permanent per-session live_session_id cache — immutable once resolved, avoids
+# repeated 40ms transcript-dir scans (the dominant cold-path bottleneck).
+_live_sid_cache: dict[str, str] = {}  # session_name → live_session_id
 
 @app.get("/api/exec-sessions")
 async def get_exec_sessions():
@@ -12674,26 +12738,27 @@ async def get_exec_sessions():
         return JSONResponse(_exec_sessions_cache["data"])
 
     _t_start = time.perf_counter()
-    # M1234-C: async subprocess — avoids blocking the event loop every 5s poll
-    # M1234-C2: parallel gather — all sessions processed concurrently (~9×speedup)
-    async def _run(*cmd):
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
-        return stdout.decode("utf-8", errors="replace") if stdout else ""
 
-    # M1826: batch tmux queries — single list-sessions + single list-panes -a
-    # replaces N per-session list-panes subprocesses (was O(N) fork cost on cold path).
-    try:
-        _ls_out, _lp_out = await asyncio.gather(
-            _run("tmux", "list-sessions", "-F", "#{session_name}:#{session_created}:#{session_windows}"),
-            _run("tmux", "list-panes", "-a", "-F", "#{session_name} #{pane_current_command}"),
-        )
-    except Exception:
-        _ls_out = _lp_out = ""
+    # M1826-v2: use background-refreshed tmux state (updated every 3s by _start_bg_tmux_poller).
+    # Falls back to on-demand subprocess if background state is stale (>10s, e.g. startup).
+    _bg_age = time.monotonic() - _bg_tmux_state.get("ts", 0.0)
+    if _bg_age < 10.0 and _bg_tmux_state.get("ls"):
+        _ls_out = _bg_tmux_state["ls"]
+        _lp_out = _bg_tmux_state["lp"]
+    else:
+        # Background poller not yet ready or stale — fall back to on-demand subprocess
+        try:
+            async def _run(*cmd):
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
+                return stdout.decode("utf-8", errors="replace") if stdout else ""
+            _ls_out, _lp_out = await asyncio.gather(
+                _run("tmux", "list-sessions", "-F", "#{session_name}:#{session_created}:#{session_windows}"),
+                _run("tmux", "list-panes", "-a", "-F", "#{session_name} #{pane_current_command}"),
+            )
+        except Exception:
+            _ls_out = _lp_out = ""
 
     # Build session → pane-commands map from the single batch call
     _batch_pane_cmds: dict[str, list[str]] = {}
@@ -12713,6 +12778,52 @@ async def get_exec_sessions():
             continue
         created_ts = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
         _session_lines.append((session_name, agent, proj_id, created_ts))
+
+    # M1826-v2: batch SQLite project_meta query — single query for all unique proj_ids,
+    # replaces N concurrent sqlite3.connect() calls (was ~11ms for 12 sessions).
+    _unique_proj_ids = list({pid for _, _, pid, _ in _session_lines})
+    _batch_model: dict[str, str] = {}
+    if _unique_proj_ids:
+        try:
+            def _batch_meta_query():
+                _bc = sqlite3.connect(str(_NS_EVENTS_DB))
+                _ph = ",".join("?" * len(_unique_proj_ids))
+                _rows = _bc.execute(
+                    f"SELECT proj_id, meta_json FROM project_meta WHERE proj_id IN ({_ph})",
+                    _unique_proj_ids
+                ).fetchall()
+                _bc.close()
+                return _rows
+            _meta_rows = await asyncio.to_thread(_batch_meta_query)
+            for _mpid, _mjson in _meta_rows:
+                try:
+                    _mm = json.loads(_mjson)
+                    _mv = (_mm.get("model") or "").strip()
+                    if _mv in _ALLOWED_MODELS:
+                        _batch_model[_mpid] = _mv
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # M1826-v3: batch-prefetch spawn-info — one file read per unique proj_id before gather,
+    # replaces N concurrent _read_spawn_info() calls (was 12 file reads for 12 sessions).
+    _batch_spawn_info: dict[str, dict] = {}  # proj_id → {session_name → spawn_info_dict}
+    _unique_proj_ids_si = list({pid for _, _, pid, _ in _session_lines})
+    def _prefetch_spawn_info():
+        result: dict[str, dict] = {}
+        for _pid in _unique_proj_ids_si:
+            try:
+                _f = PROJECTS_DIR / _pid / ".spawn-info-by-session.json"
+                if _f.exists():
+                    result[_pid] = json.loads(_f.read_text())
+            except Exception:
+                pass
+        return result
+    try:
+        _batch_spawn_info = await asyncio.to_thread(_prefetch_spawn_info)
+    except Exception:
+        pass
 
     # M1234-C2: process each session concurrently via asyncio.gather
     async def _process_session(session_name, agent, proj_id, created_ts):
@@ -12799,28 +12910,22 @@ async def get_exec_sessions():
         spawn_mode = None
         spawn_from = None
         spawn_model = ""
-        # M1656-R9: session-scoped lookup — exact key match, no epoch-proximity guessing.
-        # The old single-file-per-project design meant only whichever session spawned
-        # LAST (within a 120s guess window) ever showed real data; every sibling
-        # session (mother vs children) displayed "— unknown" regardless of reality.
-        si = _read_spawn_info(proj_id, session_name)
+        # M1826-v3: use pre-fetched batch spawn-info (avoids per-session file read).
+        # Falls back to _read_spawn_info() only if prefetch missed this proj_id.
+        _si_all = _batch_spawn_info.get(proj_id)
+        if _si_all is not None:
+            _ag2, _pid2 = _parse_exec_session_name(session_name)
+            _is_main2 = bool(_pid2) and session_name == f"{_ag2}-exec-{_pid2}"
+            si = _si_all.get(session_name) or (_si_all.get("_main") if _is_main2 else {}) or {}
+        else:
+            si = _read_spawn_info(proj_id, session_name)
         if si:
             spawn_mode = si.get("mode")
             spawn_from = si.get("from_id") or None
             spawn_model = si.get("model") or ""
         if not spawn_model:
-            try:
-                # M1493: lightweight model-only query — skip full _db_load_project (loads all milestones)
-                _mconn = sqlite3.connect(str(_NS_EVENTS_DB))
-                _mrow = _mconn.execute("SELECT meta_json FROM project_meta WHERE proj_id=?", (proj_id,)).fetchone()
-                _mconn.close()
-                if _mrow:
-                    _mmeta = json.loads(_mrow[0])
-                    spawn_model = (_mmeta.get("model") or "").strip()
-                    if spawn_model not in _ALLOWED_MODELS:
-                        spawn_model = ""
-            except Exception:
-                pass
+            # M1826-v2: use pre-fetched batch model lookup (single SQLite query for all sessions)
+            spawn_model = _batch_model.get(proj_id, "")
         if not spawn_model:
             try:
                 # M1493: cache settings.json model at module level to avoid per-session file reads
@@ -12865,8 +12970,10 @@ async def get_exec_sessions():
         # before this fix / where the diff was ambiguous — it is known to mis-attribute a
         # SIBLING session's transcript when multiple exec sessions share one project
         # directory and write concurrently (root cause of the mother/child pane mismatch).
-        _live_session_id = (si or {}).get("live_session_id", "")
-        if not _live_session_id:
+        _live_session_id = (si or {}).get("live_session_id", "") or _live_sid_cache.get(session_name, "")
+        # M1826-v2: skip transcript scan if sentinel ("") already set (previously scanned, no match found)
+        _skip_scan = session_name in _live_sid_cache
+        if not _live_session_id and not _skip_scan:
             try:
                 _base = Path.home() / ".claude" / "projects"
                 # M1766: prefer exact encoding via _get_project_dir to avoid picking up
@@ -12897,7 +13004,8 @@ async def get_exec_sessions():
                     else:
                         _from_stem = _si_from.split("-")[0] if _si_from else ""
                         try:
-                            _si_all_fb = json.loads((PROJECTS_DIR / proj_id / ".spawn-info-by-session.json").read_text())
+                            # M1826-v3: reuse prefetched spawn-info batch (avoids second file read)
+                            _si_all_fb = _batch_spawn_info.get(proj_id) or json.loads((PROJECTS_DIR / proj_id / ".spawn-info-by-session.json").read_text())
                             _claimed = {v.get("live_session_id","")[:8] for v in _si_all_fb.values() if v.get("live_session_id")}
                         except Exception:
                             _claimed = set()
@@ -12915,6 +13023,12 @@ async def get_exec_sessions():
                             _live_session_id = max(_new_files, key=lambda f: f.stat().st_mtime).stem
             except Exception:
                 pass
+        # M1826-v2: cache resolved live_session_id permanently — immutable once known,
+        # avoids repeated transcript-dir glob+stat scans (dominant cold-path bottleneck).
+        # Also cache empty string ("") to skip future scans for sessions that had no
+        # matching .jsonl yet — sentinel prevents redundant re-scans every cold poll.
+        if session_name not in _live_sid_cache or _live_session_id:
+            _live_sid_cache[session_name] = _live_session_id  # "" = already scanned, nothing found
 
         # M1754-revert: spawn_model is user intent (what was requested at dispatch time).
         # Transcript model cannot be trusted for openrouter sessions — OpenRouter returns
