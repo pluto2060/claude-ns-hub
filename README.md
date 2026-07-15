@@ -6,28 +6,34 @@
 [![Python](https://img.shields.io/pypi/pyversions/claude-ns-hub)](https://pypi.org/project/claude-ns-hub/)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-**You lose ideas every day.**
+**Drop a task. Walk away. Come back to results.**
 
-Note apps, memo pads, anything that requires you to sit at a computer — none of them keep up with your brain.
+`pip install claude-ns-hub` — 60-second install, zero config files, AGPL open source.
 
-> _"Why even geniuses lose their ideas"_ — the answer is here.
+> I built this because I kept babysitting Claude Code sessions — checking every 10 minutes whether they'd finished. NS Hub fixes that: drop a Stone, go make coffee, get a push notification when Claude's done. I've been using it daily for 6 months.
 
-![NS Hub — Second Brain for Claude Code users](https://raw.githubusercontent.com/pluto2060/claude-ns-hub/master/assets/ns-hub-banner-v9.png)
+![NS Hub demo — Stone queue to autonomous execution](https://raw.githubusercontent.com/pluto2060/claude-ns-hub/master/assets/ns-hub-banner-v9.png)
 
 ---
 
-## NS Hub is your Second Brain × AI execution layer
+## What it does
 
-Idea surfaces → **captured as a Stone** → Claude runs it autonomously → check results from your phone.
+NS Hub is a **local Claude Code session orchestrator** with a Stone queue and multi-session dispatch.
 
-No laptop required. No memo needed. No context lost.
+Instead of babysitting one Claude session, you drop tasks ("Stones") into a local SQLite queue. NS Hub dispatches them to idle Claude sessions automatically — or spins up child sessions in parallel. You monitor everything from your phone and get a push notification when work is done.
+
+**Architecture choices:**
+- **SQLite** (not a cloud service) — your data stays local, no vendor lock-in, works offline
+- **tmux + pexpect for PTY control** — NS Hub injects input and reads Claude's output without a custom API wrapper
+- **Mother/child session dispatch** — a mother session manages the queue; children are forked with truncated context (transcript sliced at the exact point before the forked task was claimed, so child sessions start clean)
+- **180+ skills/agents** indexed locally for inline search across your corpus
 
 | Without NS Hub | With NS Hub |
 |---|---|
-| Idea appears → forgotten before you act | Instant Stone creation → Claude picks it up from the queue |
-| Claude runs blind — you have no visibility | Live session monitoring from your phone |
-| Must open laptop to check context | Resume any session with ↻ from anywhere |
-| Notes pile up, context evaporates | Stone persistence — ideas never disappear |
+| Babysit one session, check every 10 min | Drop Stones, walk away, get notified |
+| Claude runs blind — no visibility | Live session monitoring from your phone |
+| Must open laptop to check progress | Mobile terminal — type directly from phone |
+| Ideas lost before you open a laptop | Stone persistence — local SQLite, never lost |
 
 ---
 
@@ -259,7 +265,15 @@ curl http://localhost:9001/api/metrics?proj_id=MOAT
 
 ---
 
-**pip install claude-ns-hub** — stop losing your ideas.
+**pip install claude-ns-hub** — stop babysitting Claude sessions.
+
+---
+
+## Current limitations (honest)
+
+- **Linux/WSL2 only** — macOS support is on the roadmap; Windows-native is not planned
+- **Requires tmux** in your PATH
+- **Web UI** is functional but unpolished — PRs welcome
 
 ---
 
