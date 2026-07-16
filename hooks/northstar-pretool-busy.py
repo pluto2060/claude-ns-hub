@@ -1,1 +1,0 @@
-../static/hooks/northstar-pretool-busy.py

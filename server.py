@@ -856,6 +856,16 @@ def _agent_busy_load_from_db():
             data2 = json.loads(row2[0])
             if isinstance(data2, dict):
                 _agent_busy_sessions.update(data2)
+        # M1844: tool_start records whose process died during hub restart must not persist.
+        # Stop hook POST can silently fail in the restart race window → stale busy until 3600s TTL.
+        _dirty = False
+        for _sk, _sv in list(_agent_busy_sessions.items()):
+            if isinstance(_sv, dict) and _sv.get("reason") == "tool_start" and _sv.get("busy"):
+                _agent_busy_sessions[_sk] = dict(_sv, busy=False, reason="agent_stopped",
+                                                  note="reset_on_startup_stale_tool_start")
+                _dirty = True
+        if _dirty:
+            _agent_busy_persist()
     except Exception:
         pass
 
@@ -3874,7 +3884,8 @@ _TMUX_OUTPUT_VIEWER_TTL = 30.0  # seconds of inactivity before no longer "watchi
 # M1836-v2: per-session ring buffer that survives ESC[3J scrollback wipe.
 # On each poll, new lines are appended; the buffer is served as the terminal output.
 _pane_ring_buf: dict[str, list] = {}   # session_name → list of lines (capped at _PANE_BUF_MAX)
-_pane_ring_prev: dict[str, str] = {}   # session_name → last raw capture (for diff)
+_pane_ring_prev: dict[str, list] = {}  # session_name → last stripped line list (for diff)
+_pane_ring_lock: dict[str, asyncio.Lock] = {}  # per-session lock (prevents concurrent extend)
 _PANE_BUF_MAX = 2000                   # max lines retained per session
 
 
@@ -4218,8 +4229,8 @@ async def _start_milestone_watcher():
                                     f"{', '.join(pending_reply_ids[:5])}.\n\n"
                                     f"PROTOCOL (docs/ns-comment-reply-protocol.md):\n"
                                     f"  1. Reply ONLY to stones whose last conversation entry has role=user\n"
-                                    f"  2. Reply length ≤ 3 lines. No code blocks, no preamble\n"
-                                    f"  3. If details > 3 lines needed: write docs/ns-replies/<DATE>-<MID>.md\n"
+                                    f"  2. Reply: STRUCTURED (bullets `-`, numbered `1.`, table `|`) → no line limit. Prose → ≤3 lines.\n"
+                                    f"  3. If prose overflow: write docs/ns-replies/<DATE>-<MID>.md\n"
                                     f"     and reference the path in the reply\n"
                                     f"  4. Do NOT add arbitrary claude_comment / append_message to other stones\n"
                                     f"  5. Replying does NOT change the stone's status\n"
@@ -4230,7 +4241,7 @@ async def _start_milestone_watcher():
                                     f"     Korean stone → Korean reply. English stone → English reply.\n\n"
                                     f"ACTION: GET http://127.0.0.1:{PORT}/api/northstar/{proj_id}/milestones,\n"
                                     f"  for each stone above, read its last user message, then\n"
-                                    f"  PATCH milestones/<MID> with append_message {{role:'claude', text:'<≤3 lines>'}}.\n"
+                                    f"  PATCH milestones/<MID> with append_message {{role:'claude', text:'<structured: no limit | prose: ≤3 lines>'}}.\n"
                                     f"Mandatory — do it now before any other work."
                                 ),
                             }, ensure_ascii=False)
@@ -4618,7 +4629,9 @@ def _session_claimable_queued_count(proj_id: str, session_name: str) -> int:
                 continue  # in-flight on another session
             sid = (m.get("substar_id") or "").strip()
             owner = sub_sess.get(sid, "") if sid else ""
-            if owner == session_name or not owner:
+            # M1860: free-pool removed — unassigned substar stones are NOT claimable.
+            # Only count stones whose substar is explicitly assigned to this session.
+            if owner == session_name:
                 n += 1
         return n
     except Exception:
@@ -5146,7 +5159,7 @@ def _get_agent_spawn_cmd(proj_id: str) -> list:
                         cfg_claude = str(_bin); break
                 if cfg_claude: break
     claude_bin = cfg_claude or "claude"
-    return [claude_bin, "--dangerously-skip-permissions", *_DISALLOWED_TOOLS_ARGS, *_get_project_model(proj_id)]
+    return [claude_bin, "--dangerously-skip-permissions", "--think", *_DISALLOWED_TOOLS_ARGS, *_get_project_model(proj_id)]
 
 
 def _get_pty_spawn_cmd(proj_id: str, agent: str | None = None) -> list:
@@ -5167,7 +5180,7 @@ def _get_pty_spawn_cmd(proj_id: str, agent: str | None = None) -> list:
         return ["codex", "--dangerously-bypass-approvals-and-sandbox"]
     # openrouter = Claude Code CLI + LiteLLM/OpenRouter env (handled by _get_project_spawn_env)
     claude_bin = _shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude")
-    return [claude_bin, "--dangerously-skip-permissions", *_DISALLOWED_TOOLS_ARGS, *_get_project_model(proj_id)]
+    return [claude_bin, "--dangerously-skip-permissions", "--think", *_DISALLOWED_TOOLS_ARGS, *_get_project_model(proj_id)]
 
 
 def _get_project_spawn_env(proj_id: str, override_model: str = None) -> dict:
@@ -5243,6 +5256,14 @@ def _write_mcp_config(proj_id: str, session_name: str) -> str | None:
         return None
 
 
+# M1854-B: single source of truth for comment line-limit rule.
+# All inject paths reference this constant — change here propagates everywhere.
+_COMMENT_RULE_TEXT = (
+    "STRUCTURED (bullets `-`, numbered `1.`, table `|`): no line limit. "
+    "Unstructured prose: ≤3 lines. "
+    "Prose overflow → docs/ns-replies/<DATE>-<MID>.md (M1860)"
+)
+
 _HUB_EXEC_SYS_PROMPT = (
     "get_pending_task response has 3 layers: "
     "(1) task = EXECUTE THIS — last user comment if present, else original stone text. "
@@ -5271,7 +5292,8 @@ _HUB_EXEC_SYS_PROMPT = (
     "When spawning subagents (Agent tool), ALWAYS include in the subagent prompt: "
     "'evidence upload: ONLY use mcp__ns-hub__upload_evidence or rclone Bash — "
     "NEVER mcp__claude_ai_Google_Drive__create_file'. "
-    "Subagents do NOT inherit the exec-session tool block."
+    "Subagents do NOT inherit the exec-session tool block. "
+    f"COMMENT RULE (M478/M1860/M1854-C): append_message {{role:'claude'}}: {_COMMENT_RULE_TEXT}"
 )
 
 
@@ -5391,14 +5413,10 @@ def _send_exec_wake(session_name: str, proj_id: str | None = None, force_dedup_r
         return False  # booting — readiness thread / next poller pass will wake
     if not _tmux_session_alive(session_name):
         return False
-    # M1763: also block if user is watching via the /tmux-output HTTP poll endpoint
-    # (capture-pane doesn't register a tmux client, so list-clients alone misses this).
-    # M1765: _force_viewer_bypass=True skips this gate for explicit user-triggered dispatch
-    # (execute button path) — user just submitted a stone, they want it to start now.
-    if not _force_viewer_bypass:
-        _last_poll = _tmux_output_viewers.get(session_name, 0.0)
-        if (now - _last_poll) < _TMUX_OUTPUT_VIEWER_TTL:
-            return False  # M1763: user is viewing via HTTP poll — never auto-inject
+    # M1882: HTTP poll viewer (_tmux_output_viewers / M1763) gate removed.
+    # live session overlay open = HTTP poll only, no tmux client attached —
+    # wake must still fire (user intent: assign/queue while watching the pane).
+    # Only real tmux attach (list-clients) blocks wake — that's the correct boundary.
     try:
         _cl = subprocess.run(["tmux", "list-clients", "-t", f"={session_name}"],
                              capture_output=True, text=True, timeout=2)
@@ -6642,10 +6660,29 @@ async def get_last_worked_session(proj_id: str, ns_id: str):
     _active = _db_get_active_milestones(proj_id) or []
     _last = _last_worked_session_for_substar(proj_id, ns_id, _active)
     if not _last:
+        # M1879 fallback: UUID-suffix guard filtered out all candidates (legacy pre-M1796 sessions).
+        # Do a display-only scan that accepts ANY claimed_by_session — returns is_resumable=False
+        # so the UI can still show a "prior work" badge without misleading the user about resumability.
+        _any_cb: str | None = None
+        _any_at: float = 0.0
+        for _m in _active:
+            if not isinstance(_m, dict) or (_m.get("substar_id") or "") != ns_id:
+                continue
+            _cb = (_m.get("claimed_by_session") or "").strip()
+            if not _cb:
+                continue
+            _at = _m.get("claimed_at") or 0
+            if _at > _any_at:
+                _any_at = _at
+                _any_cb = _cb
+        if _any_cb:
+            return JSONResponse({"ok": True, "session_name": _any_cb,
+                                 "resumable_sid": None, "is_live": False,
+                                 "is_resumable": False})
         return JSONResponse({"ok": True, "session_name": None})
     _name, _sid = _last
     return JSONResponse({"ok": True, "session_name": _name, "resumable_sid": _sid or None,
-                         "is_live": _tmux_session_alive(_name)})
+                         "is_live": _tmux_session_alive(_name), "is_resumable": True})
 
 
 @app.post("/api/northstar/{proj_id}/north-stars")
@@ -6756,7 +6793,7 @@ async def update_north_star(proj_id: str, ns_id: str, request: Request):
     # M1656-①: Assign button → auto-spawn if session is dead so M1095 poller doesn't wipe it
     _new_assigned = (ns.get("assigned_session") or "").strip()
     if _new_assigned and _new_assigned != _old_assigned:
-        # M1809-assign: same UUID-suffix guard as branch-spawn — legacy names (no 8-char suffix)
+        # M1809-assign: same UUID-suffix guard as assigned-respawn path — legacy names (no 8-char suffix)
         # get a fresh UUID-suffixed name here too, so assign-button spawns never create bare
         # 'claude-exec-{proj_id}' sessions that break _parse_exec_session_name (M1770 re-risk).
         import uuid as _uuid_asn, re as _re_asn
@@ -6901,7 +6938,7 @@ async def update_north_star(proj_id: str, ns_id: str, request: Request):
                     except Exception:
                         _sp_pre_files = set()
                     _sp_marker = _write_spawn_marker(_sp_tdir, _new_assigned)
-                _sp_cmd = (["claude", "--dangerously-skip-permissions"] + _DISALLOWED_TOOLS_ARGS
+                _sp_cmd = (["claude", "--dangerously-skip-permissions", "--think"] + _DISALLOWED_TOOLS_ARGS
                            + _hub_mcp_spawn_args(proj_id, _new_assigned, agent=_sp_agent)
                            + _sp_resume_args + _get_project_model(proj_id, override_model=_sp_override_model))
                 subprocess.Popen(["tmux", "new-session", "-d", "-s", _new_assigned, "-c", _spawn_cwd]
@@ -7079,7 +7116,7 @@ async def generate_substar_agent(proj_id: str, ns_id: str, request: Request):
             f"2. **Clarity over cleverness** — prefer explicit, well-reasoned outputs over clever shortcuts.",
             f"3. **Evidence-anchored** — back recommendations with data, examples, or established frameworks.",
             f"4. **Iterative refinement** — surface ambiguities early; confirm scope before full execution.",
-            f"5. **Concise reporting** — completion messages are ≤3 lines, past tense, no preamble (1 line ideal; 3 lines hard cap).",
+            f"5. **Concise reporting** — completion messages: STRUCTURED (bullets/table/numbered) = no line limit; UNSTRUCTURED prose = ≤3 lines (1 line ideal). Past tense, no preamble.",
             f"",
             f"## NS Hub Completion Protocol",
             f"",
@@ -7091,7 +7128,7 @@ async def generate_substar_agent(proj_id: str, ns_id: str, request: Request):
             f'  "model_used": "<model-id>",',
             f'  "exec_start": "<ISO timestamp>",',
             f'  "exec_end": "<ISO timestamp>",',
-            f'  "append_message": {{"role": "claude", "text": "<≤3-line past-tense result>"}}',
+            f'  "append_message": {{"role": "claude", "text": "<structured: no limit | prose: ≤3 lines, past-tense result>"}}',
             f"}}",
             f"```",
         ]
@@ -7120,7 +7157,7 @@ async def generate_substar_agent(proj_id: str, ns_id: str, request: Request):
             f"## Execution Protocol",
             f"1. Read the full stone text before acting.",
             f"2. Implement the task completely.",
-            f"3. PATCH `status=pending_confirmation` with `append_message` (≤3 lines, past tense; 1 line ideal).",
+            f"3. PATCH `status=pending_confirmation` with `append_message` (STRUCTURED: no limit; prose: ≤3 lines, past tense; 1 line prose ideal).",
             f"4. Include `model_used`, `exec_start`, `exec_end` in the same PATCH.",
         ]
 
@@ -7288,20 +7325,16 @@ async def claim_task_for_session(proj_id: str, request: Request):
 
         stone = None
         if session_name:
-            # First: stones whose substar is assigned to this session
+            # M1860: only claim stones whose substar is explicitly assigned to this session.
+            # Free-pool (unassigned substar) stones are no longer claimable by any session —
+            # substar must be assigned before work begins.
             for m in candidates:
                 if _stone_session(m) == session_name:
                     stone = m
                     break
-            # Second: free-pool stones (no substar / unassigned substar)
-            if stone is None:
-                for m in candidates:
-                    if not _stone_session(m):
-                        stone = m
-                        break
-            # NOTE: stones assigned to OTHER sessions are never returned to this session
+            # NOTE: stones assigned to OTHER sessions, or to no session, are never returned.
         else:
-            # No session context — return first queued (original behaviour)
+            # No session context — return first queued (original behaviour, internal callers only)
             stone = candidates[0] if candidates else None
 
         if stone is None:
@@ -7836,8 +7869,10 @@ async def create_milestone(proj_id: str, request: Request, background_tasks: Bac
             if isinstance(_ns_cw, dict) and _ns_cw.get("id") == new_ms.get("substar_id"):
                 _assigned_cw = (_ns_cw.get("assigned_session") or "").strip()
                 break
-        # M1796: main session has UUID suffix — use live session name instead of hardcoded base name
-        _target_cw = _assigned_cw or _live_exec_session_name(proj_id) or ""
+        # M1860: only wake the explicitly assigned session — no fallback to any live session.
+        # Previously: _assigned_cw or _live_exec_session_name(proj_id) caused any alive session
+        # to be woken for unassigned substars, producing the free-pool multi-session race.
+        _target_cw = _assigned_cw
 
         def _stone_create_dispatch(_sn=_target_cw, _pid=proj_id, _mid=new_id):
             try:
@@ -8263,7 +8298,15 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                     # is generalized to _group_structural_units (tables + code fences + lists).
                     _STONE_COMPRESSION_ENABLED = False
                     _MAX_LINES = 6 if _STONE_COMPRESSION_ENABLED else 10**9  # M1664: restored 12→6 per user request
-                    _text = str(msg.get("text", ""))
+                    # M1849: Claude Code MCP sometimes emits literal \n (0x5c 0x6e) in tool
+                    # parameter strings instead of real newlines (0x0a). This happens when the
+                    # model writes "\n" as a JSON-style escape sequence in its generated text
+                    # rather than using an actual newline character. The MCP JSON-RPC layer
+                    # preserves the double-escaped form: "\\n" in JSON → "\n" (two chars) in
+                    # Python. Normalize these to real newlines before storage/compression so
+                    # the chatbox renderer (which converts \n→<br>) can break lines correctly.
+                    _text = str(msg.get("text", "")).replace('\\n', '\n')
+                    msg["text"] = _text  # M1849: persist normalization before further processing
                     # M1687: the entire line-count gate below is blind to LINE LENGTH — a single
                     # 1000-char sentence with zero \n counts as "1 line" and sails through
                     # untouched, rendering as an unreadable prose wall on mobile (user-reported,
@@ -8580,18 +8623,17 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                                 f"  \"{msg.get('text','')}\"{_skill_annotation}\n"
                                 f"⚠️  THIS IS A REPLY TASK, NOT A COMPLETION TASK.\n"
                                 f"  DO NOT re-implement the stone. DO NOT change status to pending_confirmation.\n"
-                                f"  Your ONLY job: read the comment and reply with ≤3 lines.\n"
+                                f"  Your ONLY job: read the comment and reply (STRUCTURED: no limit; prose: ≤3 lines).\n"
                                 f"(If the message is long or references context, call\n"
                                 f" GET /api/northstar/{proj_id}/milestones to read conversation[] first.)\n\n"
                                 f"PROTOCOL:\n"
                                 f"  1. Read the user comment above carefully.\n"
                                 f"  1b. M246: If [skill:/name] or [agent:name] annotated: invoke it, then reply with 1-line result.\n"
-                                f"  2. ANSWER the question OR acknowledge the instruction in ≤3 lines via PATCH "
-                                f"http://127.0.0.1:{PORT}/api/northstar/{proj_id}/milestones/{mid} "
-                                f"with body append_message {{role:'claude', text:'<≤3 lines>'}}.\n"
+                                f"  2. ANSWER via PATCH http://127.0.0.1:{PORT}/api/northstar/{proj_id}/milestones/{mid} "
+                                f"with body append_message {{role:'claude', text:'<STRUCTURED: no limit | prose: ≤3 lines>'}}.\n"
                                 f"  3. ONLY if user explicitly says 're-do', 'fix', 'redo', '다시', '수정해' → also re-implement.\n"
                                 f"  4. DO NOT change status — this reply does NOT advance the stone lifecycle.\n"
-                                f"  5. If reply needs more than 3 lines: write docs/ns-replies/<DATE>-{mid}.md and reference path.\n"
+                                f"  5. Prose overflow (>3 lines prose): write docs/ns-replies/<DATE>-{mid}.md and reference path.\n"
                                 f"  6. M270: No follow-up questions unless genuinely missing critical info.\n"
                                 f"  7. M1781: Do NOT post a 'working on this now / will update soon' progress-narration "
                                 f"reply — ns-comment-reply-protocol.md Rule 2/anti-patterns forbids it. If the work "
@@ -9129,15 +9171,9 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                     if _owner:
                         if _tmux_session_alive(_owner):
                             _send_exec_wake(_owner, proj_id, force_dedup_reset=_is_reopen)
-                        return
-                    # M1797: all sessions are peers — wake the first alive session for this project.
-                    ls = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"], capture_output=True, text=True, timeout=2)
-                    for sn in (ls.stdout or "").splitlines():
-                        sn = sn.strip()
-                        for prefix in ("claude-exec-", "openrouter-exec-", "codex-exec-", "dsk-exec-"):
-                            if sn.startswith(prefix + proj_id):
-                                _send_exec_wake(sn, proj_id, force_dedup_reset=_is_reopen)
-                                return
+                    # M1860: no fallback wake for unassigned substar — only wake the assigned session.
+                    # Previously woke the first alive session for the project when _owner was empty,
+                    # causing any idle session to pick up unassigned stones (free-pool race).
                 except Exception:
                     pass
             import threading as _thr
@@ -9493,45 +9529,7 @@ async def get_tmux_output(proj_id: str, lines: int = 20, tmux_session: str = "")
     )
     raw_capture = result.stdout.rstrip("\n")
     # M1836-v2: maintain a server-side ring buffer that survives ESC[3J scrollback wipes.
-    # Strategy: diff the current capture against the previous one.
-    # • Normal append: current capture ends with the same lines as previous → new suffix is appended.
-    # • ESC[3J wipe: current capture is short and doesn't match prev tail → treat entire capture
-    #   as new content (Claude restarted; the new session context starts here).
-    if tmux_session.strip():
-        prev_lines = _pane_ring_prev.get(session_name)  # None = first poll; [] = known-empty
-        buf        = _pane_ring_buf.get(session_name, [])
-        cur_lines  = [l.rstrip() for l in raw_capture.splitlines()] if raw_capture else []
-        if prev_lines is None:
-            # First poll — seed buffer with current content
-            buf = cur_lines[:]
-        elif cur_lines == prev_lines:
-            pass  # Identical content — nothing to append
-        else:
-            # Find the longest suffix of buf that matches a prefix of cur_lines.
-            # This covers the typical "new lines appended" case.
-            overlap = 0
-            max_look = min(len(buf), len(cur_lines))
-            for look in range(max_look, 0, -1):
-                if buf[-look:] == cur_lines[:look]:
-                    overlap = look
-                    break
-            new_lines = cur_lines[overlap:]
-            if new_lines:
-                buf.extend(new_lines)
-                if len(buf) > _PANE_BUF_MAX:
-                    buf = buf[-_PANE_BUF_MAX:]
-            elif not overlap and cur_lines:
-                # No overlap at all — content completely replaced (ESC[3J or new session).
-                # Extend with the full current pane content; duplicates accepted since user
-                # wants full history, and truly identical lines are rare in active sessions.
-                buf.extend(cur_lines)
-                if len(buf) > _PANE_BUF_MAX:
-                    buf = buf[-_PANE_BUF_MAX:]
-        _pane_ring_buf[session_name] = buf
-        _pane_ring_prev[session_name] = cur_lines  # store stripped list, not raw string
-        output = "\n".join(buf)
-    else:
-        output = raw_capture
+    output = raw_capture
     return JSONResponse({"ok": True, "running": True, "session": session_name, "output": output})
 
 
@@ -10072,11 +10070,11 @@ async def execute_project(proj_id: str, request: Request):
                         _ns_list_pre = proj.get("north_stars") or []
                         _main_assign = {ns["id"] for ns in _ns_list_pre
                                         if (ns.get("assigned_session") or "").strip() == session_name}
-                        def _is_branched_substar(m):
+                        def _is_assigned_substar(m):
                             _sid = m.get("substar_id") or ""
                             return bool(_sid) and _sid not in _main_assign
                         new_queued  = [m for m in active_ms if m.get("status") == "queued"
-                                       and (not _awaits_user_reply(m) or _is_branched_substar(m))
+                                       and (not _awaits_user_reply(m) or _is_assigned_substar(m))
                                        and not m.get("held")]
                         needs_trigger = new_queued  # M210: only queued stones trigger dispatch
                         # M837 fix Stage 1: split new_queued by owner session so the main queue inject only
@@ -10087,15 +10085,19 @@ async def execute_project(proj_id: str, request: Request):
                         def _owner_session(m):
                             _sid = m.get("substar_id") or ""
                             if not _sid:
-                                return session_name  # ungrouped → main
+                                return session_name  # ungrouped (no substar) → main
                             _ak = ((_ns_by_id_inj.get(_sid) or {}).get("assigned_session") or "").strip()
-                            return _ak or session_name
+                            # M1860: unassigned substar → no owner (not this session).
+                            # Previously returned session_name as fallback, routing any
+                            # unassigned-substar stone to the current/new session.
+                            return _ak if _ak else ""
                         _main_owned_q = [m for m in new_queued if _owner_session(m) == session_name]
-                        _branched_q_by_sess: dict = {}
+                        _assigned_q_by_sess: dict = {}
                         for _m in new_queued:
                             _ok = _owner_session(_m)
-                            if _ok != session_name:
-                                _branched_q_by_sess.setdefault(_ok, []).append(_m)
+                            # M1860: skip unassigned-substar stones (_ok=="") and own-session stones
+                            if _ok and _ok != session_name:
+                                _assigned_q_by_sess.setdefault(_ok, []).append(_m)
                         _trigger_sent = False
                         if needs_trigger:
                             # M149: append-only JSONL queue — never overwrite. Each Execute click
@@ -10126,7 +10128,7 @@ async def execute_project(proj_id: str, request: Request):
                                 for _ar in _arefs: base += f"  [agent: {_ar}]"
                                 return base
                             # M837 fix Stage 1: main inject sees only main-owned queued + pending; branched-owned go to their own wake
-                            _ms_snap = "\n".join(_ms_snap_line(m) for m in (_main_owned_q + new_pending))
+                            _ms_snap = "\n".join(_ms_snap_line(m) for m in (_main_owned_q + new_pending))  # main-owned only
                             _waves = _compute_dispatch_waves(_main_owned_q) if _main_owned_q else []
                             _stamp_wave_indices(proj_id, _waves)  # M511: label wave_index on each stone
                             _waves_section = _format_dispatch_waves(_waves) if len(_main_owned_q) > 1 else ""
@@ -10134,19 +10136,13 @@ async def execute_project(proj_id: str, request: Request):
                             _reflection_section = _load_failure_reflections(proj_id)
                             _mcp_cfg_exists = Path(f"/tmp/hub/mcp/{session_name}.json").exists()
                             _common_guidance = (
-                                f"COMMENT RULE (M478) — every append_message {{role:'claude'}} posted to a stone\n"
-                                f"  MUST be ≤ 3 lines. One-line past-tense outcome summary is the target;\n"
-                                f"  3 lines is the hard cap enforced server-side (M185: lines beyond 3 are\n"
-                                f"  auto-truncated and a [details: docs/ns-replies/...] pointer is appended).\n"
-                                f"  If full detail is needed: write docs/ns-replies/<DATE>-<MID>.md first,\n"
-                                f"  then reference it in the ≤3-line comment.\n\n"
                                 f"PARALLEL DISPATCH PROTOCOL (M472, Option 2 — native sub-agents) —\n"
                                 f"  IF 2+ queued stones are INDEPENDENT (no parent-child relation in their\n"
                                 f"  parent_id field, no obvious shared-file/shared-resource collision in\n"
                                 f"  their text), dispatch them IN PARALLEL: emit multiple Agent / Task tool\n"
                                 f"  calls in a SINGLE message. Sub-agents share THIS session's token quota.\n"
                                 f"  After all parallel sub-agents return, you (the orchestrator) post ONE\n"
-                                f"  consolidated ≤3-line summary listing the completed MIDs.\n"
+                                f"  consolidated summary listing the completed MIDs (STRUCTURED: no limit; prose: ≤3 lines).\n"
                                 f"  FALL BACK TO SEQUENTIAL when: (a) a substone whose mother is also queued\n"
                                 f"  (mother must wait — M468 commit-gate), (b) UI work needing the same\n"
                                 f"  browser session, (c) stones whose text references the same target file\n"
@@ -10173,7 +10169,7 @@ async def execute_project(proj_id: str, request: Request):
                                     f"  For sub-agent lookup: mcp__ns-hub__get_task_details(task_id='<MID>')\n\n"
                                     f"ANSWER vs IMPLEMENT CHECK (M687) — for EACH stone, inspect conversation[]:\n"
                                     f"  • If conversation[-1].role == 'user'  → FOLLOW-UP QUESTION. Answer only.\n"
-                                    f"    Call: mcp__ns-hub__reply_to_stone(task_id='<MID>', message='<answer ≤3 lines>')\n"
+                                    f"    Call: mcp__ns-hub__reply_to_stone(task_id='<MID>', message='<STRUCTURED: no limit | prose: ≤3 lines>')\n"
                                     f"    Do NOT change status or re-implement.\n"
                                     f"  • If conversation is empty OR conversation[-1].role == 'claude' → normal task.\n"
                                     f"    Implement, then call mcp__ns-hub__report_task_complete(...).\n"
@@ -10189,7 +10185,7 @@ async def execute_project(proj_id: str, request: Request):
                                     f"COMPLETION — when each stone is done:\n"
                                     f"  mcp__ns-hub__report_task_complete(\n"
                                     f"    task_id='<MID>',\n"
-                                    f"    summary='<≤3-line past-tense>',\n"
+                                    f"    summary='<STRUCTURED: no limit | prose: ≤3 lines, past-tense>',\n"
                                     f"    evidence_url='<GDrive link>'  # REQUIRED if stone produced a file/image/doc/Excel/screenshot\n"
                                     f"  )\n"
                                     f"  RESULT UPLOAD (if artifact produced):\n"
@@ -10197,7 +10193,7 @@ async def execute_project(proj_id: str, request: Request):
                                     f"    FILE_ID=$(rclone lsjson 'gdrive:claude-shared/{proj_id}/outbox/' --include '<filename>' | python3 -c \"import sys,json; d=json.load(sys.stdin); items=[x for x in d if not x.get('IsDir',False)]; print(items[0]['ID'] if items else '')\")\n"
                                     f"    RESULT_URL=\"https://drive.google.com/file/d/$FILE_ID/view?usp=sharing\"\n"
                                     f"    → pass RESULT_URL as evidence_url above\n"
-                                    f"  Q&A reply: mcp__ns-hub__reply_to_stone(task_id='<MID>', message='<≤3 lines>')\n"
+                                    f"  Q&A reply: mcp__ns-hub__reply_to_stone(task_id='<MID>', message='<STRUCTURED: no limit | prose: ≤3 lines>')\n"
                                     f"  No-op: mcp__ns-hub__reply_to_stone(task_id='<MID>', message='<1-line reason>') — silent skip forbidden.\n\n"
                                     + _waves_section
                                     + f"Newly queued:\n{_ms_snap}"
@@ -10216,7 +10212,7 @@ async def execute_project(proj_id: str, request: Request):
                                     f"pasted content, image/file refs, or conversation context.\n\n"
                                     f"ANSWER vs IMPLEMENT CHECK (M687) — for EACH stone, inspect conversation[]:\n"
                                     f"  • If conversation[-1].role == 'user'  → FOLLOW-UP QUESTION. Answer only.\n"
-                                    f"    PATCH with append_message{{role:'claude', text:'<answer ≤3 lines>'}} only.\n"
+                                    f"    PATCH with append_message{{role:'claude', text:'<STRUCTURED: no limit | prose: ≤3 lines>'}} only.\n"
                                     f"    Do NOT change status.\n"
                                     f"  • If conversation is empty OR conversation[-1].role == 'claude' → normal task.\n"
                                     f"    Implement and PATCH status=pending_confirmation + append_message.\n"
@@ -10230,7 +10226,7 @@ async def execute_project(proj_id: str, request: Request):
                                     f"  2) implement (Edit/Bash/Skill/Agent as needed)\n"
                                     f"  3) PATCH status=pending_confirmation + append_message + model_used + exec_start + exec_end\n\n"
                                     f"COMPLETION PROTOCOL — PATCH status=pending_confirmation with ALL of:\n"
-                                    f"  append_message: {{\"role\":\"claude\",\"text\":\"<≤3-line PAST TENSE summary — include key result/finding>\"}}\n"
+                                    f"  append_message: {{\"role\":\"claude\",\"text\":\"<STRUCTURED(bullets/table/numbered): no limit | prose: ≤3 lines, PAST TENSE — include key result/finding>\"}}\n"
                                     f"  model_used, exec_start, exec_end\n"
                                     f"  NO-OP: POST 1-line append_message with reason — silent skip forbidden.\n\n"
                                     + _waves_section
@@ -10293,8 +10289,8 @@ async def execute_project(proj_id: str, request: Request):
                             _trigger_sent = True
                             # M837 fix Stage 1: wake each branched session that owns queued stones.
                             # M858 Stage 2: dead branched sessions → spawn them.
-                            _branched_wakes_sent: list = []
-                            _branched_spawned: list = []
+                            _assigned_wakes_sent: list = []
+                            _assigned_spawned: list = []
                             _br_spawn_cwd = proj_dir if Path(proj_dir).exists() else str(Path.home())
                             _br_agent = agent
                             _br_model = _get_project_model_value(proj_id)
@@ -10304,7 +10300,7 @@ async def execute_project(proj_id: str, request: Request):
                                 f"  {m.get('id')} [{m.get('status')}]: \"{(m.get('text') or '')[:80].replace(chr(10),' / ')}\""
                                 for m in active_ms
                             )
-                            for _br_sess, _br_stones in _branched_q_by_sess.items():
+                            for _br_sess, _br_stones in _assigned_q_by_sess.items():
                                 try:
                                     _br_check = await asyncio.to_thread(  # M1345
                                         subprocess.run, ["tmux", "has-session", "-t", f"={_br_sess}"], capture_output=True, timeout=2)
@@ -10317,7 +10313,7 @@ async def execute_project(proj_id: str, request: Request):
                                         # child even though the click was just a queue-toggle, not
                                         # the explicit dispatch button. Skip exactly like the main
                                         # session does — badge cannot spawn, only dispatch can.
-                                        _server_log_action(proj_id, "", "exec:branch_badge_no_spawn", _br_sess)
+                                        _server_log_action(proj_id, "", "exec:assigned_respawn_badge_skip", _br_sess)
                                         continue
                                     if _br_check.returncode != 0:
                                         # M858 Stage 2: session dead → write prompt and spawn
@@ -10343,7 +10339,7 @@ async def execute_project(proj_id: str, request: Request):
                                                         _save_project(proj_id, _br_proj_obj)
                                             except Exception:
                                                 pass
-                                            _server_log_action(proj_id, "", "exec:branch_sess_renamed", f"{_br_sess}→{_br_sess_new}")
+                                            _server_log_action(proj_id, "", "exec:assigned_respawn_renamed", f"{_br_sess}→{_br_sess_new}")
                                             _br_sess = _br_sess_new
                                         _br_short = _br_sess[-12:]
                                         _br_ns_ids = list(dict.fromkeys(m.get("substar_id","") for m in _br_stones if m.get("substar_id")))
@@ -10391,7 +10387,7 @@ async def execute_project(proj_id: str, request: Request):
                                                 _br_pre_files = set()
                                             # M1773-C: marker before Popen for ambiguity resolution
                                             _br_marker = _write_spawn_marker(_br_tdir, _br_sess)
-                                        _br_claude_cmd = (["claude", "--dangerously-skip-permissions"] + _DISALLOWED_TOOLS_ARGS
+                                        _br_claude_cmd = (["claude", "--dangerously-skip-permissions", "--think"] + _DISALLOWED_TOOLS_ARGS
                                                           + _hub_mcp_spawn_args(proj_id, _br_sess)
                                                           + _br_resume_args + _get_project_model(proj_id))
                                         subprocess.Popen(
@@ -10406,8 +10402,8 @@ async def execute_project(proj_id: str, request: Request):
                                         # M1678: readiness-gated unified wake (was blind send-keys during boot — parked text in input box)
                                         threading.Thread(target=_spawn_wake_when_ready,
                                                          args=(_br_sess, proj_id), daemon=True).start()
-                                        _branched_spawned.append(_br_sess)
-                                        _server_log_action(proj_id, "", "exec:branch_spawned", _br_sess)
+                                        _assigned_spawned.append(_br_sess)
+                                        _server_log_action(proj_id, "", "exec:assigned_respawn_spawned", _br_sess)
                                         continue
                                     # M1678: busy/attached/alive gates live inside _send_exec_wake
                                     # (single choke point) — no outer pre-check needed here.
@@ -10416,11 +10412,11 @@ async def execute_project(proj_id: str, request: Request):
                                     # an earlier courtesy boot-wake (found nothing queued, went
                                     # idle) must not block this now-genuinely-needed wake.
                                     if _send_exec_wake(_br_sess, proj_id, force_dedup_reset=True):
-                                        _branched_wakes_sent.append(_br_sess)
+                                        _assigned_wakes_sent.append(_br_sess)
                                 except Exception:
                                     pass
-                            _server_log_action(proj_id, "", "exec:branched_wake",
-                                               f"split: main={len(_main_owned_q)} branched={sum(len(v) for v in _branched_q_by_sess.values())} woke={','.join(_branched_wakes_sent) or 'none'} spawned={','.join(_branched_spawned) or 'none'}")
+                            _server_log_action(proj_id, "", "exec:assigned_respawn_wake",
+                                               f"split: main={len(_main_owned_q)} assigned={sum(len(v) for v in _assigned_q_by_sess.values())} woke={','.join(_assigned_wakes_sent) or 'none'} spawned={','.join(_assigned_spawned) or 'none'}")
                         return JSONResponse({
                             "ok": True, "mode": "tmux_active",
                             "session": session_name,
@@ -10501,7 +10497,7 @@ async def execute_project(proj_id: str, request: Request):
                     f"  2. Edit/write files to implement the milestone.\n"
                     f"  3. Append completion-log:\n"
                     f'     echo \'{{\"session_id\":\"exec\",\"milestone_id\":\"<MID>\",\"evidence\":\"<one-line summary>\",\"timestamp\":\"\'$(date -Iseconds)\'\"}}\' >> ~/.hub/projects/{proj_id}/completion-log.jsonl\n'
-                    f"  4. PATCH {hub_api}/api/northstar/{proj_id}/milestones/<MID> body {{\"status\":\"pending_confirmation\", \"model_used\":\"<model name>\", \"session_id\":\"$CLAUDE_CODE_SESSION_ID\", \"exec_start\":\"<ISO start>\", \"exec_end\":\"<ISO now>\", \"append_message\":{{\"role\":\"claude\",\"text\":\"<≤3-line PAST TENSE: what was done + key result/finding — NOT what to do next>\"}}}}\n"
+                    f"  4. PATCH {hub_api}/api/northstar/{proj_id}/milestones/<MID> body {{\"status\":\"pending_confirmation\", \"model_used\":\"<model name>\", \"session_id\":\"$CLAUDE_CODE_SESSION_ID\", \"exec_start\":\"<ISO start>\", \"exec_end\":\"<ISO now>\", \"append_message\":{{\"role\":\"claude\",\"text\":\"<STRUCTURED(bullets/table/numbered): no limit | prose: ≤3 lines PAST TENSE — what was done + key result/finding>\"}}}}\n"
                     f"  5. Mark the item completed in your plan.\n\n"
                     f"If a milestone is ambiguous, mark it `needs_clarification` and ask for the missing detail.\n"
                 )
@@ -10626,7 +10622,7 @@ async def execute_project(proj_id: str, request: Request):
             all_ms_lines = "\n".join(_snap_line_full(m) for m in active_ms)
             # M472: pre-compute dispatch waves for fresh-session prompt
             _fresh_queued = [m for m in active_ms if m.get("status") == "queued"]
-            # M747: group queued stones by substar for per-substar session branching
+            # M747: group queued stones by substar for per-substar assigned-session dispatch
             # M792: session router — substars sharing same assigned_session merge into one bucket
             _ns_list = proj.get("north_stars") or []
             _ns_by_id: dict = {ns["id"]: ns for ns in _ns_list if ns.get("id")}
@@ -10637,11 +10633,11 @@ async def execute_project(proj_id: str, request: Request):
             def _resolve_session_key(proj_id: str, substar_id: str, ns_by_id: dict) -> str:
                 """M792: return assigned_session for this substar.
                 M855 fix: substar_id on a stone may not match any current north-star
-                (stale ID, substar deleted, ID format mismatch). Fall back to main session."""
+                (stale ID, substar deleted, ID format mismatch).
+                M1860: do NOT fall back to main session for unassigned substars —
+                return "" so the stone is excluded from all dispatch queues until
+                a session is explicitly assigned to its substar."""
                 _assigned = (ns_by_id.get(substar_id) or {}).get("assigned_session") or ""
-                if not _assigned.strip():
-                    # Fallback: stone references unknown/stale substar → treat as main
-                    return session_name
                 return _assigned.strip()
 
             # _session_qs: session_key -> list of stones (may span multiple substars)
@@ -10651,33 +10647,36 @@ async def execute_project(proj_id: str, request: Request):
                 _qsid = _q.get("substar_id", "")
                 if _qsid:
                     _skey = _resolve_session_key(proj_id, _qsid, _ns_by_id)
-                    _session_qs.setdefault(_skey, []).append(_q)
+                    if _skey:
+                        _session_qs.setdefault(_skey, []).append(_q)
+                    # M1860: _skey=="" → unassigned substar → exclude from all dispatch queues.
+                    # Do NOT fall through to _main_qs (was the implicit effect of the old "" key).
                 else:
-                    _main_qs.append(_q)
+                    _main_qs.append(_q)  # no substar_id → ungrouped → main
             # Keep _substar_qs alias for backward compatibility (kill-session loop below)
             _substar_qs = _session_qs
-            # M824: branch whenever any assigned_session exists — every assigned tmux session must run on dispatch
-            _branch_substars = len(_session_qs) >= 1
-            # M824 LEAK FIX: build set of stone IDs owned by branched sessions
-            _branched_mids: set = {m.get("id") for stones in _session_qs.values() for m in stones} if _branch_substars else set()
-            # Stones for main session: ungrouped only (when branching) or all (when not)
+            # M824: respawn whenever any assigned_session exists — every assigned tmux session must run on dispatch
+            _has_assigned_sessions = len(_session_qs) >= 1
+            # M824 LEAK FIX: build set of stone IDs owned by assigned sessions
+            _assigned_mids: set = {m.get("id") for stones in _session_qs.values() for m in stones} if _has_assigned_sessions else set()
+            # Stones for main session: ungrouped only (when assigned sessions exist) or all (when not)
             # M824 COLLISION GUARD: if any _skey == session_name, those stones belong to main
-            if _branch_substars:
+            if _has_assigned_sessions:
                 _collision_keys = [k for k in list(_session_qs.keys()) if k == session_name]
                 for _ck in _collision_keys:
                     _main_qs.extend(_session_qs.pop(_ck))
-                    _branched_mids -= {m.get("id") for m in _main_qs}
-            _dispatch_queued = _main_qs if _branch_substars else _fresh_queued
-            # M824 LEAK FIX: filtered snapshot for main session — omits stones owned by branched sessions
+                    _assigned_mids -= {m.get("id") for m in _main_qs}
+            _dispatch_queued = _main_qs if _has_assigned_sessions else _fresh_queued
+            # M824 LEAK FIX: filtered snapshot for main session — omits stones owned by assigned sessions
             # so main orchestrator never TaskCreates them (race condition fix)
-            if _branch_substars and _branched_mids:
+            if _has_assigned_sessions and _assigned_mids:
                 _main_all_ms_lines = "\n".join(
-                    _snap_line_full(m) for m in active_ms if m.get("id") not in _branched_mids
+                    _snap_line_full(m) for m in active_ms if m.get("id") not in _assigned_mids
                 )
-                _branched_session_names = sorted(_session_qs.keys())
+                _assigned_session_names = sorted(_session_qs.keys())
             else:
                 _main_all_ms_lines = all_ms_lines
-                _branched_session_names = []
+                _assigned_session_names = []
             _fresh_waves = _compute_dispatch_waves(_dispatch_queued) if _dispatch_queued else []
             _stamp_wave_indices(proj_id, _fresh_waves)  # M511: label wave_index on each stone
             _fresh_waves_section = _format_dispatch_waves(_fresh_waves) if len(_dispatch_queued) > 1 else ""
@@ -10699,7 +10698,7 @@ async def execute_project(proj_id: str, request: Request):
                 f"  4. Append completion-log:\n"
                 f'     echo \'{{\"session_id\":\"exec\",\"milestone_id\":\"<MID>\",\"evidence\":\"<one-line summary>\",\"timestamp\":\"\'$(date -Iseconds)\'\"}}\' >> ~/.hub/projects/{proj_id}/completion-log.jsonl\n'
                 f"  5. PATCH {hub_api}/api/northstar/{proj_id}/milestones/<MID> body:\n"
-                f'     {{"status":"pending_confirmation","model_used":"claude-sonnet-4-6","session_id":"$CLAUDE_CODE_SESSION_ID","exec_start":"<ISO start>","exec_end":"$(date -Iseconds)","append_message":{{"role":"claude","text":"<≤3-line PAST TENSE: what was done + key result/finding>"}}}}\n'
+                f'     {{"status":"pending_confirmation","model_used":"claude-sonnet-4-6","session_id":"$CLAUDE_CODE_SESSION_ID","exec_start":"<ISO start>","exec_end":"$(date -Iseconds)","append_message":{{"role":"claude","text":"<STRUCTURED(bullets/table): no limit | prose: ≤3 lines PAST TENSE — what was done + key result/finding>"}}}}\n'
                 f"     append_message = MANDATORY — ALWAYS include. Omitting it leaves the stone with no reply\n"
                 f"       visible to the user (server inserts '완료.' as emergency fallback but it is generic).\n"
                 f"       RULE: append_message in the SAME PATCH as status=pending_confirmation. Past tense only.\n"
@@ -10750,15 +10749,14 @@ async def execute_project(proj_id: str, request: Request):
                 f"SUB-AGENT PROTOCOL — each Agent call must:\n"
                 + _stone_impl_steps
                 + f"ORCHESTRATOR — after all waves complete:\n"
-                f"  Post ONE consolidated ≤3-line summary listing completed MIDs.\n\n"
-                f"COMMENT RULE: append_message MUST be ≤3 lines.\n\n"
+                f"  Post ONE consolidated summary listing completed MIDs (STRUCTURED: no limit; prose: ≤3 lines).\n\n"
                 f"TOKEN DISCIPLINE: NO progress comments during work. ONE past-tense summary at completion.\n\n"
                 f"CAVEMAN LITE MODE (M582): Terse output — drop filler/politeness, keep technical precision. ~60% fewer output tokens.\n\n"
                 + (
                     f"BRANCHED SESSIONS: substar-assigned queued stones are handled by their per-substar tmux sessions "
-                    f"({', '.join(_branched_session_names)}). "
+                    f"({', '.join(_assigned_session_names)}). "
                     f"DO NOT TaskCreate or Agent-dispatch those — they are filtered out of the snapshot below.\n\n"
-                    if _branched_session_names else ""
+                    if _assigned_session_names else ""
                 )
                 + _fresh_waves_section
                 + f"Active milestones (snapshot — TaskCreate only for status=queued):\n{_main_all_ms_lines}"
@@ -10770,7 +10768,7 @@ async def execute_project(proj_id: str, request: Request):
 
             # M747/M792: write per-session dispatch prompts before killing/spawning sessions
             # M792: session_key may cover multiple substars — group by substar_id within each session
-            if _branch_substars:
+            if _has_assigned_sessions:
                 for _skey, _ss_stones in _session_qs.items():
                     _ss_short = _skey[-12:]  # last 12 chars of session key for file naming
                     # Collect distinct substar_ids in this session bucket (queued_at order)
@@ -10836,12 +10834,35 @@ async def execute_project(proj_id: str, request: Request):
                         _assigned_now.add(_a864)
             except Exception:
                 pass
-            _assigned_spare = (set(_session_qs.keys()) if _branch_substars else set()) | _assigned_now
+            _assigned_spare = (set(_session_qs.keys()) if _has_assigned_sessions else set()) | _assigned_now
+            # M1870: also spare any session currently running Claude — a live unassigned session
+            # (e.g. resume-spawned but not yet assigned to a substar) must not be silently killed
+            # just because the user spawns a second session. Only truly idle/shell-only sessions
+            # should be pruned; if claude is running, keep it alive.
+            try:
+                for _ls in _live_sessions:
+                    if f"-exec-{proj_id}-" in _ls and _ls != session_name:
+                        _lp = subprocess.run(
+                            ["tmux", "list-panes", "-t", f"={_ls}", "-F", "#{pane_current_command}"],
+                            capture_output=True, text=True, timeout=2,
+                        ).stdout.splitlines()
+                        if any(c.strip() and c.strip() not in _SHELLS for c in _lp):
+                            _assigned_spare.add(_ls)
+            except Exception:
+                pass
             _kill_all_exec_sessions(proj_id, spare=_assigned_spare)
             # M864: kill active substar sessions that have no queued work AND no assignment
+            # M1870-b: also skip sessions currently running Claude — same invariant as M1870 above.
             _active_substars_now = _get_active_substar_sessions(proj_id)
             for _ss_short2, _ss_sname2 in _active_substars_now.items():
                 if _ss_sname2 not in _session_qs and _ss_sname2 not in _assigned_now:
+                    # M1870-b: do not kill if claude is currently running in this session
+                    _m864_pane = subprocess.run(
+                        ["tmux", "list-panes", "-t", f"={_ss_sname2}", "-F", "#{pane_current_command}"],
+                        capture_output=True, text=True, timeout=2,
+                    ).stdout.splitlines()
+                    if any(c.strip() and c.strip() not in _SHELLS for c in _m864_pane):
+                        continue  # claude is running — keep it alive
                     subprocess.run(["tmux", "kill-session", "-t", f"={_ss_sname2}"], capture_output=True, timeout=5)
                     _exec_idle_count.pop(_ss_sname2, None)
                     _exec_was_running.pop(_ss_sname2, None)
@@ -10849,7 +10870,7 @@ async def execute_project(proj_id: str, request: Request):
             # M747/M792: also kill stale substar/session-key sessions before respawning
             # M824 ALIVE-BRANCH SKIP: reuse alive sessions that already have Claude running
             _alive_branch_keys: set = set()
-            if _branch_substars:
+            if _has_assigned_sessions:
                 for _skey in list(_session_qs.keys()):
                     # M824 COLLISION GUARD: never kill main session here (handled by _kill_all_exec_sessions above)
                     if _skey == session_name:
@@ -10920,7 +10941,7 @@ async def execute_project(proj_id: str, request: Request):
                 "tmux", "new-session", "-d", "-s", session_name,
                 "-c", spawn_cwd,
                 *_tmux_env,
-                "claude", "--dangerously-skip-permissions", *_DISALLOWED_TOOLS_ARGS, *_get_project_model(proj_id),
+                "claude", "--dangerously-skip-permissions", "--think", *_DISALLOWED_TOOLS_ARGS, *_get_project_model(proj_id),
                 *_mcp_full_args, *resume_args,
             ])
             subprocess.run(["tmux", "set-option", "-t", session_name, "history-limit", "5000"], capture_output=True, timeout=2)
@@ -10975,7 +10996,7 @@ async def execute_project(proj_id: str, request: Request):
                     "tmux", "new-session", "-d", "-s", session_name,
                     "-c", spawn_cwd,
                     *_tmux_env,
-                    "claude", "--dangerously-skip-permissions", *_DISALLOWED_TOOLS_ARGS, *_get_project_model(proj_id), *_mcp_args_retry,
+                    "claude", "--dangerously-skip-permissions", "--think", *_DISALLOWED_TOOLS_ARGS, *_get_project_model(proj_id), *_mcp_args_retry,
                     *resume_args,
                 ])
                 subprocess.run(["tmux", "set-option", "-t", session_name, "history-limit", "5000"], capture_output=True, timeout=2)
@@ -11022,14 +11043,14 @@ async def execute_project(proj_id: str, request: Request):
 
             # M747/M792: spawn per-session sessions after main session is live
             # M792: iterate session_qs (session_key -> stones); session_name IS the key
-            if _branch_substars:
+            if _has_assigned_sessions:
                 _ss_tmux_base = list(_tmux_env)  # copy main tmux env
                 _newly_spawned: list = []
-                # M1166: branched sessions should inherit the MOTHER (main) session's actual
+                # M1166: assigned sessions should inherit the MOTHER (main) session's actual
                 # running model, not the current project_meta model (which may have been
-                # changed via dropdown between main spawn and branch spawn). Read the
-                # main session's spawn_info ONCE before the branch loop — main was spawned
-                # earlier so its model is what's recorded there. Falls back to project model
+                # changed via dropdown between main spawn and assigned-session spawn). Read the
+                # main session's spawn_info ONCE before the assigned-session loop — main was
+                # spawned earlier so its model is what's recorded there. Falls back to project model
                 # when spawn_info is missing or has no model field.
                 _mother_model_args = _get_project_model(proj_id)
                 try:
@@ -11062,7 +11083,7 @@ async def execute_project(proj_id: str, request: Request):
                         _ss_env += ["-e", f"{_k}={_v}"]
                     # M1787: dead-session-reclaim --resume targeting now happens where the
                     # assignment itself is made (update_north_star's manual-assign spawn path),
-                    # not here — this dispatch-time branch-spawn loop no longer auto-assigns
+                    # not here — this dispatch-time assigned-respawn loop no longer auto-assigns
                     # substars to a last-worked session (see M1787 note above), so any session
                     # reaching this point either already spawned via that path (and lands in
                     # _alive_branch_keys, skipping this loop entirely) or has no known prior
@@ -11075,7 +11096,7 @@ async def execute_project(proj_id: str, request: Request):
                         "tmux", "new-session", "-d", "-s", _ss_sname,
                         "-c", spawn_cwd,
                         *_ss_env,
-                        "claude", "--dangerously-skip-permissions", *_DISALLOWED_TOOLS_ARGS, *_mother_model_args,  # M1166
+                        "claude", "--dangerously-skip-permissions", "--think", *_DISALLOWED_TOOLS_ARGS, *_mother_model_args,  # M1166
                         *_ss_resume_args,
                     ])
                     subprocess.run(["tmux", "set-option", "-t", _ss_sname, "history-limit", "5000"], capture_output=True, timeout=2)
@@ -11104,7 +11125,7 @@ async def execute_project(proj_id: str, request: Request):
             # spawning branch sessions.
             _new_sid = _update_session_history_from_transcript(proj_id, spawn_cwd, _recorded_model, known_sid=_presigned_main_sid)
             # M833: capture branch session IDs for --resume continuity on next dispatch
-            if _branch_substars and _newly_spawned:
+            if _has_assigned_sessions and _newly_spawned:
                 _br_encoded_cwd = _encode_cwd_for_claude(spawn_cwd)
                 _br_transcripts_dir = Path.home() / ".claude" / "projects" / _br_encoded_cwd
                 try:
@@ -11141,7 +11162,7 @@ async def execute_project(proj_id: str, request: Request):
                 ):
                     _save_branch_session(proj_id, _br_sname, _br_jf.stem)
             # M818: include all spawned session names in response for UI visibility
-            _all_spawned = [session_name] + (list(_session_qs.keys()) if _branch_substars else [])
+            _all_spawned = [session_name] + (list(_session_qs.keys()) if _has_assigned_sessions else [])
             return JSONResponse({
                 "ok": True, "mode": "tmux",
                 "session": session_name,
@@ -11252,7 +11273,7 @@ async def fork_session(proj_id: str, request: Request):
     _fork_source_sid = source_sid
     # M1778: this endpoint (the "⑂ fork" button, M1699) never applied the M1679 truncation
     # fix — that fix only wired into _mother_fork_args, used by the OTHER two spawn paths
-    # (assign-spawn/branch-spawn), so forking via this button always inherited whatever
+    # (assign-spawn/assigned-respawn), so forking via this button always inherited whatever
     # in-flight, unrelated work the source session was mid-turn on (reported: "fork session
     # 에서 작업중이던 작업을 재개"). Apply the same truncate-before-claim logic here: if the
     # source session is a live, busy tmux session with an in-flight stone claim, fork from a
@@ -11313,7 +11334,7 @@ async def fork_session(proj_id: str, request: Request):
     # --model corrupts arg parsing / model validation and is the cause of "issue with the selected
     # model" on fork (new-session path injects --model exactly once and works fine).
     claude_bin = _resolve_claude_bin()
-    _agent_base_cmd = [claude_bin, "--dangerously-skip-permissions", *_DISALLOWED_TOOLS_ARGS]
+    _agent_base_cmd = [claude_bin, "--dangerously-skip-permissions", "--think", *_DISALLOWED_TOOLS_ARGS]
     subprocess.Popen([
         "tmux", "new-session", "-d", "-s", session_name,
         "-c", spawn_cwd,
@@ -12178,6 +12199,7 @@ async def kill_named_tmux_session(proj_id: str, session_name: str):
     _exec_was_running.pop(session_name, None)
     _pane_ring_buf.pop(session_name, None)   # M1836-v2: clear ring buffer so new session starts fresh
     _pane_ring_prev.pop(session_name, None)
+    _pane_ring_lock.pop(session_name, None)
     _live_sid_cache.pop(session_name, None)  # M1826-v2: clear cached live_session_id on kill
 
     # Clear assigned_session on any substar that pointed at the killed session.
@@ -12206,7 +12228,7 @@ async def kill_named_tmux_session(proj_id: str, session_name: str):
     if killed:
         _ns_push("session_idle", proj_id=proj_id, kind="exec")
     _server_log_action(proj_id, "", "exec:kill",
-                       f"session:{session_name} cascade:{','.join(sorted(cascade_targets))} cleared:{len(cleared_substars)}")
+                       f"session:{session_name} killed:{','.join(killed)} cleared:{len(cleared_substars)}")
     return {"ok": bool(killed), "session": session_name,
             "killed": killed, "cleared_substars": cleared_substars}
 
@@ -12806,25 +12828,6 @@ async def get_exec_sessions():
         except Exception:
             pass
 
-    # M1826-v3: batch-prefetch spawn-info — one file read per unique proj_id before gather,
-    # replaces N concurrent _read_spawn_info() calls (was 12 file reads for 12 sessions).
-    _batch_spawn_info: dict[str, dict] = {}  # proj_id → {session_name → spawn_info_dict}
-    _unique_proj_ids_si = list({pid for _, _, pid, _ in _session_lines})
-    def _prefetch_spawn_info():
-        result: dict[str, dict] = {}
-        for _pid in _unique_proj_ids_si:
-            try:
-                _f = PROJECTS_DIR / _pid / ".spawn-info-by-session.json"
-                if _f.exists():
-                    result[_pid] = json.loads(_f.read_text())
-            except Exception:
-                pass
-        return result
-    try:
-        _batch_spawn_info = await asyncio.to_thread(_prefetch_spawn_info)
-    except Exception:
-        pass
-
     # M1234-C2: process each session concurrently via asyncio.gather
     async def _process_session(session_name, agent, proj_id, created_ts):
         import re as _re
@@ -12910,15 +12913,7 @@ async def get_exec_sessions():
         spawn_mode = None
         spawn_from = None
         spawn_model = ""
-        # M1826-v3: use pre-fetched batch spawn-info (avoids per-session file read).
-        # Falls back to _read_spawn_info() only if prefetch missed this proj_id.
-        _si_all = _batch_spawn_info.get(proj_id)
-        if _si_all is not None:
-            _ag2, _pid2 = _parse_exec_session_name(session_name)
-            _is_main2 = bool(_pid2) and session_name == f"{_ag2}-exec-{_pid2}"
-            si = _si_all.get(session_name) or (_si_all.get("_main") if _is_main2 else {}) or {}
-        else:
-            si = _read_spawn_info(proj_id, session_name)
+        si = _read_spawn_info(proj_id, session_name)
         if si:
             spawn_mode = si.get("mode")
             spawn_from = si.get("from_id") or None
@@ -13004,8 +12999,7 @@ async def get_exec_sessions():
                     else:
                         _from_stem = _si_from.split("-")[0] if _si_from else ""
                         try:
-                            # M1826-v3: reuse prefetched spawn-info batch (avoids second file read)
-                            _si_all_fb = _batch_spawn_info.get(proj_id) or json.loads((PROJECTS_DIR / proj_id / ".spawn-info-by-session.json").read_text())
+                            _si_all_fb = json.loads((PROJECTS_DIR / proj_id / ".spawn-info-by-session.json").read_text())
                             _claimed = {v.get("live_session_id","")[:8] for v in _si_all_fb.values() if v.get("live_session_id")}
                         except Exception:
                             _claimed = set()
@@ -13037,11 +13031,24 @@ async def get_exec_sessions():
 
         # M1656-R: expose accurate per-session state for UI (what stone, why busy)
         _rec = _agent_busy_sessions.get(session_name) or {}
+        # M1881: activity = transcript mtime (matches resumeRows sort key in detail panel).
+        # Allows avatar stack to use the same tie-break as the session list → order stays in sync.
+        _activity = 0.0
+        if _live_session_id:
+            try:
+                _proj_dir_a = _get_project_dir(proj_id)
+                if _proj_dir_a:
+                    _tf = Path.home() / ".claude" / "projects" / _encode_cwd_for_claude(str(_proj_dir_a)) / f"{_live_session_id}.jsonl"
+                    if _tf.exists():
+                        _activity = _tf.stat().st_mtime
+            except Exception:
+                pass
         return {
             "session": session_name,
             "proj_id": proj_id,
             "agent": agent,
             "created": _dt.fromtimestamp(created_ts).isoformat() if created_ts else "",
+            "created_ts": created_ts,
             "alive": True,
             "idle": idle,
             "busy_reason": _rec.get("reason", "") if not idle else "",
@@ -13050,6 +13057,7 @@ async def get_exec_sessions():
             "spawn_from": spawn_from,
             "live_session_id": _live_session_id,
             "model": spawn_model,
+            "activity": _activity,
         }
 
     # Run all sessions in parallel
@@ -13189,27 +13197,33 @@ async def get_resumable_sessions(proj_id: str, agent: str = "", model: str = "")
     # M1498: subprocess.run blocks the async event loop; wrap in asyncio.to_thread
     # M1765: track ALL live sessions per agent (main + fork children), not just one
     # M1821-P2: single list-panes -a batch replaces per-session subprocess loop.
+    # M1852-①: reuse _bg_tmux_state (3s cached) instead of spawning own subprocess.
     live_by_agent = set()
     live_sessions_by_agent: dict[str, list[dict]] = {}  # agent → [{name, created_ts}]
     try:
-        def _tmux_batch_query():
-            sess_r = subprocess.run(
-                ["tmux", "list-sessions", "-F", "#{session_name}:#{session_created}:#{session_windows}"],
-                capture_output=True, text=True, timeout=3
-            )
-            pane_r = subprocess.run(
-                ["tmux", "list-panes", "-a", "-F", "#{session_name} #{pane_current_command}"],
-                capture_output=True, text=True, timeout=3
-            )
-            return sess_r, pane_r
-        tmux_out, pane_out = await asyncio.to_thread(_tmux_batch_query)
+        _bg_age_rs = time.monotonic() - _bg_tmux_state.get("ts", 0.0)
+        if _bg_age_rs < 10.0 and _bg_tmux_state.get("ls"):
+            _ls_raw = _bg_tmux_state["ls"]
+            _lp_raw = _bg_tmux_state["lp"]
+        else:
+            def _tmux_batch_query():
+                sess_r = subprocess.run(
+                    ["tmux", "list-sessions", "-F", "#{session_name}:#{session_created}:#{session_windows}"],
+                    capture_output=True, text=True, timeout=3
+                )
+                pane_r = subprocess.run(
+                    ["tmux", "list-panes", "-a", "-F", "#{session_name} #{pane_current_command}"],
+                    capture_output=True, text=True, timeout=3
+                )
+                return sess_r.stdout, pane_r.stdout
+            _ls_raw, _lp_raw = await asyncio.to_thread(_tmux_batch_query)
         # Build session_name → set(pane commands) map from the single batch call
         _sess_pane_cmds: dict[str, set[str]] = {}
-        for _pl in pane_out.stdout.splitlines():
+        for _pl in (_lp_raw or "").splitlines():
             _parts = _pl.split(" ", 1)
             if len(_parts) == 2:
                 _sess_pane_cmds.setdefault(_parts[0], set()).add(_parts[1].strip())
-        for line in tmux_out.stdout.splitlines():
+        for line in (_ls_raw or "").splitlines():
             parts = line.split(":", 2)
             sname = parts[0] if parts else ""
             created_ts = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
@@ -13258,6 +13272,9 @@ async def get_resumable_sessions(proj_id: str, agent: str = "", model: str = "")
                         if not _live_sid:
                             if _si_mode == "resume" and _si_from:
                                 _live_sid = _si_from  # resume = continues same conversation
+                            elif sname in _live_sid_cache and _live_sid_cache[sname]:
+                                # M1852-②: reuse cache from get_all_sessions (avoids repeated glob)
+                                _live_sid = _live_sid_cache[sname]
                             elif transcript_dir.exists():
                                 # Step 2: scan transcript dir for new .jsonl (fork/fresh)
                                 _claimed = {v.get("live_session_id","")[:8] for v in _si_all.values() if v.get("live_session_id")}
@@ -13281,6 +13298,8 @@ async def get_resumable_sessions(proj_id: str, agent: str = "", model: str = "")
                                     _candidates.append((mt, fstem))
                                 if len(_candidates) == 1:
                                     _live_sid = _candidates[0][1]
+                                    if _live_sid:
+                                        _live_sid_cache[sname] = _live_sid  # M1852-②: populate shared cache
                         if _live_sid:
                             live_exec_sessions.setdefault(ag, []).append({
                                 "tmux_session": sname, "live_sid": _live_sid,
@@ -13390,11 +13409,13 @@ async def get_resumable_sessions(proj_id: str, agent: str = "", model: str = "")
                     # _push_session_history_ring for the write side.
                     hist_keys = _session_history_slot_keys(mkey)
                 else:
-                    # M323: include _current for empty model key — this is the default claude session.
-                    # _current is set by _update_session_history_from_transcript only on claude spawns,
-                    # so cross-agent contamination is minimal. Previously skipped (M279) causing
-                    # the default session to disappear after tmux kill.
-                    hist_keys = ["_current", "_default"]
+                    # M323: include _current/_default for empty model key (default claude session).
+                    # M1876: also include the full claude-sonnet-4-6 5-slot ring — sessions spawned
+                    # with --model claude-sonnet-4-6 write into that ring, not _current/_default,
+                    # so they were invisible in the default "sonnet-4.6" bucket. This caused sessions
+                    # like 77e38ee2 (stored in claude-sonnet-4-6_prev) to disappear from the UI even
+                    # though they were alive and accessible via the explicit "Sonnet 4.6" bucket.
+                    hist_keys = ["_current", "_default"] + _session_history_slot_keys("claude-sonnet-4-6")
                 encoded_path = _encode_cwd_for_claude(str(_get_project_dir(proj_id) or str(Path.home())))
                 for hist_key in hist_keys:
                     if hist_key == "_default" and mkey:
@@ -13838,13 +13859,24 @@ def _detect_session_model(transcript_path: Path, max_lines: int = 50, prefer_tai
     _result = ""
     try:
         if prefer_tail:
-            # M1806: read the full file to find the last session-boundary marker, then
-            # scan only entries after it. Boundary markers (type=mode / permission-mode)
-            # are emitted at the start of each Claude invocation; entries following the
-            # LAST marker belong exclusively to the current run — no inherited context.
-            # Falls back to raw tail scan when no boundary is found (e.g. old transcripts).
+            # M1806: find last session-boundary marker then scan only entries after it.
+            # M1852-③: read only last 32KB (covers ~200-400 lines) instead of the full file.
+            # Session-boundary markers and current-run model fields are always near the END
+            # of the transcript; active sessions with large transcripts (multi-MB) were
+            # re-reading the entire file on every poll. 32KB is sufficient in ~99% of cases;
+            # falls back to full read if no boundary or model found in the tail window.
             try:
-                all_lines = transcript_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                _TAIL_BYTES = 32768
+                fsize = transcript_path.stat().st_size
+                if fsize <= _TAIL_BYTES:
+                    all_lines = transcript_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                else:
+                    with transcript_path.open("rb") as _f:
+                        _f.seek(-_TAIL_BYTES, 2)
+                        _tail_raw = _f.read().decode("utf-8", errors="replace")
+                    # Drop the first (likely partial) line from the seek
+                    _tail_lines = _tail_raw.splitlines()
+                    all_lines = _tail_lines[1:] if len(_tail_lines) > 1 else _tail_lines
                 last_boundary_idx = -1
                 for _i, _ln in enumerate(all_lines):
                     if not _ln.strip():
@@ -14211,17 +14243,16 @@ def _spawn_entity_corpus() -> "subprocess.Popen | None":
         return None
 
 
-_HUB_GLOBAL_BLOCK = """\
-## NS Hub Protocol (auto-injected by hub install-global)
-<!-- NS_HUB_GLOBAL_START -->
-Stone lifecycle: queued → pending_confirmation → done.
-COMPLETION PROTOCOL: PATCH status=pending_confirmation + append_message.role=claude + exec_start + exec_end + model_used (all in one PATCH).
-COMMENT RULE: append_message ≤3 lines. Longer detail → docs/ns-replies/<DATE>-<MID>.md then reference link in comment.
-PARALLEL DISPATCH: 2+ independent queued stones → emit multiple Agent calls in ONE message.
-NO-OP PROTOCOL: if skipping a stone, post 1-line reason via append_message. Silent skip forbidden.
-TOKEN DISCIPLINE: after completion post ≤3-line summary including key result/finding. No follow-up questions.
-<!-- NS_HUB_GLOBAL_END -->
-"""
+_HUB_GLOBAL_BLOCK = (
+    "## NS Hub Protocol (auto-injected by hub install-global)\n"
+    "<!-- NS_HUB_GLOBAL_START -->\n"
+    "Stone lifecycle: queued → pending_confirmation → done.\n"
+    "COMPLETION PROTOCOL: PATCH status=pending_confirmation + append_message.role=claude + exec_start + exec_end + model_used (all in one PATCH).\n"
+    "PARALLEL DISPATCH: 2+ independent queued stones → emit multiple Agent calls in ONE message.\n"
+    "NO-OP PROTOCOL: if skipping a stone, post 1-line reason via append_message. Silent skip forbidden.\n"
+    "TOKEN DISCIPLINE: after completion post structured or ≤3-line prose summary including key result/finding. No follow-up questions.\n"
+    "<!-- NS_HUB_GLOBAL_END -->\n"
+)
 
 _HUB_PROJECT_BLOCK_TEMPLATE = """\
 ## NS Hub — Project Config (auto-injected by hub init)
@@ -14267,11 +14298,20 @@ def _hub_init(proj_id=None, proj_dir=None):
 
 _HUB_HOOKS_DIR = Path(__file__).parent / "static" / "hooks"
 _HUB_SETTINGS_HOOKS = {
-    # Hub-owned PostToolUse hooks only — other event hooks removed (MCP 전환 완료)
+    # Hub-owned hooks — F2: expanded to 4 hooks for full busy/idle tracking
+    "PreToolUse": [
+        # F2: busy heartbeat on tool invocation
+        {"type": "command", "command": "python3 $HOME/.hub/static/hooks/northstar-pretool-busy.py", "async": True, "matcher": "Bash|Agent|Task|mcp__.*"},
+    ],
     "PostToolUse": [
         # M775: causality dataset — action-log + tool_trace + busy heartbeat (M1577)
-        {"type": "command", "command": "python3 $HOME/.hub/hooks/northstar-action-log.py", "async": True, "matcher": "Bash|Edit|Write|Read|Glob|Grep|WebFetch|WebSearch"},
-        # M770: skill invocation counted server-side in hub-mcp-server.py L436 (M1221) — hook removed
+        {"type": "command", "command": "python3 $HOME/.hub/static/hooks/northstar-action-log.py", "async": True, "matcher": "Bash|Edit|Write|Read|Glob|Grep|WebFetch|WebSearch"},
+        # NOTE: stone-ctx-hook.py is CTX-feature-specific — register manually when CTX is enabled.
+        # Do NOT add it here; hub install-global must not deploy it to all users.
+    ],
+    "Stop": [
+        # F2: idle signal when claude session ends
+        {"type": "command", "command": "python3 $HOME/.hub/static/hooks/northstar-stop-idle.py", "async": True},
     ],
 }
 
@@ -14307,6 +14347,26 @@ def _hub_deploy_hooks():
                 print(f"Skipped duplicate hook (basename match) {event}: {h['command']}")
     if changed:
         settings_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False))
+
+    # F1: register MCP server globally in ~/.claude/settings.json
+    mcp_script = Path(__file__).parent / "static" / "hooks" / "hub-mcp-server.py"
+    if mcp_script.exists():
+        try:
+            settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+        except Exception:
+            settings = {}
+        mcp_cfg = settings.setdefault("mcpServers", {})
+        if "ns-hub" not in mcp_cfg:
+            import sys as _sys
+            mcp_cfg["ns-hub"] = {
+                "type": "stdio",
+                "command": _sys.executable,
+                "args": [str(mcp_script), "--hub-url", "http://127.0.0.1:9001"],
+            }
+            settings_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False))
+            print(f"Registered MCP ns-hub in {settings_path}")
+        else:
+            print("MCP ns-hub already registered — skipping.")
 
 _SYSTEMD_UNIT_TEMPLATE = """\
 [Unit]
@@ -14370,14 +14430,100 @@ def _hub_generate_systemd_unit():
           f"&& systemctl --user enable --now hub' to activate.")
 
 
+def _hub_doctor():
+    """F9: Self-diagnostic command — checks all prerequisites for a working hub install.
+    Each check prints ✅/❌ + a one-line fix command on failure."""
+    import shutil as _sh
+    import urllib.request as _ur
+
+    checks = []
+
+    def chk(label, ok, fix=""):
+        mark = "✅" if ok else "❌"
+        line = f"  {mark}  {label}"
+        if not ok and fix:
+            line += f"\n       → {fix}"
+        checks.append((ok, line))
+        print(line)
+
+    print("\nhub doctor — NS Hub install diagnostics\n")
+
+    # Python version
+    import sys as _sys
+    py_ok = _sys.version_info >= (3, 10)
+    chk(f"Python ≥ 3.10  (found {_sys.version.split()[0]})", py_ok,
+        "upgrade Python: https://python.org/downloads")
+
+    # tmux
+    chk("tmux installed", bool(_sh.which("tmux")),
+        "sudo apt install tmux  # or brew install tmux")
+
+    # claude CLI
+    chk("claude CLI installed", bool(_sh.which("claude")),
+        "npm install -g @anthropic-ai/claude-code")
+
+    # ~/.config/hub/env
+    env_file = Path.home() / ".config" / "hub" / "env"
+    chk(f"~/.config/hub/env exists", env_file.exists(),
+        "hub install-global  # auto-creates this file")
+
+    # settings.json MCP
+    settings_path = Path.home() / ".claude" / "settings.json"
+    try:
+        _sd = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+    except Exception:
+        _sd = {}
+    chk("MCP ns-hub registered in ~/.claude/settings.json",
+        "ns-hub" in _sd.get("mcpServers", {}),
+        "hub install-global")
+
+    # core hooks (stone-ctx-hook.py excluded — CTX-feature-specific, not auto-deployed)
+    _core_hooks = ["northstar-pretool-busy.py", "northstar-stop-idle.py",
+                   "northstar-action-log.py"]
+    _all_hook_cmds = " ".join(
+        h.get("command", "")
+        for ev in _sd.get("hooks", {}).values()
+        for entry in ev
+        for h in entry.get("hooks", [entry])
+    )
+    for _hk in _core_hooks:
+        chk(f"Hook registered: {_hk}", _hk in _all_hook_cmds,
+            "hub install-global")
+
+    # hub server responding
+    try:
+        _r = _ur.urlopen("http://127.0.0.1:9001/api/hub/status", timeout=2)
+        hub_ok = _r.status == 200
+    except Exception:
+        hub_ok = False
+    chk("Hub server responding at http://127.0.0.1:9001", hub_ok,
+        "systemctl --user start hub  # or: hub (to start manually)")
+
+    failed = sum(1 for ok, _ in checks if not ok)
+    print(f"\n{'All checks passed ✅' if failed == 0 else f'{failed} check(s) failed — run the fix commands above.'}\n")
+
+
+def _hub_ensure_env_file():
+    """F5: Create ~/.config/hub/env with defaults if missing.
+    systemd EnvironmentFile= fails silently when file absent — prevents service start."""
+    env_dir = Path.home() / ".config" / "hub"
+    env_file = env_dir / "env"
+    if not env_file.exists():
+        env_dir.mkdir(parents=True, exist_ok=True)
+        env_file.write_text("HUB_HOST=127.0.0.1\nHUB_PORT=9001\n", encoding="utf-8")
+        print(f"Created {env_file} (HUB_HOST=127.0.0.1 HUB_PORT=9001)")
+    return env_file
+
+
 def _hub_install_global():
     """Write NS Hub global protocol block to ~/.claude/CLAUDE.md (once) and deploy hooks.
     M1694b: CTX (bm25-memory, chat-memory, vec-daemon, etc.) is a fully independent,
     separately-installed project — hub does NOT own, bundle, or deploy CTX hooks. The only
-    hub-owned hook here is northstar-action-log.py (tool_trace causality dataset collection,
-    _HUB_SETTINGS_HOOKS above). stone-ctx-hook.py (static/hooks/) is a hub-owned BRIDGE that
-    reads FROM an already-installed CTX, and remains hub's responsibility — but it does not
-    imply hub deploys or requires CTX itself."""
+    hub-owned hooks auto-deployed here are: northstar-pretool-busy.py, northstar-stop-idle.py,
+    northstar-action-log.py (tool_trace causality dataset collection, see _HUB_SETTINGS_HOOKS).
+    stone-ctx-hook.py lives in static/hooks/ but is CTX-feature-specific — NOT auto-deployed
+    by install-global. Users who enable CTX must register it manually."""
+    _hub_ensure_env_file()  # F5: must precede systemd unit gen (unit references this file)
     _hub_deploy_hooks()
     _hub_generate_systemd_unit()
     global_md = Path.home() / ".claude" / "CLAUDE.md"
@@ -15295,6 +15441,10 @@ def main():
         _hub_install_global()
         return
 
+    if args and args[0] == "doctor":
+        _hub_doctor()
+        return
+
     # M705: hub configure [--project PROJ] [--agent AGENT] [--model MODEL]
     if args and args[0] == "configure":
         _hub_configure(args[1:])
@@ -15336,6 +15486,13 @@ def main():
         _ver = "unknown"
     _consent_on = bool(_get_consent().get("data_collection", True))
     _tel_on = "ON (Turso, no PII)" if _consent_on and _TEL_ENABLED else "OFF"
+    # F3: detect first-run (MCP not registered) and show next-step guide
+    _settings_path = Path.home() / ".claude" / "settings.json"
+    try:
+        _settings_data = json.loads(_settings_path.read_text()) if _settings_path.exists() else {}
+    except Exception:
+        _settings_data = {}
+    _mcp_registered = "ns-hub" in _settings_data.get("mcpServers", {})
     _banner_lines = [
         "",
         f"  claude-ns-hub v{_ver}",
@@ -15348,8 +15505,19 @@ def main():
         f"   Opt-out:     POST /api/hub/consent  body {{\"data_collection\": false}}",
         f"   Quickstart:  https://github.com/pluto2060/claude-ns-hub#quick-start",
         f"  ──────────────────────────────────────────────",
-        "",
     ]
+    if not _mcp_registered:
+        _banner_lines += [
+            f"",
+            f"  ⚠  First-run setup required:",
+            f"     1) hub install-global          # register MCP + hooks in Claude Code",
+            f"     2) hub init <proj_id> --dir .  # register this project",
+            f"     3) Open Dashboard → create a Stone",
+            f"     Then restart Claude Code to pick up MCP.",
+            f"",
+        ]
+    else:
+        _banner_lines.append("")
     for _ln in _banner_lines:
         print(_ln)
     # M1345 P0: enable access_log so input → response correlation is measurable.

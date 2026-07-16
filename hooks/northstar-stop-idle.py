@@ -1,1 +1,0 @@
-../static/hooks/northstar-stop-idle.py

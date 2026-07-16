@@ -323,6 +323,7 @@ header {
 .ns-sess-detached  { background: #6b5ea8; color: #fff; }
 @keyframes sess-pulse { 0%,100%{opacity:1} 50%{opacity:.65} }
 @keyframes arc-spin { from { transform: rotate(-90deg); } to { transform: rotate(270deg); } }
+@keyframes cg-ring-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 @keyframes ns-blink { 0%,100%{opacity:.85;border-color:var(--accent)} 50%{opacity:.4;border-color:var(--accent-deep)} }
 /* M370: mascot feeding animations */
 @keyframes mascot-happy { 0%,100%{transform:scale(1) rotate(0deg)} 25%{transform:scale(1.3) rotate(-15deg)} 75%{transform:scale(1.3) rotate(15deg)} }
@@ -360,16 +361,18 @@ header {
 .detail-modal.loading::after {
   content: ""; position: absolute; inset: 0; z-index: 9000;
   background: rgba(26,25,22,.55); pointer-events: none;
-  display: flex; align-items: center; justify-content: center;
 }
-.detail-modal.loading::before {
-  content: "loading…"; position: absolute; top: 50%; left: 50%;
+/* M1877: loading pill — real DOM element (#dm-loading-pill) replaces ::before so a spinner ring can be inlined */
+#dm-loading-pill {
+  display: none; position: absolute; top: 50%; left: 50%;
   transform: translate(-50%,-50%); z-index: 9001;
+  align-items: center; gap: 10px;
   font-family: var(--mono); font-size: 12px; color: var(--accent);
   padding: 10px 18px; background: var(--panel); border: 1px solid var(--accent);
   border-radius: 6px; box-shadow: 0 4px 14px rgba(0,0,0,.35); letter-spacing: .08em;
   pointer-events: none;
 }
+.detail-modal.loading #dm-loading-pill { display: flex; }
 /* M260: tightened bar-wrap margin so the enlarged %/d-days row fits without growing the card. */
 .ns-node-bar-wrap { height: 3px; background: var(--panel-border); border-radius: 2px; overflow: hidden; margin-bottom: 2px; }
 .ns-node-bar { height: 100%; border-radius: 2px; }
@@ -582,7 +585,9 @@ header {
 .cg-card.cg-link-src,
 .cg-card.cg-link-src .cg-ring,
 /* M1831: arc-spin must also pause when tab hidden */
-.ns-node.exec-live .progress-arc-wrap svg { animation-play-state: var(--busy-anim-state, running) !important; }
+.ns-node.exec-live .progress-arc-wrap svg,
+/* M1859: CG ring spin pauses when tab hidden */
+.cg-card.cg-blink-q .cg-ring > svg { animation-play-state: var(--busy-anim-state, running) !important; }
 /* M1581: ms-running-highlight uses !important on animation shorthand — must match with !important */
 .nt-table tr.ms-running-highlight td { animation-play-state: var(--busy-anim-state, running) !important; }
 /* Stone content */
@@ -1226,24 +1231,24 @@ header {
   display: flex; align-items: center; gap: 8px; margin-bottom: 10px;
 }
 .dm-layer-icon {
-  width: 24px; height: 24px; border-radius: 50%; flex-shrink: 0;
+  width: 24px; height: 24px; border-radius: 6px; flex-shrink: 0;
   display: flex; align-items: center; justify-content: center;
-  font-size: 11px; font-weight: 600; border: 2px solid;
+  font-size: 11px; font-weight: 600;
 }
-.dm-layer-icon.ns    { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-deep); }
-.dm-layer-icon.okr   { background: var(--blue-soft, #e8f0fb); border-color: var(--blue, #2c6fad); color: var(--blue, #2c6fad); }
-.dm-layer-icon.ms    { background: var(--green-soft); border-color: var(--green); color: var(--green); }
-.dm-layer-icon.al    { background: rgba(120,120,140,.10); border-color: var(--text-dim); color: var(--text-dim); }
+.dm-layer-icon.ns    { background: var(--accent-soft); color: var(--accent-deep); }
+.dm-layer-icon.okr   { background: var(--blue-soft, #e8f0fb); color: var(--blue, #2c6fad); }
+.dm-layer-icon.ms    { background: var(--green-soft); color: var(--green); }
+.dm-layer-icon.al    { background: rgba(120,120,140,.10); color: var(--text-dim); }
 .dm-layer-title {
   font-size: 10px; font-family: var(--mono); text-transform: uppercase;
-  letter-spacing: .09em; color: var(--text-dim); font-weight: 600;
+  letter-spacing: .09em; color: var(--text); font-weight: 600;
 }
-/* M265: the NS metric "star sentence" reads as a sentence, not a section header —
-   drop the uppercase + dim styling, render in vivid accent for legibility. */
+/* M1851: goal text now matches milestone-pane header style — mono, uppercase.
+   M1863: color elevated to var(--text) per user preference (was var(--text-dim)). */
 .dm-layer-title[data-field="metric"] {
-  font-size: 13px; text-transform: none; letter-spacing: 0;
-  color: var(--accent); font-weight: 700;
-  font-family: var(--serif, system-ui);
+  font-size: 10px; text-transform: uppercase; letter-spacing: .09em;
+  color: var(--text); font-weight: 600;
+  font-family: var(--mono);
 }
 .dm-layer-count { font-size: 10px; font-family: var(--mono); color: var(--text-dim); margin-left: auto; }
 .dm-sync-btn {
@@ -1590,8 +1595,8 @@ header {
    for a main circle radius R and inner circle radius r placed along the diagonal, the inner
    circle stays fully inside iff center-distance d = R-r (touches at exactly one point, no
    overflow). M1779: all inner avatars +25%, geometric ratio k=1.44 maintained (72:50:35).
-   R_eff=35 (72px ring -1px shadow), r2=25 (50px) → d=10 → offset 3.93px from ring edge;
-   r3=17.5 (35px = 50/1.44) inside r2=25 (50px) → d=7.5 → offset 2.20px from 2nd corner.
+   Unified formula: offset = container_size - r_child - container_r - (R_eff - r_child)/√2, R_eff = R-1 (1px shadow).
+   1:2 R_eff=35, r=25, d=10 → 3.93px; 2:3 R_eff=24, r=17.5, d=6.5 → 2.90px; 3:4 R_eff=16.5, r=12, d=4.5 → 2.32px.
    State conveyed by opacity (matches the main avatar's own running=1/idle=0.3 convention). */
 .ns-sess-avatars { position:absolute; inset:0; z-index:5; pointer-events:none; }
 .ns-sess-mini-wrap { position:absolute; bottom:3.93px; right:3.93px; width:50px; height:50px; }
@@ -1601,9 +1606,10 @@ header {
    ring (rgba(255,255,255,.85)) which contrasts against both light AND dark avatar content,
    plus a darker outer shadow ring for separation against light backgrounds too. */
 .ns-sess-mini-avatar { position:absolute; inset:0; width:100%; height:100%; border-radius:50%; object-fit:cover; border:2px solid rgba(255,255,255,.85); box-shadow:0 0 0 1px rgba(0,0,0,.6), 0 1px 4px rgba(0,0,0,.5); background:var(--bg-deep); }
-.ns-sess-mini-avatar.ns-sess-nested { inset:auto; bottom:2.20px; right:2.20px; width:35px; height:35px; border-width:1.5px; box-shadow:0 0 0 1px rgba(0,0,0,.6), 0 1px 2px rgba(0,0,0,.5); }
-/* M1838: 4th session avatar, r4=12 (24px), nested inside 3rd (35px). d=r3-r4=5.5 → offset=2.20px identical to 3rd level (same internal-tangent formula). */
-.ns-sess-mini-avatar.ns-sess-deep-nested { inset:auto; bottom:2.20px; right:2.20px; width:24px; height:24px; border-width:1px; box-shadow:0 0 0 1px rgba(0,0,0,.6), 0 1px 2px rgba(0,0,0,.5); }
+.ns-sess-mini-avatar.ns-sess-nested { inset:auto; bottom:2.90px; right:2.90px; width:35px; height:35px; border-width:1.5px; box-shadow:0 0 0 1px rgba(0,0,0,.6), 0 1px 2px rgba(0,0,0,.5); }
+/* M1838/M1858: 4th session avatar. M1868b: 24px restored (ratio k=1.43 maintained: 35/1.43≈24.5→24px).
+   R_eff=16.5, r=12, d=4.5 → offset=2.32px. */
+.ns-sess-mini-avatar.ns-sess-deep-nested { inset:auto; bottom:2.32px; right:2.32px; width:24px; height:24px; border-width:1px; box-shadow:0 0 0 1px rgba(0,0,0,.6), 0 1px 2px rgba(0,0,0,.5); }
 /* M1729: mirrors .avatar-ring.status-active (border=accent + sess-pulse) for running child sessions */
 .ns-sess-mini-avatar.ns-sess-mini-active { border-color:var(--accent); animation:sess-pulse 3s ease-in-out infinite; }
 .ns-sess-mini-fallback { display:flex; align-items:center; justify-content:center; font-family:var(--mono); font-size:11px; font-weight:700; color:var(--text-dim); }
@@ -1853,14 +1859,15 @@ header {
   <div class="detail-modal" id="detail-modal">
     <!-- M285: loading spinner overlay for stone operations -->
     <div class="dm-op-overlay" id="dm-op-overlay"><div class="dm-op-spinner"></div></div>
+    <!-- M1877: dispatch/kill/open loading pill with spinner ring -->
+    <div id="dm-loading-pill"><div class="dm-op-spinner" style="width:14px;height:14px;border-width:2px"></div><span>loading…</span></div>
 
     <!-- Header -->
     <div class="dm-header">
       <div style="flex:1;min-width:0">
-        <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;min-width:0">
-          <span class="dm-title" id="dm-title">—</span>
-          <div id="dm-header-stats" style="display:flex;align-items:center;gap:5px;font-family:var(--mono);font-size:10px;flex-wrap:wrap;flex-shrink:0"></div>
-        </div>
+        <span class="dm-title" id="dm-title">—</span>
+        <!-- M1870: stats above dir path, font size 11px -->
+        <div id="dm-header-stats" style="display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11px;flex-wrap:wrap;margin-top:3px"></div>
         <div id="dm-proj-dir" title="Click to edit project directory path" onclick="_editProjPath(window._openDetailProjId)" style="font-family:var(--mono);font-size:9px;color:var(--text);margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer;opacity:.55"></div>
       </div>
       <!-- M294: status pill removed (showed "paused" etc. — cluttered header) -->
@@ -2934,6 +2941,21 @@ function renderMilestoneCreator(projId, milestones) {
   // M452: don't overwrite status for stones with in-flight PATCH (race guard)
   if (_patchInFlight.size > 0) {
     milestones.forEach(m => { if (_patchInFlight.has(m.id)) m.status = _patchInFlight.get(m.id); });
+  }
+  // M1862: capture restore target for server-side auto-queued stones (e.g. user reply auto-requeue).
+  // When poll sees a stone flip to 'queued' but no _preQueueStatus entry exists (server set it,
+  // not the user toggle), record the previous cached status so cancel can restore correctly.
+  if (_msCacheByProject[projId]) {
+    const _prevCache = _msCacheByProject[projId];
+    milestones.forEach(m => {
+      if (m.status === 'queued' && !_preQueueStatus.has(m.id) && !_patchInFlight.has(m.id)) {
+        const _prev = _prevCache.find(p => p.id === m.id);
+        if (_prev && _prev.status && _prev.status !== 'queued' && _prev.status !== 'done') {
+          _preQueueStatus.set(m.id, _prev.status);
+          _persistPreQueueStatus();
+        }
+      }
+    });
   }
   _msCacheByProject[projId] = milestones;
   // M649: MoSCoW backfill removed — badge display removed
@@ -4038,11 +4060,12 @@ function renderMilestoneCreator(projId, milestones) {
     // Status chip for col 3: uses stone status color
     const _statusChipColor = {queued:'var(--accent)',pending_confirmation:'var(--green)',done:'var(--text-dim)',needs_clarification:'#7b9fd4'}[m.status||'']||'var(--text-dim)';
     const _statusLabel = {queued:'Q',pending_confirmation:'C',done:'✓',needs_clarification:'?'}[m.status||'']||'·';
+    const _statusTooltip = {queued:'Queued — waiting for Claude to pick up',pending_confirmation:'Completed — awaiting your review/confirmation',done:'Done — closed',needs_clarification:'Needs clarification — Claude is waiting for your input'}[m.status||'']||m.status||'';
     // 3 ext cells: tree | gap-bar | status+layer
     const extContents = [
       `<div style="display:flex;align-items:center;min-width:0">${_indent}${_parentLabel}</div>`,
       _gapBar,
-      `<div style="display:flex;flex-direction:column;align-items:center;gap:1px"><span style="font-size:9px;font-weight:700;color:${_statusChipColor}">${_statusLabel}</span><span style="font-size:7px;font-family:var(--mono);color:var(--text-dim)">L${layer}</span></div>`,
+      `<div title="${_statusTooltip}" style="display:flex;flex-direction:column;align-items:center;gap:1px;cursor:help"><span style="font-size:9px;font-weight:700;color:${_statusChipColor}">${_statusLabel}</span><span style="font-size:7px;font-family:var(--mono);color:var(--text-dim)">L${layer}</span></div>`,
     ];
     if (!tr.querySelector('.ms-td-ext')) {
       const first = tr.firstChild;
@@ -4605,7 +4628,7 @@ function _pasteChipHtml(raw) {
   const lines = raw.split('\n').length;
   return `<span class="nt-paste-chip" contenteditable="false" data-full="${enc}" `
     + `title="Click to expand pasted text" `
-    + `onclick="event.stopPropagation();(async()=>{if(await _hubConfirm('Expand pasted text inline? (${lines} lines, ${raw.length} chars)')){const t=document.createTextNode(this.dataset.full||'');this.replaceWith(t);}})()"`
+    + `onclick="event.stopPropagation();(async()=>{if(await _hubConfirm('Expand pasted text inline? (${lines} lines, ${raw.length} chars)')){const sp=document.createElement('span');sp.innerHTML=_renderNtTextHtml(this.dataset.full||'');this.replaceWith(sp);}})()"`
     + `>[Pasted text +${lines} lines, ${raw.length} chars]</span>`;
 }
 function _previewFile(url, fname, isImg, isVideo) {
@@ -4719,7 +4742,16 @@ function _applyInlineMarkdown(html) {
     }
     out.push(lines[i]); i++;
   }
-  html = out.join('<br>');
+  // M1884: don't insert <br> when the current or next item is a block element — it already
+  // provides its own spacing via margin, and a <br> after </ul>/<div>/<table>/<pre> renders
+  // as an extra blank line making double-newlines appear between sections.
+  const _isBlock = s => /^<(?:ul|ol|div|table|pre)[\s>]/i.test(s.trim()) || /^<\/(?:ul|ol|div|table|pre)>/i.test(s.trim());
+  html = out.map((item, idx) => {
+    if (idx === out.length - 1) return item;
+    const next = out[idx + 1];
+    if (_isBlock(item) || _isBlock(next)) return item;
+    return item + '<br>';
+  }).join('');
   // 3) Inline code — protect before bold/italic so `*` inside code isn't treated as emphasis.
   const inlineCodes = [];
   html = html.replace(/`([^`<]+?)`/g, (_, code) => { inlineCodes.push(code); return `${_IC}${inlineCodes.length - 1}${_IC}`; });
@@ -4750,15 +4782,25 @@ function _renderNtTextHtml(text) {
   // Render typed text inline; only PUA-sentinel (...) segments collapse into chips.
   text = text || '';
   if (text.indexOf(_PASTE_OPEN) === -1) {
-    // M315: render newlines as <br> so multi-line stone text is preserved on reopen
-    return esc(text).replace(/\n/g, '<br>');
+    // M315: render newlines as <br>.
+    // M1849: also normalize literal \n (0x5c 0x6e) for already-stored entries where Claude Code
+    // MCP emitted backslash-n escape sequences instead of real newlines (LLM generation artifact).
+    // M1855: auto-break before Unicode circled/enclosed numbers (①-⑳, ❶-❿, ⓪-⑳) when mid-text
+    // so Claude responses with ①②③ markers render one item per line without explicit newlines.
+    return esc(text)
+      .replace(/\n/g, '<br>')
+      .replace(/\\n/g, '<br>')
+      .replace(/(?<=[^\s<>])\s*([①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳❶❷❸❹❺❻❼❽❾❿])/g, '<br>$1');
   }
+  // M1855: shared inline-text escape+transform (same rules as no-PASTE path above)
+  const _escInline = s => esc(s).replace(/\n/g,'<br>').replace(/\\n/g,'<br>')
+    .replace(/(?<=[^\s<>])\s*([①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳❶❷❸❹❺❻❼❽❾❿])/g,'<br>$1');
   let out = '';
   let i = 0;
   while (i < text.length) {
     const open = text.indexOf(_PASTE_OPEN, i);
-    if (open === -1) { out += esc(text.slice(i)); break; }
-    if (open > i) out += esc(text.slice(i, open));
+    if (open === -1) { out += _escInline(text.slice(i)); break; }
+    if (open > i) out += _escInline(text.slice(i, open));
     const bodyStart = open + _PASTE_OPEN.length;
     const close = text.indexOf(_PASTE_CLOSE, bodyStart);
     // M327: if close marker missing, treat all remaining text as pasted content (chip it, don't dump raw)
@@ -5307,13 +5349,20 @@ function _msQueueBtnHtml(projId, mid, status) {
   const ttl = isQueued
     ? 'Queued — click to take it back to pending (claude will skip it)'
     : 'Click to queue this stone — only then will claude work on it';
-  // M1515 v3: restore to pre-queue status on cancel.
-  // Order of fallback: captured _preQueueStatus → infer from claude_ack (PC if acked) → 'pending'.
+  // M1515 v3 / M1862: restore to pre-queue status on cancel.
+  // Order of fallback: captured _preQueueStatus → infer from cache → 'pending'.
   let _restoreStatus = _preQueueStatus.get(mid);
   if (!_restoreStatus && isQueued) {
-    // Infer: stone has been ack'd by Claude AND not currently in queue → likely was pending_confirmation
     const _cachedM = _msCacheByProject[projId]?.find(m => m.id === mid);
-    if (_cachedM?.claude_ack) _restoreStatus = 'pending_confirmation';
+    if (_cachedM) {
+      if (_cachedM.claude_ack) {
+        // Stone was acked by Claude → was pending_confirmation before queue
+        _restoreStatus = 'pending_confirmation';
+      } else if ((_cachedM.conversation || []).length > 0) {
+        // Stone has messages but not yet acked → server auto-queued from pending_confirmation on user reply
+        _restoreStatus = 'pending_confirmation';
+      }
+    }
   }
   const nextStatus = isQueued ? (_restoreStatus || 'pending') : 'queued';
   return `<button class="nt-queue" title="${ttl}"
@@ -7728,13 +7777,12 @@ async function refreshSessionStatus() {
       else if (!newExec[s.proj_id]) newExec[s.proj_id] = 'idle';
       // M1824: first non-empty model wins (no mother priority — all sessions are peers).
       if (!window._execModel[s.proj_id]) window._execModel[s.proj_id] = s.model || '';
-      (window._execSessionList[s.proj_id] = window._execSessionList[s.proj_id] || []).push({idle: s.idle, model: s.model||'', session: s.session||'', live_session_id: s.live_session_id||'', isMother: false, created: s.created||''});
+      (window._execSessionList[s.proj_id] = window._execSessionList[s.proj_id] || []).push({idle: s.idle, model: s.model||'', session: s.session||'', live_session_id: s.live_session_id||'', isMother: false, created: s.created||'', created_ts: s.created_ts||0, activity: s.activity||0});
     }
     for (const pid of Object.keys(window._execSessionList)) {
-      // M1827: sort by created ASC so the oldest (first-spawned) session is always [0] → stable main avatar.
-      // API return order varies per poll; without sort, a newer busy session could land at [0]
-      // and make the main avatar show busy even when the oldest session is idle (race condition).
-      window._execSessionList[pid].sort((a, b) => (a.created > b.created ? 1 : a.created < b.created ? -1 : 0));
+      // M1881: sort by session name ASC — matches tmux list-sessions alphabetical order,
+      // which is exactly the exec-pane row order. Avatar #N = exec-pane row #N.
+      window._execSessionList[pid].sort((a, b) => a.session < b.session ? -1 : a.session > b.session ? 1 : 0);
     }
     // Clear model for projects whose exec session ended
     for (const pid of Object.keys(window._execModel)) {
@@ -8079,7 +8127,7 @@ function nodeCard(p, idx) {
     ${stageBadge}
     <div style="position:relative;width:72px;height:72px;flex-shrink:0">
       <!-- M991: drag handle = avatar ring only -->
-      <div class="avatar-ring ${_statusCls}" draggable="true" style="cursor:grab" title="Drag to reorder">${_avatarHtml}${_execKey === 'running' ? '<div class="live-dot"></div>' : ''}</div>
+      <div class="avatar-ring ${_statusCls}" draggable="true" style="cursor:grab" title="Drag to reorder">${_avatarHtml}</div>
       ${_arcL0All.length ? `<div class="progress-arc-wrap"><svg width="116" height="116" viewBox="0 0 116 116">${_rings}</svg></div>` : ''}
       ${_sessAvatarStackHtml}
       <div class="ring-badges">
@@ -11140,7 +11188,7 @@ async function _sbAdjAdd() {
   _sbAdjRender(m._adjList);
 }
 async function _sbAdjDelete(adj) {
-  if (!(await _hubConfirm(`"${adj}" 형용사를 삭제하시겠습니까?`))) return;
+  if (!(await _hubConfirm(`Delete adjective "${adj}"?`))) return;
   const m = document.getElementById('skill-badge-modal');
   if (!m) return;
   if (!m._adjList) m._adjList = _SB_ADJ_DEFAULTS.slice();
@@ -11224,7 +11272,7 @@ async function _dpAdjAdd() {
   _dpAdjRender();
 }
 async function _dpAdjDelete(adj) {
-  if (!(await _hubConfirm(`"${adj}" 형용사를 삭제하시겠습니까?`))) return;
+  if (!(await _hubConfirm(`Delete adjective "${adj}"?`))) return;
   if (!window._dpAdjList) window._dpAdjList = _SB_ADJ_DEFAULTS.slice();
   window._dpAdjList = window._dpAdjList.filter(a => a !== adj);
   window._dpAdjSelected = (window._dpAdjSelected || []).filter(a => a !== adj);
@@ -12345,18 +12393,19 @@ async function openDetail(idx) {
     const _pctVal = _msTotal ? Math.round(_msPc/_msTotal*100) : 0;
     const _dl = p.deadline ? deadlineBadge(p.deadline) : null;
     const _age = p.proj_started_ts ? Math.floor((Date.now()/1000-p.proj_started_ts)/86400) : null;
-    const _dot = `<span style="opacity:.25;margin:0 3px;font-size:10px">·</span>`;
+    // M1870: stats font size 11px (moved below dir path)
+    const _dot = `<span style="opacity:.25;margin:0 4px;font-size:11px">·</span>`;
     let _parts = [];
-    if (_age !== null) _parts.push(`<span style="color:var(--text-soft);font-size:10px;font-weight:500">D+${_age}</span>`);
+    if (_age !== null) _parts.push(`<span style="color:var(--text-soft);font-size:11px;font-weight:500">D+${_age}</span>`);
     // M1328v3: embed input inside label — browser opens picker at label's DOM position
     // onclick calls showPicker() on the embedded input; input stays at label coords
     const _dlInputId = 'dm-deadline-input';
     // M1335: mobile fix — label[for] + no pointer-events:none; browser natively opens date picker on label tap
     const _dlInputHtml = `<input type="date" id="${_dlInputId}" value="${esc(p.deadline||'')}" style="position:absolute;left:0;top:0;opacity:0;width:100%;height:100%;border:none;padding:0;margin:0;cursor:pointer;z-index:1" onchange="saveDeadline('${esc(p.id||p.name)}',this.value)">`;
-    if (_dl) _parts.push(`<label for="${_dlInputId}" style="position:relative;display:inline-flex;align-items:center;cursor:pointer;color:${_dl.color};font-size:10px;font-weight:600" title="Tap to change deadline">${esc(_dl.text)}${_dlInputHtml}</label>`);
-    else _parts.push(`<label for="${_dlInputId}" style="position:relative;display:inline-flex;align-items:center;cursor:pointer;color:var(--text-dim);font-size:10px" title="Tap to set deadline">+ deadline${_dlInputHtml}</label>`);
-    _parts.push(`<span style="color:var(--text-soft);font-size:10px;font-weight:500">${_msPc}/${_msTotal}</span>`);
-    _hdrStats.style.cssText = 'display:flex;align-items:center;gap:2px;font-family:var(--mono);flex-wrap:wrap';
+    if (_dl) _parts.push(`<label for="${_dlInputId}" style="position:relative;display:inline-flex;align-items:center;cursor:pointer;color:${_dl.color};font-size:11px;font-weight:600" title="Tap to change deadline">${esc(_dl.text)}${_dlInputHtml}</label>`);
+    else _parts.push(`<label for="${_dlInputId}" style="position:relative;display:inline-flex;align-items:center;cursor:pointer;color:var(--text-dim);font-size:11px" title="Tap to set deadline">+ deadline${_dlInputHtml}</label>`);
+    _parts.push(`<span style="color:var(--text-soft);font-size:11px;font-weight:500">${_msPc}/${_msTotal}</span>`);
+    _hdrStats.style.cssText = 'display:flex;align-items:center;gap:2px;font-family:var(--mono);flex-wrap:wrap;margin-top:3px;font-size:11px';
     _hdrStats.innerHTML = _parts.join(_dot);
   }
 
@@ -12399,7 +12448,8 @@ async function openDetail(idx) {
   // resolves so exec pane is fully populated before user sees the card. _refreshExecState
   // will clear modal.loading itself on first successful fetch (see L13130 onwards).
   // If exec fetch is slow or fails, fail-safe timeout drops it after 5s.
-  setTimeout(() => { if (modal && modal.classList.contains('loading')) { modal.classList.remove('loading'); delete modal.dataset.loadingOwner; } }, 5000);
+  // M1812e: only clear if owner is still 'open' — don't wipe 'kill'/'dispatch'/'tmux' owners set after openDetail.
+  setTimeout(() => { if (modal && modal.classList.contains('loading') && modal.dataset.loadingOwner === 'open') { modal.classList.remove('loading'); delete modal.dataset.loadingOwner; } }, 5000);
 
   // M137: abort if another project was opened while we were waiting
   if (_activeDetailProjId !== myProjId) return;
@@ -12628,6 +12678,8 @@ function _refreshCommentThread(mid) {
     return null;
   })();
   if (thread.length) {
+    // M1871: date divider — track last rendered date to inject dividers on day change
+    let _lastDateKey = null;
     const html = `<div id="comment-thread" style="margin:7px 0 0">` +
       thread.map(msg => {
         if (msg.role === 'summary') {
@@ -12653,9 +12705,16 @@ function _refreshCommentThread(mid) {
           ...(msg.skill_refs||[msg.skill_ref]).filter(Boolean).map(s=>`<span style="font-size:8px;padding:1px 4px;border-radius:2px;background:rgba(123,159,212,.12);color:var(--accent);margin-left:3px">⚡${esc(s)}</span>`),
           ...(msg.agent_refs||[msg.agent_ref]).filter(Boolean).map(a=>`<span style="font-size:8px;padding:1px 4px;border-radius:2px;background:rgba(61,139,94,.12);color:var(--green,#3d8b5e);margin-left:3px">🤖${esc(a)}</span>`),
         ].join('');
-        return `<div style="margin-bottom:6px">
+        // M1871: date divider injection
+        const _dk = _fmtDateKey(msg.ts);
+        let _divider = '';
+        if (_dk && _dk !== _lastDateKey) {
+          _divider = `<div style="display:flex;align-items:center;gap:6px;margin:8px 0 6px"><div style="flex:1;height:1px;background:var(--text-dim)"></div><span style="font-size:9px;font-family:var(--mono);color:var(--text-soft);white-space:nowrap;font-weight:600;letter-spacing:.04em">${_fmtDateLabel(msg.ts)}</span><div style="flex:1;height:1px;background:var(--text-dim)"></div></div>`;
+          _lastDateKey = _dk;
+        }
+        return _divider + `<div style="margin-bottom:6px">
           <div style="font-size:9px;color:${msg.role==='user'?'var(--text-dim)':'var(--accent)'}">
-            ${msg.role==='user'?'you':'claude'} · ${(msg.ts||'').slice(11,16)}${skillTag}</div>
+            ${msg.role==='user'?'you':'claude'} · ${_fmtTs(msg.ts)}${skillTag}</div>
           <div style="font-size:11px;color:var(--text);margin-top:1px">${_applyInlineMarkdown(_renderNtTextHtml(msg.text))}</div>
         </div>`;
       }).join('') + `</div>`;
@@ -12689,8 +12748,9 @@ function _closeCommentPopupNow() {
     if (_cur.length) sessionStorage.setItem(_pendingKey, JSON.stringify(_cur));
     else sessionStorage.removeItem(_pendingKey);
   }
-  // M1822: clean up drag-origin tracker before removing popup
-  document.getElementById('comment-popup')?._cleanupDragTracker?.();
+  // M1822/M1850: clean up all document-level listeners before removing popup so stale
+  // closures from a prior toggle-close don't fire against the next popup and close it.
+  document.getElementById('comment-popup')?._cleanupAllListeners?.();
   document.getElementById('comment-popup')?.remove();
   window._commentPendingAttachments = []; // M1708: clear in-memory state — next open restores from sessionStorage instead of carrying stale refs across different stones
   _openCommentMid = null;
@@ -12821,6 +12881,8 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
   function buildThreadHtml() {
     const thread = _msConversations[mid] || [];
     if (!thread.length) return '';
+    // M1871: date divider tracking
+    let _lastDK = null;
     return `<div id="comment-thread" style="margin:7px 0 0">` +
       thread.map(msg => {
         if (msg.role === 'summary') {
@@ -12846,9 +12908,16 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
           ...(msg.skill_refs||[msg.skill_ref]).filter(Boolean).map(s=>`<span style="font-size:8px;padding:1px 4px;border-radius:2px;background:rgba(123,159,212,.12);color:var(--accent);margin-left:3px">⚡${esc(s)}</span>`),
           ...(msg.agent_refs||[msg.agent_ref]).filter(Boolean).map(a=>`<span style="font-size:8px;padding:1px 4px;border-radius:2px;background:rgba(61,139,94,.12);color:var(--green,#3d8b5e);margin-left:3px">🤖${esc(a)}</span>`),
         ].join('');
-        return `<div style="margin-bottom:6px">
+        // M1871: date divider
+        const _dk = _fmtDateKey(msg.ts);
+        let _div = '';
+        if (_dk && _dk !== _lastDK) {
+          _div = `<div style="display:flex;align-items:center;gap:6px;margin:8px 0 6px"><div style="flex:1;height:1px;background:var(--text-dim)"></div><span style="font-size:9px;font-family:var(--mono);color:var(--text-soft);white-space:nowrap;font-weight:600;letter-spacing:.04em">${_fmtDateLabel(msg.ts)}</span><div style="flex:1;height:1px;background:var(--text-dim)"></div></div>`;
+          _lastDK = _dk;
+        }
+        return _div + `<div style="margin-bottom:6px">
           <div style="font-size:9px;color:${msg.role==='user'?'var(--text-dim)':'var(--accent)'}">
-            ${msg.role==='user'?'you':'claude'} · ${(msg.ts||'').slice(11,16)}${skillTag}</div>
+            ${msg.role==='user'?'you':'claude'} · ${_fmtTs(msg.ts)}${skillTag}</div>
           <div style="font-size:11px;color:var(--text);margin-top:1px">${_applyInlineMarkdown(_renderNtTextHtml(msg.text))}</div>
         </div>`;
       }).join('') + `</div>`;
@@ -12892,7 +12961,7 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
         </label>
         <!-- M987: verify (3rd) -->
         <button id="comment-verify-chip" onclick="event.stopPropagation();_toggleCommentVerify('${esc(projId)}','${esc(mid)}',this)"
-          title="Toggle [검수] flag for this stone"
+          title="Toggle [verify] flag for this stone"
           style="flex-shrink:0;font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:3px;border:1px solid rgba(123,159,212,.4);background:rgba(123,159,212,.08);color:#7b9fd4;cursor:pointer">verify</button>
         <!-- M987: Send fills remaining space (4th) -->
         <button onclick="event.stopPropagation();_doCommentReply('${esc(projId)}','${esc(mid)}',document.getElementById('comment-reply-input'),'${esc(currentStatus||'')}')"
@@ -12938,8 +13007,9 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
       <div style="font-size:9px;color:var(--accent);letter-spacing:.05em">CLAUDE COMMENT</div>
       <button onclick="event.stopPropagation();_closeCommentPopupNow()"
         title="Close"
-        style="background:none;border:1px solid var(--panel-border);border-radius:4px;color:var(--text-dim);
-          cursor:pointer;font-family:var(--mono);font-size:12px;line-height:1;padding:1px 7px">×</button>
+        style="background:none;border:1px solid var(--text-soft,#9b8f84);border-radius:4px;color:var(--text);
+          cursor:pointer;font-family:var(--mono);font-size:13px;line-height:1;padding:1px 7px;opacity:.8"
+        onmouseenter="this.style.opacity='1'" onmouseleave="this.style.opacity='.8'">×</button>
     </div>
     <div style="overflow-y:auto;flex:1;padding:8px 13px 4px">
     <div style="color:var(--text-soft)">${esc(comment)}</div>
@@ -13015,46 +13085,106 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
       document.removeEventListener('click', _hComment);
       document.removeEventListener('touchstart', _hComment);
       document.removeEventListener('pointerdown', _trackPointerDown, { capture: true });
-      document.removeEventListener('pointerup',   _trackPointerUp,   { capture: true });
+      document.removeEventListener('mousedown',   _trackPointerDown, { capture: true });
+      document.removeEventListener('touchstart',  _trackPointerDown, { capture: true });
     }
   };
   document.addEventListener('keydown', _escClose);
-  // M1830: track pointer-down origin (capture phase so stopPropagation in children can't block it)
-  // and pointer-up target to distinguish intentional drag-select from outside-click.
-  // Prior M1822 approach used bubble-phase mousedown + click — failed when:
-  //   (a) child elements called stopPropagation on mousedown before _trackDragOrigin fired, or
-  //   (b) no click event fired after long drag (suppressed by browser), leaving flag stale.
-  // New approach: capture-phase pointerdown tracks origin; pointerup tracks where release landed;
-  // click handler checks BOTH — only close if release was also outside the popup.
-  let _pdInsidePopup = false;   // pointerdown started inside
-  let _puInsidePopup = false;   // pointerup ended inside
-  function _trackPointerDown(e) { _pdInsidePopup = popup.contains(e.target); }
-  function _trackPointerUp(e)   { _puInsidePopup = popup.contains(e.target); }
+  // M1842/M1847: track all down-phase events (pointerdown, mousedown, touchstart) in capture
+  // phase to detect drag-select. If ANY down event started inside the popup, the next click
+  // is treated as a drag-select — do NOT close regardless of where the release landed.
+  // Covers: desktop drag-select, mobile touch drag, and touch emulation flows where
+  // touchstart fires before pointerdown/mousedown.
+  let _pdInsidePopup = false;   // any down event started inside popup
+  function _trackPointerDown(e) { if (popup.contains(e.target)) _pdInsidePopup = true; }
   document.addEventListener('pointerdown', _trackPointerDown, { capture: true });
-  document.addEventListener('pointerup',   _trackPointerUp,   { capture: true });
-  popup._cleanupDragTracker = () => {
+  document.addEventListener('mousedown',   _trackPointerDown, { capture: true });
+  document.addEventListener('touchstart',  _trackPointerDown, { capture: true, passive: true });
+  // M1850: _cleanupAllListeners removes every document-level listener added by this popup
+  // (drag tracker + click-outside + ESC). Called by _closeCommentPopupNow so that a
+  // toggle-close followed by opening a new popup doesn't leave stale closures that see
+  // the detached old popup.contains() = false and immediately close the new popup.
+  popup._cleanupAllListeners = () => {
     document.removeEventListener('pointerdown', _trackPointerDown, { capture: true });
-    document.removeEventListener('pointerup',   _trackPointerUp,   { capture: true });
+    document.removeEventListener('mousedown',   _trackPointerDown, { capture: true });
+    document.removeEventListener('touchstart',  _trackPointerDown, { capture: true });
+    document.removeEventListener('click', _hComment);
+    document.removeEventListener('touchstart', _hComment);
+    document.removeEventListener('keydown', _escClose);
   };
+  popup._cleanupDragTracker = popup._cleanupAllListeners; // M1850: alias for legacy callers
   function _hComment(e) {
     // M258: skip close if skill/agent picker modal is open
     if (window._skillModalActive) return;
-    // M1830: if the pointer-down OR pointer-up was inside the popup, this is a drag-select
-    // ending outside — do not close. Reset flags so the NEXT genuine outside-click closes.
-    if (_pdInsidePopup || _puInsidePopup) { _pdInsidePopup = false; _puInsidePopup = false; return; }
+    // M1842: if the down event started inside the popup, this is a drag-select ending
+    // outside — do not close. Reset so the NEXT genuine outside-click closes.
+    if (_pdInsidePopup) { _pdInsidePopup = false; return; }
     if (!popup.contains(e.target)) {
       _closeCommentPopupNow(); // M1740: use canonical close so sessionStorage is saved
       document.removeEventListener('click', _hComment);
       document.removeEventListener('touchstart', _hComment);
       document.removeEventListener('keydown', _escClose);
       document.removeEventListener('pointerdown', _trackPointerDown, { capture: true });
-      document.removeEventListener('pointerup',   _trackPointerUp,   { capture: true });
+      document.removeEventListener('mousedown',   _trackPointerDown, { capture: true });
+      document.removeEventListener('touchstart',  _trackPointerDown, { capture: true });
     }
   }
   setTimeout(() => {
     document.addEventListener('click', _hComment);
     document.addEventListener('touchstart', _hComment, {passive: true});
   }, 100);
+  // M1874: resize handle — desktop only
+  if (!isMob) {
+    const _rh = document.createElement('div');
+    _rh.style.cssText = 'position:absolute;bottom:0;right:0;width:16px;height:16px;cursor:se-resize;z-index:1;display:flex;align-items:flex-end;justify-content:flex-end;padding:2px;box-sizing:border-box;opacity:.35;transition:opacity .15s';
+    _rh.innerHTML = '<svg width="10" height="10" viewBox="0 0 10 10" fill="none"><line x1="9" y1="1" x2="1" y2="9" stroke="currentColor" stroke-width="1.5"/><line x1="9" y1="5" x2="5" y2="9" stroke="currentColor" stroke-width="1.5"/></svg>';
+    _rh.addEventListener('mouseenter', () => { _rh.style.opacity = '1'; });
+    _rh.addEventListener('mouseleave', () => { if (!_resizing) _rh.style.opacity = '.35'; });
+    // M1874-fix4: stable resize — pin explicit px size on mousedown (no visual change since
+    // px value matches current constrained size), then remove max-constraints so drag is free.
+    // No lazy-init needed: explicit width/height on a fixed-size popup is a no-op visually.
+    let _resizing = false, _rx0, _ry0, _rw0, _rh0, _dragOverlay = null;
+    function _cleanupResize() {
+      _resizing = false;
+      _rh.style.opacity = '.35';
+      if (_dragOverlay) { _dragOverlay.remove(); _dragOverlay = null; }
+      document.body.style.userSelect = '';
+      document.removeEventListener('mousemove', _onResizeMove);
+      document.removeEventListener('mouseup', _onResizeUp);
+    }
+    function _onResizeMove(e) {
+      const dw = e.clientX - _rx0, dh = e.clientY - _ry0;
+      popup.style.width  = Math.max(200, _rw0 + dw) + 'px';
+      popup.style.height = Math.max(120, _rh0 + dh) + 'px';
+    }
+    function _onResizeUp() { _cleanupResize(); }
+    _rh.addEventListener('mousedown', (e) => {
+      e.stopPropagation(); e.preventDefault();
+      _resizing = true;
+      // Capture current rendered size first (while constraints are still active)
+      const r = popup.getBoundingClientRect();
+      _rw0 = r.width; _rh0 = r.height;
+      // Pin explicit px — visually identical to current constrained size
+      popup.style.width = _rw0 + 'px'; popup.style.height = _rh0 + 'px';
+      // Now safe to remove constraints (explicit px already wins, no reflow jump)
+      popup.style.maxWidth = 'none'; popup.style.maxHeight = 'none';
+      _rx0 = e.clientX; _ry0 = e.clientY;
+      // Full-viewport overlay: consistent se-resize cursor + swallows pointer events
+      // from all elements under the mouse (scroll area, buttons, etc.)
+      _dragOverlay = document.createElement('div');
+      _dragOverlay.style.cssText = 'position:fixed;inset:0;z-index:99999;cursor:se-resize';
+      document.body.appendChild(_dragOverlay);
+      document.body.style.userSelect = 'none';
+      document.addEventListener('mousemove', _onResizeMove);
+      document.addEventListener('mouseup', _onResizeUp);
+    });
+    popup.style.position = 'fixed'; // ensure containing block is viewport
+    popup.appendChild(_rh);
+    // Register cleanup so listeners die with the popup
+    const _origCleanup = popup._cleanupAllListeners;
+    popup._cleanupAllListeners = () => { _origCleanup?.(); _cleanupResize(); };
+    popup._cleanupDragTracker = popup._cleanupAllListeners;
+  }
 }
 // M1732: extracted from showCommentPopup so the SSE-driven live refresh path
 // (_refreshCommentThread) can also re-evaluate the badge — previously this only ran once at
@@ -13119,7 +13249,7 @@ function _updateSummaryBadge(mid) {
           _badge.textContent='∑ '+(_cnt||_llmSum.length); _badge.style.display='inline';
           _badge.style.background=''; _badge.style.borderColor=''; _badge.style.color='';
           _badge.title='LLM receives compressed view — '+(_cnt||'?')+' turns summarized. Click to show.';
-          if (_detail) { _detail.innerHTML=_llmSum.map(s=>`<div style="margin-bottom:4px"><span style="font-size:8px;color:var(--text-dim)">∑ ${s.compressed_count||'?'} turns · ${(s.ts||'').slice(11,16)}</span><br>${_renderNtTextHtml(s.text||'')}</div>`).join('<hr style="border:none;border-top:1px solid var(--panel-border);margin:4px 0">'); }
+          if (_detail) { _detail.innerHTML=_llmSum.map(s=>`<div style="margin-bottom:4px"><span style="font-size:8px;color:var(--text-dim)">∑ ${s.compressed_count||'?'} turns · ${_fmtTs(s.ts)}</span><br>${_renderNtTextHtml(s.text||'')}</div>`).join('<hr style="border:none;border-top:1px solid var(--panel-border);margin:4px 0">'); }
         } else { _badge.style.display='none'; if (_detail) _detail.style.display='none'; }
       }
     }
@@ -13295,7 +13425,7 @@ async function _doCommentReply(projId, mid, inputEl, currentStatus) {
       ...(entry.skill_refs||[entry.skill_ref]).filter(Boolean).map(s=>`<span style="font-size:8px;padding:1px 4px;border-radius:2px;background:rgba(123,159,212,.12);color:var(--accent);margin-left:3px">⚡${esc(s)}</span>`),
       ...(entry.agent_refs||[entry.agent_ref]).filter(Boolean).map(a=>`<span style="font-size:8px;padding:1px 4px;border-radius:2px;background:rgba(61,139,94,.12);color:var(--green,#3d8b5e);margin-left:3px">🤖${esc(a)}</span>`),
     ].join('');
-    msgDiv.innerHTML = `<div style="font-size:9px;color:var(--text-dim)">you · ${entry.ts.slice(11,16)}${_skillTags}</div>
+    msgDiv.innerHTML = `<div style="font-size:9px;color:var(--text-dim)">you · ${_fmtTs(entry.ts)}${_skillTags}</div>
       <div style="font-size:11px;color:var(--text);margin-top:1px">${_renderNtTextHtml(reply)}</div>`;
     threadEl.appendChild(msgDiv);
     // M465: scroll the actual scroll container (parent of threadArea), not inner threadEl
@@ -13379,7 +13509,7 @@ function showClarifyPopup(event, projId, mid, clarQ, clarA, hasAnswer) {
     ? `<div id="clarify-thread" style="margin:8px 0;border-top:1px solid var(--panel-border);padding-top:8px">` +
       thread.map(msg => `<div style="margin-bottom:6px">
         <div style="font-size:9px;color:${msg.role==='user'?'var(--text-dim)':'var(--accent)'}">
-          ${msg.role==='user'?'you':'claude'} · ${(msg.ts||'').slice(11,16)}</div>
+          ${msg.role==='user'?'you':'claude'} · ${_fmtTs(msg.ts)}</div>
         <div style="font-size:11px;color:var(--text);margin-top:1px">${esc(msg.text)}</div>
       </div>`).join('') + `</div>`
     : '';
@@ -13437,7 +13567,29 @@ async function killExecSession(explicitSession) {
   const _target = specificSession || `claude-exec-${projId}`;
   await fetch(`/api/northstar/${encodeURIComponent(projId)}/tmux-session/${encodeURIComponent(_target)}`, {method:'DELETE'}).catch(()=>{});
   if (output) { output.style.color = ''; output.style.fontWeight = ''; output.style.textAlign = ''; output.style.fontSize = '10px'; output.style.letterSpacing = ''; output.textContent = '(session ended)'; }
+  // M1812b / M1812c: show loading overlay during kill→pane-disappear gap.
+  // Store killed session name on the modal so _refreshExecState can gate clearing until
+  // the session actually disappears from the API response (not just on first poll).
+  const _dmKillModal = document.getElementById('detail-modal');
+  // M1812e: allow kill to override 'open' owner (was stuck on 'open', then cleared by openDetail's 5s timeout).
+  // Never override 'dispatch' or 'tmux' — those have their own lifecycle.
+  const _dmKillOwner = _dmKillModal && _dmKillModal.dataset.loadingOwner;
+  if (_dmKillModal && (!_dmKillOwner || _dmKillOwner === 'open')) {
+    _dmKillModal.classList.add('loading');
+    _dmKillModal.dataset.loadingOwner = 'kill';
+    _dmKillModal.dataset.killTarget = _target;
+    setTimeout(() => {
+      if (_dmKillModal.dataset.loadingOwner === 'kill') {
+        // Timeout fallback: clear spinner only. Exec pane state is poll-only (API truth source).
+        _dmKillModal.classList.remove('loading');
+        delete _dmKillModal.dataset.loadingOwner;
+        delete _dmKillModal.dataset.killTarget;
+      }
+    }, 5000);
+  }
   // M1118: clear assigned_session immediately in cache so sess badge disappears at once
+  // M1879: also clear _lwsCache so the next render re-fetches fresh last-worked-session
+  if (window._lwsCache && window._lwsCache[projId]) delete window._lwsCache[projId];
   const _stars1118 = _nsStarsCache[projId] || [];
   let _chg1118 = false;
   for (const ns of _stars1118) {
@@ -13537,10 +13689,19 @@ function startTmuxWatch(projId, tmuxSession) {
       if (output.textContent !== newText) {
         _noChangeCnt = 0; // M1757: output changed — reset to fast 2s polling
         const atBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 40;
+        const prevScrollTop = output.scrollTop;
+        const prevScrollHeight = output.scrollHeight;
         output.textContent = newText;
-        if (atBottom) output.scrollTop = output.scrollHeight;
-        // M1575: no prevScrollTop restore — browser preserves scrollTop on textContent write;
-        // restoring it explicitly breaks scroll momentum by forcing 0→prevScrollTop every poll.
+        if (atBottom) {
+          output.scrollTop = output.scrollHeight;
+        } else {
+          // M1836: textContent assignment resets scrollTop to 0 in all browsers (contrary to
+          // M1575 comment). Restore the user's scroll position anchored to the bottom delta:
+          // new content was appended to the end, so the visible content moved down by
+          // (newScrollHeight - prevScrollHeight). Anchor to bottom preserves user's view.
+          const delta = output.scrollHeight - prevScrollHeight;
+          output.scrollTop = prevScrollTop + delta;
+        }
       } else {
         _noChangeCnt++; // M1757: no change — step toward slower interval
       }
@@ -13863,9 +14024,21 @@ function renderRight(p) {
         // M1812: 'open' owner cleared here — exec-sessions (live session block) now rendered,
         // card is fully loaded. Previously cleared by _renderResumableSessions (session rows only),
         // causing overlay to drop before the live session adj block appeared.
+        // M1812c: 'kill' owner — hold spinner until the killed session is absent from API response.
         if (_dmModal && _dmModal.classList.contains('loading') && _dmOwner !== 'dispatch' && _dmOwner !== 'tmux') {
-          _dmModal.classList.remove('loading');
-          delete _dmModal.dataset.loadingOwner;
+          if (_dmOwner === 'kill') {
+            const _killTgt = _dmModal.dataset.killTarget || '';
+            const _stillAlive = (d.sessions||[]).some(s => s.session === _killTgt);
+            if (!_stillAlive) {
+              _dmModal.classList.remove('loading');
+              delete _dmModal.dataset.loadingOwner;
+              delete _dmModal.dataset.killTarget;
+            }
+            // else: keep spinner — session still present in API response
+          } else {
+            _dmModal.classList.remove('loading');
+            delete _dmModal.dataset.loadingOwner;
+          }
         }
         const info = document.getElementById('dm-exec-sessions');
         const running = (d.sessions||[]).filter(s => s.proj_id === p.id || ['claude-exec-','codex-exec-','openrouter-exec-','dsk-exec-'].some(pfx => (s.session||'').toLowerCase().startsWith(pfx + p.id.toLowerCase() + '-')));
@@ -14041,7 +14214,7 @@ function renderRight(p) {
               //   Row 2: stone-chip + spawn-badge + model-chip (model now RIGHTMOST badge)
               // Same truncation contract as M1685-h: name truncates first, the moved element
               // (now "started HH:MM") never does.
-              const _startedTxt = `started ${(s.created||'').slice(11,16)}`;
+              const _startedTxt = `started ${_fmtTs(s.created)}`;
               return `<div style="display:grid;grid-template-columns:8px 1fr auto;grid-template-rows:auto auto;column-gap:8px;row-gap:1px;align-items:center;padding:6px 10px;background:${rowBg};${i<running.length-1?`border-bottom:1px solid ${borderColor}`:''}"
                 onclick="_toggleTmux('${esc(p.id)}','${esc(s.session||'')}');event.stopPropagation()">
                 <span style="grid-column:1;grid-row:1/3;width:8px;height:8px;border-radius:50%;background:${dotColor};align-self:center;${sIdle?'':'box-shadow:0 0 6px rgba(61,139,94,.5);animation:sess-pulse 3s ease-in-out infinite'}"></span>
@@ -14457,6 +14630,30 @@ function esc(s) {
   return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+// M1871: convert UTC ISO ts → local HH:MM
+function _fmtTs(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  return isNaN(d) ? ts.slice(11,16) : d.toLocaleTimeString('en-GB', {hour:'2-digit', minute:'2-digit', hour12:false});
+}
+// M1871: local date label "MM/DD" for date dividers
+function _fmtDateLabel(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  if (isNaN(d)) return ts.slice(5,10);
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) return 'Today';
+  const y = d.getFullYear(), ny = now.getFullYear();
+  const mm = String(d.getMonth()+1).padStart(2,'0'), dd = String(d.getDate()).padStart(2,'0');
+  return y === ny ? `${mm}/${dd}` : `${y}/${mm}/${dd}`;
+}
+// M1871: local date string for dedup key
+function _fmtDateKey(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  return isNaN(d) ? ts.slice(0,10) : `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+}
+
 // ── Keyboard & overlay close ──────────────────────────────────────────────────
 
 document.addEventListener('keydown', e => {
@@ -14787,10 +14984,12 @@ document.addEventListener('input', e => {
         // render() uses fresh per-session idle states (not stale poll values up to 8s old).
         // mini avatar (_sessList[1~2]) idle state was the main SSE gap identified in review.
         const _prevSnap = JSON.stringify((window._execSessionList[projId] || []).map(s => s.idle));
+        // M1881: sort session ASC (alphabetical) — matches tmux list-sessions order = exec-pane row order.
         window._execSessionList[projId] = mine.map(s => ({
           idle: s.idle, model: s.model||'', session: s.session||'',
-          live_session_id: s.live_session_id||'', isMother: false, created: s.created||''
-        })).sort((a, b) => (a.created > b.created ? 1 : a.created < b.created ? -1 : 0));
+          live_session_id: s.live_session_id||'', isMother: false,
+          created: s.created||'', created_ts: s.created_ts||0, activity: s.activity||0
+        })).sort((a, b) => a.session < b.session ? -1 : a.session > b.session ? 1 : 0);
         const _newSnap = JSON.stringify(window._execSessionList[projId].map(s => s.idle));
         const _sessChanged = _newSnap !== _prevSnap;
         if (_execStatus[projId] !== correctKey) {
@@ -15072,6 +15271,24 @@ function _computeBestSubstarIdx(stoneText, projId) {
   const result = bestScore >= 0.05 ? bestIdx : -1;
   _bestSubstarCache[_cacheKey] = result;
   return result;
+}
+
+// M1879: apply last-worked-session styling to a sess badge button.
+// is_resumable===false → legacy pre-M1796 session; show "past" to signal prior work without implying resumability.
+function _applyLwsBadge(btn, lw, projId) {
+  if (!lw || !lw.session_name) return;
+  const _isResumable = lw.is_resumable !== false; // default true for old API responses without field
+  if (_isResumable) {
+    const _suffix = lw.session_name.replace(new RegExp(`.*-exec-${projId}-`), '').slice(0, 8);
+    btn.textContent = _suffix || lw.session_name.slice(0, 8);
+  } else {
+    btn.textContent = 'past';
+  }
+  btn.title = `Last worked: ${lw.session_name}${_isResumable ? '' : ' (legacy — not resumable)'}`;
+  btn.style.color = 'var(--text-dim)';
+  btn.style.borderColor = 'rgba(255,255,255,.15)';
+  btn.style.background = 'none';
+  btn.style.opacity = _isResumable ? '.7' : '.5';
 }
 
 // M608: DOM post-processing — group milestone tbodys under collapsible substar headers
@@ -15422,14 +15639,14 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
                     _ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:10020;display:flex;align-items:center;justify-content:center';
                     const _box = document.createElement('div');
                     _box.style.cssText = 'background:var(--panel);border:1px solid #e67e22;border-radius:8px;padding:16px;width:280px;font-family:var(--mono);font-size:11px;color:var(--text)';
-                    _box.innerHTML = `<div style="color:#e67e22;font-weight:700;margin-bottom:8px">세션 재할당 확인</div><div style="margin-bottom:12px;line-height:1.5">세션 <b>${esc(_claimedSuffix)}</b>이(가) 이 서브스타의 스톤 ${_staleClaimStones.length}개를 처리 중입니다.<br><br>재할당하면 기존 클레임이 초기화되고 <b>${esc(s.name.replace(/.*-exec-[^-]+-/,'') || s.name.slice(-8))}</b> 세션이 작업을 인계합니다.</div>`;
+                    _box.innerHTML = `<div style="color:#e67e22;font-weight:700;margin-bottom:8px">Reassign session</div><div style="margin-bottom:12px;line-height:1.5">Session <b>${esc(_claimedSuffix)}</b> is currently handling ${_staleClaimStones.length} stone(s) in this substar.<br><br>Reassigning will clear existing claims and hand off work to session <b>${esc(s.name.replace(/.*-exec-[^-]+-/,'') || s.name.slice(-8))}</b>.</div>`;
                     const _br = document.createElement('div');
                     _br.style.cssText = 'display:flex;gap:8px;justify-content:flex-end';
                     const _cancel = document.createElement('button');
-                    _cancel.textContent = '취소';
+                    _cancel.textContent = 'Cancel';
                     _cancel.style.cssText = 'font-family:var(--mono);font-size:10px;padding:4px 10px;border-radius:4px;border:1px solid var(--panel-border);background:none;color:var(--text-dim);cursor:pointer';
                     const _ok = document.createElement('button');
-                    _ok.textContent = '재할당';
+                    _ok.textContent = 'Reassign';
                     _ok.style.cssText = 'font-family:var(--mono);font-size:10px;padding:4px 10px;border-radius:4px;border:1px solid #e67e22;background:rgba(230,126,34,.1);color:#e67e22;cursor:pointer';
                     _cancel.onclick = () => { _ov.remove(); res(false); };
                     _ok.onclick = () => { _ov.remove(); res(true); };
@@ -15667,7 +15884,9 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
       // Re-verify against a fresh server read right before actually opening — the auto-open
       // is a convenience nudge, not a hot path, so one extra fetch here is cheap insurance
       // against snapshot staleness that a purely client-cache-based check can't rule out.
-      if (!_hasSess && ns?.id) {
+      // M1861: only auto-open if THIS substar section is currently expanded (isOpen).
+      // Firing on a collapsed/different substar confuses the user — they can't tell which substar triggered it.
+      if (!_hasSess && ns?.id && isOpen) {
         const _autoQueuedCount = (_msCacheByProject[_proj] || [])
           .filter(m => m.substar_id === ns.id && m.status === 'queued' && !m.done && !m.held).length;
         if (_autoQueuedCount > 0) {
@@ -16132,6 +16351,35 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
     }
   });
 
+  // M1879: lazy-fetch last-worked-session for unassigned substars and update sess badge.
+  // Uses client-side cache (window._lwsCache) so re-renders don't re-fetch.
+  window._lwsCache = window._lwsCache || {};
+  window._lwsCache[projId] = window._lwsCache[projId] || {};
+  nsList.forEach(ns => {
+    if (!ns || (ns.assigned_session || '').trim()) return; // skip if already assigned
+    const _btn = table.querySelector(`[data-ns-sess-btn="${ns.id}"]`);
+    if (!_btn) return;
+    const _cached = window._lwsCache[projId][ns.id];
+    if (_cached) {
+      // apply from cache immediately
+      if (_cached.session_name) {
+        _applyLwsBadge(_btn, _cached, projId);
+      }
+      return;
+    }
+    // fetch async — update DOM when result lands (if btn still in DOM and still unassigned)
+    fetch(`/api/northstar/${encodeURIComponent(projId)}/north-stars/${encodeURIComponent(ns.id)}/last-worked-session`, {cache: 'no-store'})
+      .then(r => r.json())
+      .then(lw => {
+        window._lwsCache[projId][ns.id] = lw && lw.ok ? lw : {};
+        if (!lw || !lw.ok || !lw.session_name) return;
+        const _b = document.querySelector(`[data-ns-sess-btn="${ns.id}"]`);
+        if (!_b || (_b.dataset.assignedLive)) return; // already assigned live — skip
+        _applyLwsBadge(_b, lw, projId);
+      })
+      .catch(() => { window._lwsCache[projId][ns.id] = {}; });
+  });
+
 }
 
 
@@ -16430,6 +16678,10 @@ function _showForkPicker(triggerEl, projId, sourceSid) {
   _forkBtn.onclick = async () => {
     _forkBtn.disabled = true;
     _forkBtn.textContent = 'forking…';
+    // M1845: show loading overlay on detail-modal while fork spawns (same pattern as executeProject)
+    const _forkDm = document.getElementById('detail-modal');
+    if (_forkDm) { _forkDm.classList.add('loading'); _forkDm.dataset.loadingOwner = 'fork'; }
+    const _forkClearLoading = () => { if (_forkDm && _forkDm.dataset.loadingOwner === 'fork') { _forkDm.classList.remove('loading'); delete _forkDm.dataset.loadingOwner; } };
     try {
       const r = await fetch(`/api/northstar/${encodeURIComponent(projId)}/fork-session`, {
         method: 'POST', headers: {'Content-Type':'application/json'},
@@ -16440,6 +16692,8 @@ function _showForkPicker(triggerEl, projId, sourceSid) {
         pop.remove();
         // Burst-refresh session pane + exec state so new fork appears immediately
         if (window._refreshExecState) [0, 600, 1800].forEach(t => setTimeout(window._refreshExecState, t));
+        // M1845: clear loading once first refresh fires (new session row visible)
+        setTimeout(_forkClearLoading, 600);
         // Toast
         try {
           let _t = document.getElementById('ns-push-toasts');
@@ -16451,10 +16705,11 @@ function _showForkPicker(triggerEl, projId, sourceSid) {
           setTimeout(() => { _c.style.transition='opacity .3s'; _c.style.opacity='0'; setTimeout(()=>_c.remove(), 350); }, 3000);
         } catch(_) {}
       } else {
+        _forkClearLoading();
         _forkBtn.textContent = 'Error — retry';
         _forkBtn.disabled = false;
       }
-    } catch(_) { _forkBtn.textContent = 'Error — retry'; _forkBtn.disabled = false; }
+    } catch(_) { _forkClearLoading(); _forkBtn.textContent = 'Error — retry'; _forkBtn.disabled = false; }
   };
   pop.appendChild(_agSel);
   pop.appendChild(_mdSel);
@@ -17113,7 +17368,7 @@ async function _showHubConfigModal() {
 /* M1756: restore filter:brightness/drop-shadow for blink card glow (M1757 revert rolled back per user) */
 @keyframes cg-blink-pulse {
   from { filter: brightness(1.2) drop-shadow(0 0 4px var(--green,#5a9572)); transform: scale(1.0); }
-  to   { filter: brightness(1.7) drop-shadow(0 0 14px var(--green,#5a9572)); transform: scale(1.04); }
+  to   { filter: brightness(1.7) drop-shadow(0 0 14px var(--green,#5a9572)); transform: scale(1.0); }
 }
 @keyframes cg-blink-glow-pulse {
   from { box-shadow: 0 0 0 2px var(--green,#5a9572), 0 0 6px 2px rgba(90,149,114,.4); }
@@ -17154,9 +17409,25 @@ async function _showHubConfigModal() {
   transition:box-shadow .12s,border-color .12s;flex-shrink:0;position:relative;
   touch-action:none;cursor:grab;
 }
+/* M1859: spin the SVG arc inside .cg-ring when queued stones exist.
+   arc-spin keyframe (from -90deg → to 270deg) preserves the arc's -90deg start offset
+   while rotating a full 360° — identical to NS card .progress-arc-wrap svg logic. */
+.cg-card.cg-blink-q .cg-ring > svg {
+  animation: arc-spin 2s linear infinite;
+  animation-play-state: paused;
+}
 .cg-ring-lbl {
   font-family:var(--mono,monospace);font-weight:500;
-  color:var(--text-soft,#b0a89e);text-align:center;line-height:1;
+  color:var(--text-soft,#b0a89e);text-align:center;line-height:1;position:relative;z-index:3;
+}
+/* M1880: idle elapsed timer badge — top-left of ring, shows Ns since last queue work */
+.cg-idle-elapsed {
+  position:absolute;top:-9px;left:-9px;
+  font-family:var(--mono,monospace);font-size:11px;font-weight:600;
+  color:#e05555;background:var(--bg-deep,#111009);
+  border:1px solid rgba(224,85,85,.45);border-radius:4px;
+  padding:1px 3px;line-height:1.3;pointer-events:none;z-index:10;
+  white-space:nowrap;
 }
 .cg-ring-menu {
   position:absolute;top:-9px;right:-9px;
@@ -17310,6 +17581,8 @@ function _cgPrefetch(projId) {
 }
 
 function _cgClose(skipDetailClose) {
+  // M1880: stop idle elapsed tick when graph closes
+  if (window._cgIdleTickInterval) { clearInterval(window._cgIdleTickInterval); window._cgIdleTickInterval = null; }
   const ov = document.getElementById('cg-overlay');
   if (ov) ov.style.display = 'none';
   // M1448: close detail card together when graph panel closes (ns-card click opens both)
@@ -17615,6 +17888,27 @@ function _cgRenderBoard() {
       _edgePairs.push([pid, n.id]);
     }
   }
+  // M1885: pre-pass — collect lastBlinkTs per node for rank-based font sizing.
+  // Rank 1 = most idle (oldest ts = longest wait) → largest badge.
+  // Only non-spinning nodes (no queued blinks) get a badge, matching the render condition below.
+  const _cgIdleRankMap = (() => {
+    const _entries = [];
+    for (const _nn of _cgNodes) {
+      const _nnsId = 'cg_' + _nn.id;
+      const _nsBE = window._blinkState && window._blinkState[_cgProjId] && window._blinkState[_cgProjId][_nnsId];
+      const _nnMids = (_nsBE && typeof _nsBE.mids === 'object' && !Array.isArray(_nsBE.mids)) ? _nsBE.mids : {};
+      let _nnTs = 0;
+      for (const ts of Object.values(_nnMids)) { if (typeof ts === 'number' && ts > _nnTs) _nnTs = ts; }
+      if (_nnTs > 0 && (Date.now() - _nnTs) < 86400000) _entries.push({ id: _nn.id, ts: _nnTs });
+    }
+    // Sort descending by ts (newest = most recently worked = rank 1 = largest font)
+    _entries.sort((a, b) => b.ts - a.ts);
+    const _sizes = [12, 10, 8]; // rank 1=12px, rank 2=10px, rank 3+=8px(floor); 2px step
+    const _map = {};
+    const _floor = _sizes[_sizes.length - 1]; // last entry = floor size for all lower ranks
+    _entries.forEach((e, i) => { _map[e.id] = (_sizes[i] ?? _floor) + 'px'; });
+    return _map;
+  })();
   // nodes
   for (const n of _cgNodes) {
     const pos = _cgPositions[n.id]; if (!pos) continue;
@@ -17775,17 +18069,41 @@ function _cgRenderBoard() {
       const _bc = (k) => _blink[k] ? ' ss-cnt-blink' : '';
       // M1454: pulse the whole card if any blink slot is active (link-mode-style brightness animation)
       if (Object.values(_blink).some(Boolean)) card.classList.add('cg-blink-active');
+      if (_blink.q) card.classList.add('cg-blink-q');
+
+      // M1880: idle elapsed badge — top-left of ring, shows Ns since last queue work completed.
+      // Only on non-spinning nodes (no cg-blink-q). Source: most recent blink timestamp for this ns.
+      if (!_blink.q) {
+        const _nsBlinkEntry = (window._blinkState && window._blinkState[_cgProjId] && window._blinkState[_cgProjId][_nsId]);
+        const _nsMids = (_nsBlinkEntry && typeof _nsBlinkEntry.mids === 'object' && !Array.isArray(_nsBlinkEntry.mids)) ? _nsBlinkEntry.mids : {};
+        let _lastBlinkTs = 0;
+        for (const ts of Object.values(_nsMids)) { if (typeof ts === 'number' && ts > _lastBlinkTs) _lastBlinkTs = ts; }
+        // Show up to 24h; font size = rank-based (most idle = rank 1 = largest, floor 11px)
+        if (_lastBlinkTs > 0 && (Date.now() - _lastBlinkTs) < 86400000) {
+          const _idleEl = document.createElement('div');
+          _idleEl.className = 'cg-idle-elapsed';
+          _idleEl.dataset.ts = String(_lastBlinkTs);
+          const _secs = Math.floor((Date.now() - _lastBlinkTs) / 1000);
+          _idleEl.textContent = _secs < 60 ? _secs + 's' : Math.floor(_secs / 60) + 'm';
+          _idleEl.title = 'Idle since last queue work: ' + new Date(_lastBlinkTs).toLocaleTimeString();
+          // M1885: rank-based font size (pre-computed above); fallback to CSS default (11px)
+          const _rankFs = _cgIdleRankMap[n.id] || '11px';
+          _idleEl.style.fontSize = _rankFs;
+          _idleEl.dataset.rankFs = _rankFs; // persist for tick interval
+          ring.appendChild(_idleEl);
+        }
+      }
 
       const cntEl = document.createElement('div');
       cntEl.className = 'cg-stone-counts';
-      const sep = '<span style="color:rgba(255,255,255,.25);font-size:.75em;margin:0 1px">·</span>';
+      const sep = '<span style="color:rgba(200,200,220,.7);font-size:1em;margin:0 2px;line-height:1">›</span>';
       const grpStyle = 'display:inline-flex;align-items:center;gap:2px;border:1px solid rgba(74,159,212,.4);border-radius:3px;padding:0 2px;margin-left:1px;';
       cntEl.innerHTML =
         `<span class="ss-cnt-q${_bc('q')}" style="color:var(--accent)" title="${_qCnt} queued">${_qCnt}</span>` + sep +
         `<span class="ss-cnt-review${_bc('review')}" style="color:var(--green,#3d8b5e)" title="${_rCnt} review">${_rCnt}</span>` + sep +
         `<span style="${grpStyle}">` +
           `<span class="ss-cnt-pc${_bc('pc')}" style="color:#4a9fd4" title="${_pcCnt} pending">${_pcCnt}</span>` +
-          `<span style="color:rgba(255,255,255,.3);font-size:.8em">|</span>` +
+          `<span style="color:rgba(200,200,220,.7);font-size:1em;line-height:1">›</span>` +
           `<span class="ss-cnt-watch${_bc('watch')}" style="color:#fbbb24" title="${_wCnt} watching">${_wCnt}</span>` +
         `</span>`;
       card.appendChild(cntEl);
@@ -17797,6 +18115,23 @@ function _cgRenderBoard() {
   }
 
   document.getElementById('cg-node-menu').style.display = 'none';
+
+  // M1880: start/reset live tick that updates idle elapsed badges without full re-render.
+  // Uses module-scope interval ID so only one timer runs at a time regardless of re-renders.
+  if (window._cgIdleTickInterval) clearInterval(window._cgIdleTickInterval);
+  window._cgIdleTickInterval = setInterval(() => {
+    const board2 = document.getElementById('cg-board');
+    if (!board2) { clearInterval(window._cgIdleTickInterval); return; }
+    board2.querySelectorAll('.cg-idle-elapsed[data-ts]').forEach(el => {
+      const ts = parseInt(el.dataset.ts, 10);
+      if (!ts) return;
+      const secs = Math.floor((Date.now() - ts) / 1000);
+      if (secs >= 86400) { el.remove(); return; } // expired — hide after 24h
+      el.textContent = secs < 60 ? secs + 's' : Math.floor(secs / 60) + 'm';
+      // M1885: rank font size is static (rank doesn't change within a tick cycle); restore from dataset
+      if (el.dataset.rankFs) el.style.fontSize = el.dataset.rankFs;
+    });
+  }, 1000);
 
   // M1380: initial open → center graph; re-renders (link/unlink/edit) → restore scroll position
   // Then redraw SVG edges in a nested rAF so scroll is settled before reading card positions
@@ -18460,7 +18795,7 @@ window.addEventListener('resize', () => { if (_cgNodes.length) _cgRenderBoard();
 <div id="ns-db-config-modal" style="display:none;position:fixed;inset:0;z-index:9000;background:rgba(0,0,0,.55);align-items:center;justify-content:center">
   <div style="background:var(--panel);border:1px solid var(--panel-border);border-radius:10px;padding:20px 24px;min-width:220px;max-width:280px">
     <div style="font-family:var(--mono);font-size:11px;font-weight:700;color:var(--text);margin-bottom:12px">Day Battery — Start Hour</div>
-    <div style="font-family:var(--mono);font-size:10px;color:var(--text-dim);margin-bottom:8px">근무 시작 시간 (0–23, 기본 10)</div>
+    <div style="font-family:var(--mono);font-size:10px;color:var(--text-dim);margin-bottom:8px">Work start hour (0–23, default 10)</div>
     <input id="ns-db-hour-input" type="text" inputmode="numeric" maxlength="2" placeholder="10"
       style="width:100%;box-sizing:border-box;font-family:var(--mono);font-size:14px;font-weight:700;
              background:var(--bg-deep);border:1px solid var(--panel-border);border-radius:6px;

@@ -127,16 +127,27 @@ Without both of these, OpenRouter sessions silently stay unavailable — hub doe
 # 1. Start the hub
 hub
 
-# 2. Inject the NS Hub protocol into Claude Code (run once)
+# 2. Register Claude Code hooks + MCP (run once per machine)
 hub install-global
 # Writes stone lifecycle protocol to ~/.claude/CLAUDE.md
+# Registers MCP server (ns-hub) + 4 hooks in ~/.claude/settings.json
+# Auto-creates ~/.config/hub/env if missing
 
-# 3. Add your first project
-# North Star tab → "+ node" → set repo_path
+# 3. Add your first project (two options)
+#   Option A — CLI:
+hub init MyProject --dir ~/Projects/MyProject
+#   Option B — UI: North Star tab → "+ node" → set repo_path
 
-# 4. Drop a Stone and let Claude run it
+# 4. (Optional) Verify setup
+hub doctor
+# Checks Python / tmux / claude CLI / env file / MCP / hooks / server
+
+# 5. Drop a Stone and let Claude run it
 # Click project card → "+ milestone" → type your task → "live"
+# Claude picks it up on next idle turn via mcp__ns-hub__get_pending_task
 ```
+
+> **Restart Claude Code** after `hub install-global` so the new MCP server and hooks are loaded.
 
 ---
 
@@ -159,14 +170,15 @@ hub install-global
 
 ```
 ~/.hub/
-├── server.py          — main FastAPI server
-├── ns-events.db       — SQLite: stones (milestones), exec sessions, action log
-├── config.yaml        — optional overrides (port, tailscale IP, etc.)
-├── hooks/             — PostToolUse / Stop hooks for Claude Code
-├── static/            — web UI (northstar.html, index.html)
-├── corpora/           — local corpus collections (skills, agents, docs)
-├── ee/                — enterprise extensions (source-available)
-└── relay/             — optional Cloudflare Workers relay for remote access
+├── server.py              — main FastAPI server
+├── ns-events.db           — SQLite: stones (milestones), exec sessions, action log
+├── config.yaml            — optional overrides (port, tailscale IP, etc.)
+├── static/
+│   ├── northstar.html     — web UI
+│   └── hooks/             — Claude Code hooks (PostToolUse / Stop / PreToolUse)
+├── corpora/               — local corpus collections (skills, agents, docs)
+├── ee/                    — enterprise extensions (source-available)
+└── relay/                 — optional Cloudflare Workers relay for remote access
 ```
 
 ---
@@ -193,6 +205,26 @@ curl -X POST http://localhost:9001/api/hub/consent \
   -H 'Content-Type: application/json' \
   -d '{"data_collection": false}'
 ```
+
+---
+
+## Push Notifications (optional)
+
+Get a phone notification when Claude finishes a Stone.
+
+**Setup (2 minutes):**
+1. Install the [ntfy app](https://ntfy.sh) on your phone (free, open-source)
+2. Pick a unique topic name (e.g. `my-hub-abc123`)
+3. Edit `~/.hub/config.yaml`:
+   ```yaml
+   ntfy_url: https://ntfy.sh/my-hub-abc123
+   ```
+4. Subscribe to the same topic in the ntfy app
+
+Hub sends a notification whenever a Stone transitions to `pending_confirmation` or `done`.
+
+> **Self-hosted**: replace `https://ntfy.sh/` with your own ntfy server URL.
+> **Local only (no internet)**: set `ntfy_url: http://127.0.0.1:9001/ntfy` (built-in relay, Tailscale required for phone access).
 
 ---
 

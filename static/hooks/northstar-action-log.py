@@ -33,6 +33,22 @@ try:
     session_id = os.environ.get("CLAUDE_SESSION_ID", "")
     proj_id = os.environ.get("NS_PROJ_ID", "")
     stone_id = os.environ.get("NS_STONE_ID", "")
+    # M1751: fallback — read per-session marker written by hub-mcp-server.py at task claim time.
+    # NS_STONE_ID env cannot be set post-spawn; marker file bridges the gap for tool_trace linkage.
+    if not stone_id:
+        try:
+            import pathlib
+            _sk_env = os.environ.get("NS_SESSION_KEY", "")
+            if not _sk_env and os.environ.get("TMUX"):
+                import subprocess as _sp
+                _sk_env = _sp.run(["tmux", "display-message", "-p", "#S"],
+                                  capture_output=True, text=True, timeout=1).stdout.strip()
+            if _sk_env:
+                _m = pathlib.Path.home() / ".claude" / f".stone-id-{_sk_env}"
+                if _m.exists():
+                    stone_id = _m.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
     # Fallback: derive proj_id from CLAUDE_PROJECT_DIR if NS_PROJ_ID not set
     # e.g. /home/desk-1/Project/MOAT → "MOAT"
     if not proj_id:

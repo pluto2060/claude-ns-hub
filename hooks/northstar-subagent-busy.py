@@ -1,1 +1,0 @@
-../static/hooks/northstar-subagent-busy.py

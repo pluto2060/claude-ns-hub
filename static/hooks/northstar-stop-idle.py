@@ -86,5 +86,16 @@ try:
     req = urllib.request.Request(f"{HUB_URL}/api/agent-busy", data=payload,
                                  headers={"Content-Type": "application/json"}, method="POST")
     urllib.request.urlopen(req, timeout=2)
+
+    # M1751: clear per-session stone_id marker on Stop (task boundary).
+    # Next get_pending_task will write the new stone_id for the next task.
+    if sk:
+        try:
+            import pathlib
+            _m = pathlib.Path.home() / ".claude" / f".stone-id-{sk}"
+            if _m.exists():
+                _m.unlink()
+        except Exception:
+            pass
 except Exception:
     pass  # never block Claude

@@ -20,6 +20,13 @@ import urllib.error
 import datetime
 from pathlib import Path
 
+# M1854-B: single source of truth for comment line-limit rule (mirrors server.py _COMMENT_RULE_TEXT).
+_COMMENT_RULE_TEXT = (
+    "STRUCTURED (bullets `-`, numbered `1.`, table `|`): no line limit. "
+    "Unstructured prose: ≤3 lines. "
+    "Prose overflow → docs/ns-replies/<DATE>-<MID>.md (M1860)"
+)
+
 
 def _hub_request(url: str, method: str = "GET", body: dict = None, timeout: int = 15) -> dict:
     # M1115: increased timeout 5→15s for slow networks / hub load; retries on transient failure
@@ -107,15 +114,14 @@ TOOLS = [
             "NOTE: ❌ rclone link is prohibited — returns open?id= format that breaks on mobile. "
             "✅ Always use rclone lsjson | python3 pipeline (steps ①② above) to get the /file/d/.../view?usp=sharing URL. "
             "If you already called this tool and got requires_evidence=True: re-run steps ①② then call again with evidence_url. "
-            "LONG-FORM OVERFLOW (M1817): if analysis is too detailed for 3 lines, write full detail to "
-            "docs/ns-replies/<YYYYMMDD>-<MID>.md first, then reference it in the ≤3-line summary "
-            "(e.g. '분석 완료. 상세: docs/ns-replies/20260715-M1814.md'). Never attempt reply_to_stone AFTER report_task_complete."
+            f"LONG-FORM (M1817/M1860): {_COMMENT_RULE_TEXT} "
+            "Never attempt reply_to_stone AFTER report_task_complete."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "task_id": {"type": "string"},
-                "summary": {"type": "string", "description": "≤3-line past-tense summary including key result/finding — match user's stone input language. Text/analysis results: include the actual conclusion, not just 'done'. One line is ideal; 3 lines is the hard cap (M1709/M1817)."},
+                "summary": {"type": "string", "description": f"Past-tense summary — match user's stone input language. {_COMMENT_RULE_TEXT} Text/analysis results: include the actual conclusion, not just 'done'. (M1860/M1709/M1817)"},
                 "status": {"type": "string", "enum": ["pending_confirmation", "skipped"], "description": "default: pending_confirmation"},
                 "evidence_url": {"type": "string", "description": "GDrive URL (https://drive.google.com/file/d/<ID>/view?usp=sharing) — paste here, NOT inside summary text. REQUIRED for Layer A stones; omitting returns ok=False. ❌ DO NOT use rclone link (returns open?id= format that breaks on mobile). ✅ Use: rclone lsjson 'gdrive:...' --include '<file>' | python3 -c \"import sys,json;d=json.load(sys.stdin);print('https://drive.google.com/file/d/'+d[0]['ID']+'/view?usp=sharing')\""},
                 "evidence_filename": {"type": "string", "description": "Local filename of the uploaded file (e.g. 'M1234-report.xlsx'). Pass this so the UI shows the real filename instantly without a GDrive API call."},
@@ -138,7 +144,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "task_id": {"type": "string"},
-                "message": {"type": "string", "description": "Reply text, max 3 lines (M172/M270 convention). Prefer bullets/numbered list/table rows over unbroken prose for multi-point answers."},
+                "message": {"type": "string", "description": f"Reply text. {_COMMENT_RULE_TEXT} Prefer structured format for multi-point answers. (M1860/M172/M270)"},
                 "evidence_url": {"type": "string", "description": "Optional GDrive URL (https://drive.google.com/file/d/<ID>/view?usp=sharing). Pass when the QA reply delivers an artifact (e.g. revised Excel). Sets the result badge without calling attach_evidence_url separately."},
                 "evidence_filename": {"type": "string", "description": "Local filename hint (M{ID}-{suffix}.{ext} convention). Pass alongside evidence_url so the UI shows the real filename instantly without a GDrive API call — omitting this leaves the evd badge dependent on a live GDrive lookup that can fail under quota pressure."},
             },
@@ -521,6 +527,16 @@ def handle_get_pending_task(proj_id: str, hub_url: str) -> dict:
             # M1533 v4: agent received an impl task → busy. Poller skips redundant go-injection.
             # M1579 Phase 2: pass stone_id so hub can track running stone without pane-scrape.
             _post_busy(proj_id, hub_url, True, "pending_task_received", stone_id=stone.get("id", ""))
+        # M1751: write per-session stone_id marker so PostToolUse hooks can link tool_trace rows
+        # to the active stone without requiring NS_STONE_ID env (which cannot be set post-spawn).
+        # Marker: ~/.claude/.stone-id-{session_key} — cleared by northstar-stop-idle.py on Stop.
+        try:
+            _sid = stone.get("id", "")
+            if _sid and _sk:
+                _marker_path = __import__("pathlib").Path.home() / ".claude" / f".stone-id-{_sk}"
+                _marker_path.write_text(_sid, encoding="utf-8")
+        except Exception:
+            pass
         # M1114: surface skill_refs as a structured field (not buried in text annotations)
         _srefs = stone.get("skill_refs") or ([stone["skill_ref"]] if stone.get("skill_ref") else [])
         # M1825: suppress skill_refs re-injection when the skill was already invoked for this stone

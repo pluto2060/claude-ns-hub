@@ -1,1 +1,0 @@
-../static/hooks/hub-mcp-server.py
