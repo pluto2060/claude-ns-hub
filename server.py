@@ -727,9 +727,24 @@ def _session_is_busy(session_name: str) -> bool:
     # Stop fires (parent turn ended) while the subagent still computes. Same 1h/
     # tmux-alive shape as tool_start; northstar-stop-idle.py sets this reason when
     # its subagent-count marker is >0 instead of posting plain agent_stopped.
+    # M1893: SubagentStop may never fire (crash/kill mid-flight), leaving the
+    # marker stuck at count=1 and the session locked busy up to 3600s. Server-side
+    # self-heal: check marker file mtime directly — if the marker hasn't been touched
+    # in _SUBAGENT_MARKER_TTL_SECS (15min), treat as leaked/stale and clear it.
+    _SUBAGENT_MARKER_TTL_SECS = 900
     if rec.get("reason") == "subagent_running" and rec.get("busy"):
         if _age < _OOB_STALE_SECS:
             return True
+        _marker = Path.home() / ".claude" / f".subagent-count-{session_name}"
+        if _marker.exists():
+            try:
+                _marker_age = time.time() - _marker.stat().st_mtime
+                if _marker_age > _SUBAGENT_MARKER_TTL_SECS:
+                    _marker.write_text("0")
+                    rec["busy"] = False
+                    return False
+            except Exception:
+                pass
         return _age < 3600 and _tmux_session_alive(session_name)
     # M1741: tool_call_heartbeat (PostToolUse, fires after EVERY tracked tool call) only
     # got the generic 120s window, not tool_start's long hold — so a multi-minute stretch
@@ -824,16 +839,38 @@ def _tmux_session_alive(session_name: str) -> bool:
         return False
 
 
+_BUSY_SESSIONS_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS agent_busy_sessions (
+    session_key TEXT PRIMARY KEY,
+    proj_id     TEXT NOT NULL DEFAULT '',
+    busy        INTEGER NOT NULL DEFAULT 0,
+    reason      TEXT NOT NULL DEFAULT '',
+    ts          REAL NOT NULL DEFAULT 0,
+    stone_id    TEXT NOT NULL DEFAULT '',
+    updated_at  TEXT NOT NULL DEFAULT ''
+)
+"""
+
+
+def _agent_busy_ensure_table(conn: "sqlite3.Connection") -> None:
+    """M1890-A: create per-session table on first use (idempotent)."""
+    conn.execute(_BUSY_SESSIONS_TABLE_DDL)
+
+
 def _agent_busy_load_from_db():
-    """Hydrate _agent_busy_state from SQLite user_settings on startup."""
+    """M1890-A: Hydrate _agent_busy_state and _agent_busy_sessions from SQLite on startup.
+    Per-session rows (agent_busy_sessions table) take priority; legacy blob is fallback for
+    cold migration (first run after upgrade)."""
     try:
         conn = sqlite3.connect(str(_NS_EVENTS_DB))
+        _agent_busy_ensure_table(conn)
+        conn.commit()
+
+        # --- proj-level mirror (legacy blob, low priority) ---
         row = conn.execute("SELECT value_json FROM user_settings WHERE key='_agent_busy_state'").fetchone()
-        conn.close()
         if row and row[0]:
             data = json.loads(row[0])
             if isinstance(data, dict):
-                # M1637-fix: normalize case on load — merge lowercase/mixed keys into canonical folder name.
                 canonical_map: dict[str, str] = {}
                 try:
                     for d in PROJECTS_DIR.iterdir():
@@ -844,45 +881,98 @@ def _agent_busy_load_from_db():
                 for k, v in data.items():
                     canonical = canonical_map.get(k.lower(), k)
                     existing = _agent_busy_state.get(canonical)
-                    # Keep newer entry when two case variants exist
                     if not existing or v.get("ts", 0) > existing.get("ts", 0):
                         _agent_busy_state[canonical] = v
-        # M1656-R: also hydrate session records so in-flight stone holds survive hub restart
-        # (prevents duplicate wake injection into a mid-work session after restart).
-        conn2 = sqlite3.connect(str(_NS_EVENTS_DB))
-        row2 = conn2.execute("SELECT value_json FROM user_settings WHERE key='_agent_busy_sessions'").fetchone()
-        conn2.close()
+
+        # --- M1890-A: per-session rows (primary, atomic UPSERT on every write) ---
+        per_session_rows = conn.execute(
+            "SELECT session_key, proj_id, busy, reason, ts, stone_id FROM agent_busy_sessions"
+        ).fetchall()
+        _loaded_per_row: dict[str, dict] = {}
+        for sk, pid, bsy, rsn, ts_, sid in per_session_rows:
+            _loaded_per_row[sk] = {
+                "proj_id": pid, "busy": bool(bsy), "reason": rsn,
+                "ts": ts_, "stone_id": sid or None,
+            }
+
+        # Fallback: legacy blob for sessions not yet in the new table (cold migration).
+        row2 = conn.execute("SELECT value_json FROM user_settings WHERE key='_agent_busy_sessions'").fetchone()
+        _legacy_blob: dict = {}
         if row2 and row2[0]:
-            data2 = json.loads(row2[0])
-            if isinstance(data2, dict):
-                _agent_busy_sessions.update(data2)
-        # M1844: tool_start records whose process died during hub restart must not persist.
-        # Stop hook POST can silently fail in the restart race window → stale busy until 3600s TTL.
+            _legacy_blob = json.loads(row2[0]) if row2[0] else {}
+            if not isinstance(_legacy_blob, dict):
+                _legacy_blob = {}
+
+        # Merge: per-row wins over blob (per-row is more recent; blob is last-restart snapshot).
+        for sk, rec in _legacy_blob.items():
+            if sk not in _loaded_per_row:
+                _loaded_per_row[sk] = rec
+
+        _agent_busy_sessions.update(_loaded_per_row)
+
+        # M1844: tool_start records from dead processes must not persist across restart.
         _dirty = False
         for _sk, _sv in list(_agent_busy_sessions.items()):
             if isinstance(_sv, dict) and _sv.get("reason") == "tool_start" and _sv.get("busy"):
                 _agent_busy_sessions[_sk] = dict(_sv, busy=False, reason="agent_stopped",
                                                   note="reset_on_startup_stale_tool_start")
                 _dirty = True
+        conn.close()
         if _dirty:
             _agent_busy_persist()
     except Exception:
         pass
 
 
-def _agent_busy_persist():
-    """Write busy state (proj mirror + session records) to SQLite. Fire-and-forget."""
+def _agent_busy_persist(session_key: str | None = None) -> None:
+    """M1890-A: Durable per-session UPSERT (atomic, no blob race on SIGTERM).
+
+    If session_key is given, writes only that one row — used by POST /api/agent-busy for
+    O(1) single-row UPSERT with immediate commit durability.
+    If session_key is None (startup cleanup path), rewrites all in-memory sessions.
+    proj-level _agent_busy_state blob is still written for legacy consumers.
+    """
+    import datetime as _dt
+    _now_iso = _dt.datetime.utcnow().isoformat()
     try:
-        import datetime as _dt
-        _now_iso = _dt.datetime.utcnow().isoformat()
         conn = sqlite3.connect(str(_NS_EVENTS_DB))
+        _agent_busy_ensure_table(conn)
+        if session_key is not None:
+            rec = _agent_busy_sessions.get(session_key)
+            if rec is not None:
+                conn.execute(
+                    "INSERT OR REPLACE INTO agent_busy_sessions"
+                    "(session_key, proj_id, busy, reason, ts, stone_id, updated_at)"
+                    " VALUES(?, ?, ?, ?, ?, ?, ?)",
+                    (session_key,
+                     rec.get("proj_id") or "",
+                     1 if rec.get("busy") else 0,
+                     (rec.get("reason") or "")[:200],
+                     rec.get("ts") or 0.0,
+                     rec.get("stone_id") or "",
+                     _now_iso),
+                )
+        else:
+            # Bulk rewrite (startup cleanup only — rare path).
+            for sk, rec in _agent_busy_sessions.items():
+                if not isinstance(rec, dict):
+                    continue
+                conn.execute(
+                    "INSERT OR REPLACE INTO agent_busy_sessions"
+                    "(session_key, proj_id, busy, reason, ts, stone_id, updated_at)"
+                    " VALUES(?, ?, ?, ?, ?, ?, ?)",
+                    (sk,
+                     rec.get("proj_id") or "",
+                     1 if rec.get("busy") else 0,
+                     (rec.get("reason") or "")[:200],
+                     rec.get("ts") or 0.0,
+                     rec.get("stone_id") or "",
+                     _now_iso),
+                )
+        # proj-level mirror (legacy blob — kept for GET /api/agent-busy consumers).
         conn.execute(
             "INSERT OR REPLACE INTO user_settings(key, value_json, updated_at) VALUES(?, ?, ?)",
             ("_agent_busy_state", json.dumps(_agent_busy_state, ensure_ascii=False), _now_iso),
-        )
-        conn.execute(
-            "INSERT OR REPLACE INTO user_settings(key, value_json, updated_at) VALUES(?, ?, ?)",
-            ("_agent_busy_sessions", json.dumps(_agent_busy_sessions, ensure_ascii=False), _now_iso),
         )
         conn.commit()
         conn.close()
@@ -965,7 +1055,7 @@ async def agent_busy(request: Request):
     }
     # Legacy proj-level mirror — kept for GET /api/agent-busy consumers and old harnesses.
     _agent_busy_state[proj_id] = {"busy": new_busy, "reason": _reason[:200], "ts": time.time()}
-    _agent_busy_persist()  # M1479-P2: durable across hub restart
+    _agent_busy_persist(_rec_key)  # M1890-A: per-row UPSERT — atomic, survives SIGTERM
     # M1677: busy-state transition → invalidate exec-sessions cache so the session pane
     # (SSE-triggered or next poll) reflects the new state instead of a ≤2s-old snapshot.
     if prev_busy != new_busy:
@@ -5159,7 +5249,7 @@ def _get_agent_spawn_cmd(proj_id: str) -> list:
                         cfg_claude = str(_bin); break
                 if cfg_claude: break
     claude_bin = cfg_claude or "claude"
-    return [claude_bin, "--dangerously-skip-permissions", "--think", *_DISALLOWED_TOOLS_ARGS, *_get_project_model(proj_id)]
+    return [claude_bin, "--dangerously-skip-permissions", *_DISALLOWED_TOOLS_ARGS, *_get_project_model(proj_id)]
 
 
 def _get_pty_spawn_cmd(proj_id: str, agent: str | None = None) -> list:
@@ -5180,7 +5270,7 @@ def _get_pty_spawn_cmd(proj_id: str, agent: str | None = None) -> list:
         return ["codex", "--dangerously-bypass-approvals-and-sandbox"]
     # openrouter = Claude Code CLI + LiteLLM/OpenRouter env (handled by _get_project_spawn_env)
     claude_bin = _shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude")
-    return [claude_bin, "--dangerously-skip-permissions", "--think", *_DISALLOWED_TOOLS_ARGS, *_get_project_model(proj_id)]
+    return [claude_bin, "--dangerously-skip-permissions", *_DISALLOWED_TOOLS_ARGS, *_get_project_model(proj_id)]
 
 
 def _get_project_spawn_env(proj_id: str, override_model: str = None) -> dict:
@@ -5667,7 +5757,9 @@ def _write_sid_direct(proj_id: str, session_name: str, sid: str) -> None:
     """M1775: write a known-in-advance live_session_id (e.g. from --session-id pre-assignment)
     directly into spawn-info, bypassing the poll-and-diff capture entirely. Same target file
     as _capture_live_session_id_bg's internal _write_sid, exposed standalone so spawn call
-    sites that pre-generate the UUID don't need a background thread at all."""
+    sites that pre-generate the UUID don't need a background thread at all.
+    M1884: also push into .session-history.json ring so assign_spawn sessions (children
+    spawned via the substar assign path, not /execute) appear in the resume session list."""
     _f = PROJECTS_DIR / proj_id / ".spawn-info-by-session.json"
     _all: dict = {}
     if _f.exists():
@@ -5678,6 +5770,16 @@ def _write_sid_direct(proj_id: str, session_name: str, sid: str) -> None:
     if session_name in _all:
         _all[session_name]["live_session_id"] = sid
         _f.write_text(json.dumps(_all, ensure_ascii=False))
+    # M1884: push into session-history ring so this session appears in the resume list.
+    # assign_spawn never went through /execute, so _update_session_history_from_transcript
+    # was never called — the session was invisible in the resume popup after being killed.
+    try:
+        _model_key = (_all.get(session_name) or {}).get("model", "") or ""
+        if _model_key and sid:
+            _update_session_history_locked(proj_id,
+                lambda h: _push_session_history_ring(h, _model_key, sid))
+    except Exception:
+        pass
 
 
 def _write_spawn_marker(tdir: Path, session_name: str) -> Optional[Path]:
@@ -6938,7 +7040,7 @@ async def update_north_star(proj_id: str, ns_id: str, request: Request):
                     except Exception:
                         _sp_pre_files = set()
                     _sp_marker = _write_spawn_marker(_sp_tdir, _new_assigned)
-                _sp_cmd = (["claude", "--dangerously-skip-permissions", "--think"] + _DISALLOWED_TOOLS_ARGS
+                _sp_cmd = (["claude", "--dangerously-skip-permissions"] + _DISALLOWED_TOOLS_ARGS
                            + _hub_mcp_spawn_args(proj_id, _new_assigned, agent=_sp_agent)
                            + _sp_resume_args + _get_project_model(proj_id, override_model=_sp_override_model))
                 subprocess.Popen(["tmux", "new-session", "-d", "-s", _new_assigned, "-c", _spawn_cwd]
@@ -9752,16 +9854,31 @@ def _last_worked_session_for_substar(proj_id: str, substar_id: str, all_stones: 
 
     _si = _read_spawn_info(proj_id, _last_session)
     _live_sid = _si.get("live_session_id") or _si.get("from_id") or ""
-    if not _live_sid:
-        return None
     try:
         _proj_dir = _get_project_dir(proj_id)
         if not _proj_dir:
             return None
         _encoded = _encode_cwd_for_claude(str(_proj_dir))
-        _t = Path.home() / ".claude" / "projects" / _encoded / f"{_live_sid}.jsonl"
-        if _t.exists() and _t.stat().st_size > 0:
-            return (_last_session, _live_sid)
+        _tdir = Path.home() / ".claude" / "projects" / _encoded
+        if _live_sid:
+            _t = _tdir / f"{_live_sid}.jsonl"
+            if _t.exists() and _t.stat().st_size > 0:
+                return (_last_session, _live_sid)
+        # M1887: spawn-info live_session_id may have been overwritten by a failed re-spawn.
+        # Fall back to searching the transcript dir for any .jsonl whose UUID prefix matches
+        # the session name's 8-char suffix (session "claude-exec-PROJ-XXXXXXXX" → uuid "XXXXXXXX-...").
+        import re as _re_fb
+        _suffix_m = _re_fb.search(r'-([0-9a-f]{8})$', _last_session)
+        if _suffix_m and _tdir.exists():
+            _pfx = _suffix_m.group(1)
+            _candidates = sorted(
+                [f for f in _tdir.glob("*.jsonl")
+                 if f.name.replace("-", "").startswith(_pfx) and f.stat().st_size > 0],
+                key=lambda f: f.stat().st_mtime, reverse=True
+            )
+            if _candidates:
+                _fallback_sid = _candidates[0].stem  # UUID without .jsonl
+                return (_last_session, _fallback_sid)
     except Exception:
         pass
     return None
@@ -10387,7 +10504,7 @@ async def execute_project(proj_id: str, request: Request):
                                                 _br_pre_files = set()
                                             # M1773-C: marker before Popen for ambiguity resolution
                                             _br_marker = _write_spawn_marker(_br_tdir, _br_sess)
-                                        _br_claude_cmd = (["claude", "--dangerously-skip-permissions", "--think"] + _DISALLOWED_TOOLS_ARGS
+                                        _br_claude_cmd = (["claude", "--dangerously-skip-permissions"] + _DISALLOWED_TOOLS_ARGS
                                                           + _hub_mcp_spawn_args(proj_id, _br_sess)
                                                           + _br_resume_args + _get_project_model(proj_id))
                                         subprocess.Popen(
@@ -10941,7 +11058,7 @@ async def execute_project(proj_id: str, request: Request):
                 "tmux", "new-session", "-d", "-s", session_name,
                 "-c", spawn_cwd,
                 *_tmux_env,
-                "claude", "--dangerously-skip-permissions", "--think", *_DISALLOWED_TOOLS_ARGS, *_get_project_model(proj_id),
+                "claude", "--dangerously-skip-permissions", *_DISALLOWED_TOOLS_ARGS, *_get_project_model(proj_id),
                 *_mcp_full_args, *resume_args,
             ])
             subprocess.run(["tmux", "set-option", "-t", session_name, "history-limit", "5000"], capture_output=True, timeout=2)
@@ -10996,7 +11113,7 @@ async def execute_project(proj_id: str, request: Request):
                     "tmux", "new-session", "-d", "-s", session_name,
                     "-c", spawn_cwd,
                     *_tmux_env,
-                    "claude", "--dangerously-skip-permissions", "--think", *_DISALLOWED_TOOLS_ARGS, *_get_project_model(proj_id), *_mcp_args_retry,
+                    "claude", "--dangerously-skip-permissions", *_DISALLOWED_TOOLS_ARGS, *_get_project_model(proj_id), *_mcp_args_retry,
                     *resume_args,
                 ])
                 subprocess.run(["tmux", "set-option", "-t", session_name, "history-limit", "5000"], capture_output=True, timeout=2)
@@ -11096,7 +11213,7 @@ async def execute_project(proj_id: str, request: Request):
                         "tmux", "new-session", "-d", "-s", _ss_sname,
                         "-c", spawn_cwd,
                         *_ss_env,
-                        "claude", "--dangerously-skip-permissions", "--think", *_DISALLOWED_TOOLS_ARGS, *_mother_model_args,  # M1166
+                        "claude", "--dangerously-skip-permissions", *_DISALLOWED_TOOLS_ARGS, *_mother_model_args,  # M1166
                         *_ss_resume_args,
                     ])
                     subprocess.run(["tmux", "set-option", "-t", _ss_sname, "history-limit", "5000"], capture_output=True, timeout=2)
@@ -11334,7 +11451,7 @@ async def fork_session(proj_id: str, request: Request):
     # --model corrupts arg parsing / model validation and is the cause of "issue with the selected
     # model" on fork (new-session path injects --model exactly once and works fine).
     claude_bin = _resolve_claude_bin()
-    _agent_base_cmd = [claude_bin, "--dangerously-skip-permissions", "--think", *_DISALLOWED_TOOLS_ARGS]
+    _agent_base_cmd = [claude_bin, "--dangerously-skip-permissions", *_DISALLOWED_TOOLS_ARGS]
     subprocess.Popen([
         "tmux", "new-session", "-d", "-s", session_name,
         "-c", spawn_cwd,
@@ -14430,9 +14547,10 @@ def _hub_generate_systemd_unit():
           f"&& systemctl --user enable --now hub' to activate.")
 
 
-def _hub_doctor():
+def _hub_doctor(exit_code: bool = False):
     """F9: Self-diagnostic command — checks all prerequisites for a working hub install.
-    Each check prints ✅/❌ + a one-line fix command on failure."""
+    Each check prints ✅/❌ + a one-line fix command on failure.
+    P1: --exit-code flag returns sys.exit(failed_count) for CI integration."""
     import shutil as _sh
     import urllib.request as _ur
 
@@ -14490,17 +14608,21 @@ def _hub_doctor():
         chk(f"Hook registered: {_hk}", _hk in _all_hook_cmds,
             "hub install-global")
 
-    # hub server responding
+    # hub server responding — NS_HUB_URL env takes priority (Tailscale / custom port)
+    _hub_check_url = os.environ.get("NS_HUB_URL", "http://127.0.0.1:9001")
     try:
-        _r = _ur.urlopen("http://127.0.0.1:9001/api/hub/status", timeout=2)
+        _r = _ur.urlopen(f"{_hub_check_url}/api/hub/defaults", timeout=2)
         hub_ok = _r.status == 200
     except Exception:
         hub_ok = False
-    chk("Hub server responding at http://127.0.0.1:9001", hub_ok,
+    chk(f"Hub server responding at {_hub_check_url}", hub_ok,
         "systemctl --user start hub  # or: hub (to start manually)")
 
     failed = sum(1 for ok, _ in checks if not ok)
     print(f"\n{'All checks passed ✅' if failed == 0 else f'{failed} check(s) failed — run the fix commands above.'}\n")
+    if exit_code:
+        import sys as _sys2
+        _sys2.exit(failed)
 
 
 def _hub_ensure_env_file():
@@ -15442,7 +15564,7 @@ def main():
         return
 
     if args and args[0] == "doctor":
-        _hub_doctor()
+        _hub_doctor(exit_code="--exit-code" in args)
         return
 
     # M705: hub configure [--project PROJ] [--agent AGENT] [--model MODEL]

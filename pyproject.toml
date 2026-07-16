@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-ns-hub"
-version = "0.3.5"
+version = "0.3.6"
 description = "Personal AI project management hub — North Star milestone tracking, live Claude sessions, CTX context alignment."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -52,6 +52,7 @@ hub = [
   "static/favicon.svg",
   "static/hooks/*.py",
   "static/hooks/*.sh",
+  "scripts/onboarding_smoke_test.py",
 ]
 
 [tool.setuptools.exclude-package-data]
@@ -71,7 +72,6 @@ hub = [
   "*.jsonl",
   "*.yaml",
   "*.yml",
-  "scripts/*",
   "dist/*",
   "build/*",
   "__pycache__/*",
