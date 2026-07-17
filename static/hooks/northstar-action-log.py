@@ -6,7 +6,7 @@ M775: also writes to /api/tool-trace for causality dataset step-level trace.
 """
 import json, sys, os, urllib.request, urllib.error, datetime
 
-HUB_URL = os.environ.get("NS_HUB_URL", "http://100.119.82.4:9001")
+HUB_URL = os.environ.get("NS_HUB_URL", "http://127.0.0.1:9001")
 
 TRACK = {"Edit", "Write", "Bash", "Read", "Glob", "Grep", "WebFetch", "WebSearch", "Agent", "Task"}
 

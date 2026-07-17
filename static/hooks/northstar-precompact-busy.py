@@ -9,7 +9,7 @@ session busy at compaction start; the server holds reason=compacting for up to 1
 """
 import json, os, sys, urllib.request
 
-HUB_URL = os.environ.get("NS_HUB_URL", "http://100.119.82.4:9001")
+HUB_URL = os.environ.get("NS_HUB_URL", "http://127.0.0.1:9001")
 
 try:
     proj_id = os.environ.get("NS_PROJ_ID", "")
