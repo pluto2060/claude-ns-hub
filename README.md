@@ -5,6 +5,7 @@
 [![GitHub Stars](https://img.shields.io/github/stars/pluto2060/claude-ns-hub?style=flat&color=yellow)](https://github.com/pluto2060/claude-ns-hub)
 [![Python](https://img.shields.io/pypi/pyversions/claude-ns-hub)](https://pypi.org/project/claude-ns-hub/)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[![Docs](https://img.shields.io/badge/docs-github.com%2Fpluto2060%2Fclaude--ns--hub-blue)](https://github.com/pluto2060/claude-ns-hub#quick-start)
 
 **Drop a task. Walk away. Come back to results.**
 
@@ -26,7 +27,7 @@ Instead of babysitting one Claude session, you drop tasks ("Stones") into a loca
 - **SQLite** (not a cloud service) — your data stays local, no vendor lock-in, works offline
 - **tmux + pexpect for PTY control** — NS Hub injects input and reads Claude's output without a custom API wrapper
 - **Mother/child session dispatch** — a mother session manages the queue; children are forked with truncated context (transcript sliced at the exact point before the forked task was claimed, so child sessions start clean)
-- **180+ skills/agents** indexed locally for inline search across your corpus
+- **190+ skills/agents/docs** indexed locally for inline search across your corpus
 
 | Without NS Hub | With NS Hub |
 |---|---|
@@ -76,7 +77,7 @@ The entire loop runs without touching a computer.
 
 ![North Star swimlane](https://raw.githubusercontent.com/pluto2060/claude-ns-hub/master/assets/northstar-swimlane.png)
 
-**Corpus browser** — 58 skills · 54 agents · 75 docs, all searchable inline:
+**Corpus browser** — 61 skills · 54 agents · 75 docs, all searchable inline:
 
 ![Corpus browser](https://raw.githubusercontent.com/pluto2060/claude-ns-hub/master/assets/corpus-browser.png)
 
@@ -123,31 +124,47 @@ Without both of these, OpenRouter sessions silently stay unavailable — hub doe
 
 ## Quick start
 
+**First Stone running in 3 minutes:**
+
 ```bash
-# 1. Start the hub
+# Step 1 — Install
+pip install claude-ns-hub
+
+# Step 2 — Start hub (keep this terminal open)
 hub
+# → Hub started at http://localhost:9001
+# → Open that URL on your phone — you'll see your live dashboard
 
-# 2. Register Claude Code hooks + MCP (run once per machine)
+# Step 3 — Register hooks + MCP into Claude Code (run once per machine)
 hub install-global
-# Writes stone lifecycle protocol to ~/.claude/CLAUDE.md
-# Registers MCP server (ns-hub) + 4 hooks in ~/.claude/settings.json
-# Auto-creates ~/.config/hub/env if missing
+# → Writes lifecycle protocol to ~/.claude/CLAUDE.md
+# → Registers mcp__ns-hub server + 4 hooks in ~/.claude/settings.json
 
-# 3. Add your first project (two options)
-#   Option A — CLI:
-hub init MyProject --dir ~/Projects/MyProject
-#   Option B — UI: North Star tab → "+ node" → set repo_path
-
-# 4. (Optional) Verify setup
+# Step 4 — Verify everything is wired up
 hub doctor
-# Checks Python / tmux / claude CLI / env file / MCP / hooks / server
+# → Checks: Python / tmux / claude CLI / env / MCP / hooks / server
+# Expected output: all green ✓
 
-# 5. Drop a Stone and let Claude run it
-# Click project card → "+ milestone" → type your task → "live"
-# Claude picks it up on next idle turn via mcp__ns-hub__get_pending_task
+# Step 5 — Register your project
+hub init MyProject --dir ~/Projects/MyProject
+
+# Step 6 — Restart Claude Code so hooks + MCP are loaded
+# (close and reopen Claude Code, or run: claude --resume)
+
+# Step 7 — Drop your first Stone
+# In the hub UI: click your project card → "+ milestone" → type a task → click "live"
+# In Claude Code: you'll see the task injected automatically on next idle turn
+# Claude completes it → you get a push notification (if ntfy is configured)
 ```
 
-> **Restart Claude Code** after `hub install-global` so the new MCP server and hooks are loaded.
+**What you'll see in Claude Code when a Stone arrives:**
+```
+[hub] Stone M1 claimed: "Write a hello world in Python"
+→ Claude runs the task autonomously
+→ Stone status: pending_confirmation → done
+```
+
+> **Note**: `hub install-global` writes to `~/.claude/` — restart Claude Code after running it.
 
 ---
 
@@ -161,7 +178,8 @@ hub doctor
 | **Session resume** | ↻ resumes exact prior context — no re-explaining, no lost work |
 | **Context persistence** | Stone history, evidence URLs, conversation summaries — all local SQLite, fully portable |
 | **North Star swimlane** | All projects + milestones on one screen, any device |
-| **Corpus browser** | Browse all local skills/agents/docs; inline search across 180+ entries |
+| **Corpus browser** | Browse all local skills/agents/docs; inline search across 190+ entries |
+| **Per-stone session assignment** | Pin any Stone to a specific exec session — override auto-dispatch from the UI |
 | **Zero-config install** | `pip install claude-ns-hub && hub` — that's the entire setup |
 
 ---
