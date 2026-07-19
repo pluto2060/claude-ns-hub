@@ -138,7 +138,7 @@ hub
 # Step 3 — Register hooks + MCP into Claude Code (run once per machine)
 hub install-global
 # → Writes lifecycle protocol to ~/.claude/CLAUDE.md
-# → Registers mcp__ns-hub server + 4 hooks in ~/.claude/settings.json
+# → Registers mcp__ns-hub server + 5 hooks in ~/.claude/settings.json
 
 # Step 4 — Verify everything is wired up
 hub doctor
@@ -193,7 +193,7 @@ hub init MyProject --dir ~/Projects/MyProject
 ├── config.yaml            — optional overrides (port, tailscale IP, etc.)
 ├── static/
 │   ├── northstar.html     — web UI
-│   └── hooks/             — Claude Code hooks (PostToolUse / Stop / PreToolUse)
+│   └── hooks/             — Claude Code hooks (PreToolUse / Stop / PostToolUse / PreCompact / SubagentStart+Stop)
 ├── corpora/               — local corpus collections (skills, agents, docs)
 ├── ee/                    — enterprise extensions (source-available)
 └── relay/                 — optional Cloudflare Workers relay for remote access
@@ -324,6 +324,26 @@ curl http://localhost:9001/api/metrics?proj_id=MOAT
 - **Linux/WSL2 only** — macOS support is on the roadmap; Windows-native is not planned
 - **Requires tmux** in your PATH
 - **Web UI** is functional but unpolished — PRs welcome
+
+---
+
+## Changelog
+
+### v0.3.10 (2026-07-20)
+
+**Bug fixes**
+- `hub --help` no longer starts the server — prints usage and exits
+- `hub --version` no longer starts the server — prints version and exits
+- `GET /landing` now redirects to `/northstar` (was 404)
+- `POST /api/northstar` with a single-dict body now returns 400 with a hint to use `/api/northstar/create` (was silently a no-op returning `{ok:true}`)
+- `POST /milestones` with `layer:"root"` or `layer:"substar"` now auto-converts to integer (was 500); unknown strings return 422 with an explicit error message
+
+### v0.3.9 (2026-07-19)
+
+**New hooks (M1951)**
+- `northstar-precompact-busy.py` — keeps session busy during context compaction (`PreCompact` event)
+- `northstar-subagent-busy.py` — tracks subagent busy state (`SubagentStart` / `SubagentStop` events)
+- `hub doctor` now checks all 5 hooks (was 3)
 
 ---
 
