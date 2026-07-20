@@ -15,6 +15,6 @@ Source: https://github.com/jaytoone/claude-ns-hub
 PyPI:   https://pypi.org/project/claude-ns-hub/
 """
 
-__version__ = "0.3.10"
+__version__ = "0.3.11"
 __author__ = "jaytoone"
 __license__ = "MIT"

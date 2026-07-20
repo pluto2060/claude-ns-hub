@@ -9,7 +9,7 @@
 
 **Drop a task. Walk away. Come back to results.**
 
-`pip install claude-ns-hub` — 60-second install, zero config files, AGPL open source.
+`pip install claude-ns-hub` — 60-second install, no required config files, AGPL open source.
 
 > I built this because I kept babysitting Claude Code sessions — checking every 10 minutes whether they'd finished. NS Hub fixes that: drop a Stone, go make coffee, get a push notification when Claude's done. I've been using it daily for 6 months.
 
@@ -100,7 +100,7 @@ pip install claude-ns-hub
 hub                          # starts at http://localhost:9001
 ```
 
-No config files. No environment variables. No separate daemon. Open the printed URL in your phone browser and you're done.
+No required config files. No environment variables. No separate daemon. Open the printed URL in your phone browser and you're done. (Optional: `~/.hub/config.yaml` for push notifications via ntfy.)
 
 ### Prerequisites
 
@@ -328,6 +328,16 @@ curl http://localhost:9001/api/metrics?proj_id=MOAT
 ---
 
 ## Changelog
+
+### v0.3.11 (2026-07-20)
+
+**Onboarding fixes (E0–E5)**
+- `PORT` default corrected from 9000 → 9001 (fixes ERR_CONNECTION_REFUSED on first run)
+- `hub install-global` now prints a restart-Claude-Code reminder after completing
+- `hub doctor` / smoke test now checks all 5 hooks including `northstar-precompact-busy.py` and `northstar-subagent-busy.py`
+- macOS: `hub install-global` now prints a clear message instead of silently writing a systemd unit that can't be activated
+- README: corrected "No config files" to "No required config files" — clarified that `~/.hub/config.yaml` is optional for push notifications
+- Dashboard: shows onboarding banner with `hub init` command when no projects exist
 
 ### v0.3.10 (2026-07-20)
 

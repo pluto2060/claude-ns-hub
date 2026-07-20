@@ -14,7 +14,8 @@ import sys, json, pathlib, subprocess, argparse, urllib.request, urllib.error, t
 HUB_URL = "http://127.0.0.1:9001"
 SETTINGS = pathlib.Path.home() / ".claude" / "settings.json"
 CONFIG_ENV = pathlib.Path.home() / ".config" / "hub" / "env"
-CORE_HOOKS = ["northstar-pretool-busy.py", "northstar-stop-idle.py", "northstar-action-log.py"]
+CORE_HOOKS = ["northstar-pretool-busy.py", "northstar-stop-idle.py", "northstar-action-log.py",
+              "northstar-precompact-busy.py", "northstar-subagent-busy.py"]
 
 PASS = "\033[32m✅\033[0m"
 FAIL = "\033[31m❌\033[0m"
