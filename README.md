@@ -100,6 +100,8 @@ pip install claude-ns-hub
 hub                          # starts at http://localhost:9001
 ```
 
+> **Python 3.10+ required.** On systems where `pip` / `pip3` points to Python 3.8 (common on Ubuntu/Jetson/Raspberry Pi), use `python3.10 -m pip install claude-ns-hub` instead.
+
 No required config files. No environment variables. No separate daemon. Open the printed URL in your phone browser and you're done. (Optional: `~/.hub/config.yaml` for push notifications via ntfy.)
 
 ### Prerequisites
@@ -328,6 +330,11 @@ curl http://localhost:9001/api/metrics?proj_id=MOAT
 ---
 
 ## Changelog
+
+### v0.3.12 (2026-07-21)
+
+**Onboarding fix (E6)**
+- README: install section now shows a Python 3.10+ warning for systems where `pip`/`pip3` defaults to Python 3.8 (Ubuntu, Jetson, Raspberry Pi) — use `python3.10 -m pip install claude-ns-hub`
 
 ### v0.3.11 (2026-07-20)
 
