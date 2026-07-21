@@ -5148,10 +5148,29 @@ _ALLOWED_PTY_AGENTS = {"claude", "codex", "openrouter"}
 # so we use the agent name set directly. New agent → add to _ALLOWED_AGENTS only.
 _IDLE_HARNESS_CMDS = _ALLOWED_AGENTS.copy()
 _OSK_PROXY_URL = "http://127.0.0.1:4100"
-_OSK_PROXY_KEY = "sk-osk-local"
 _OPENROUTER_PROXY_URL = "http://127.0.0.1:4100"  # LiteLLM proxy handles openrouter/ prefix
 _DSK_PROXY_URL = "http://127.0.0.1:8860"  # Darwin-28B bridge (SSH tunnel → NIPA:8850)
-_DSK_PROXY_KEY = "sk-ant-api03-dummy-dsk-darwin28b-coder-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+
+def _read_proxy_key(env_var: str, default: str) -> str:
+    """Read proxy key from os.environ first, then ~/.config/hub/env, then default."""
+    val = os.environ.get(env_var, "")
+    if val:
+        return val
+    _env_file = Path.home() / ".config" / "hub" / "env"
+    if _env_file.exists():
+        for _line in _env_file.read_text(encoding="utf-8").splitlines():
+            if _line.startswith(f"{env_var}=") and not _line.startswith("#"):
+                return _line.split("=", 1)[1].strip()
+    return default
+
+
+def _get_osk_proxy_key() -> str:
+    return _read_proxy_key("OSK_PROXY_KEY", "sk-osk-local")
+
+
+def _get_dsk_proxy_key() -> str:
+    return _read_proxy_key("DSK_PROXY_KEY", "sk-dsk-local")
 
 
 # ── M705: Per-user config helpers ─────────────────────────────────────────────
@@ -5335,7 +5354,7 @@ def _get_project_spawn_env(proj_id: str, override_model: str = None) -> dict:
         return {
             "CLAUDE_CODE_OAUTH_TOKEN": "",
             "CLAUDE_CODE_OAUTH_REFRESH_TOKEN": "",
-            "ANTHROPIC_API_KEY": _OSK_PROXY_KEY,
+            "ANTHROPIC_API_KEY": _get_osk_proxy_key(),
             "ANTHROPIC_BASE_URL": _OSK_PROXY_URL,
             "ANTHROPIC_MODEL": model,
             "ANTHROPIC_SMALL_FAST_MODEL": model,
@@ -5352,7 +5371,7 @@ def _get_project_spawn_env(proj_id: str, override_model: str = None) -> dict:
                         or_key = _line.split("=", 1)[1].strip()
                         break
         if not or_key:
-            or_key = _OSK_PROXY_KEY
+            or_key = _get_osk_proxy_key()
         or_model = ("openrouter-" + model[3:]) if model.startswith("or-") else model
         return {
             "CLAUDE_CODE_OAUTH_TOKEN": "",
@@ -5368,7 +5387,7 @@ def _get_project_spawn_env(proj_id: str, override_model: str = None) -> dict:
             "CLAUDE_CODE_OAUTH_TOKEN": "",
             "CLAUDE_CODE_OAUTH_REFRESH_TOKEN": "",
             "CLAUDE_CODE_DISABLE_NONAPI_AUTH": "1",
-            "ANTHROPIC_API_KEY": _DSK_PROXY_KEY,
+            "ANTHROPIC_API_KEY": _get_dsk_proxy_key(),
             "ANTHROPIC_BASE_URL": _DSK_PROXY_URL,
             "ANTHROPIC_MODEL": model,
             "ANTHROPIC_SMALL_FAST_MODEL": model,
@@ -14966,20 +14985,37 @@ def _hub_ensure_env_file():
         env_file.write_text(
             "HUB_HOST=127.0.0.1\nHUB_PORT=9001\n"
             "# OpenRouter — set key to enable or-* models (e.g. or-kimi-k2, or-grok-3)\n"
-            "#OPENROUTER_API_KEY=sk-or-v1-...\n",
+            "#OPENROUTER_API_KEY=sk-or-v1-...\n"
+            "# OSK (OpenAI-compatible) proxy key — set to override local default\n"
+            "#OSK_PROXY_KEY=sk-osk-...\n"
+            "# DSK (Darwin-28B) proxy key — set to override local default\n"
+            "#DSK_PROXY_KEY=sk-dsk-...\n",
             encoding="utf-8",
         )
         print(f"Created {env_file} (HUB_HOST=127.0.0.1 HUB_PORT=9001)")
     else:
-        # Idempotent: inject OR placeholder comment if key not mentioned yet
+        # Idempotent: inject placeholders for any keys not yet mentioned
         existing = env_file.read_text(encoding="utf-8")
+        additions = []
         if "OPENROUTER_API_KEY" not in existing:
+            additions.append(
+                "\n# OpenRouter — set key to enable or-* models (e.g. or-kimi-k2, or-grok-3)\n"
+                "#OPENROUTER_API_KEY=sk-or-v1-...\n"
+            )
+        if "OSK_PROXY_KEY" not in existing:
+            additions.append(
+                "# OSK (OpenAI-compatible) proxy key — set to override local default\n"
+                "#OSK_PROXY_KEY=sk-osk-...\n"
+            )
+        if "DSK_PROXY_KEY" not in existing:
+            additions.append(
+                "# DSK (Darwin-28B) proxy key — set to override local default\n"
+                "#DSK_PROXY_KEY=sk-dsk-...\n"
+            )
+        if additions:
             with env_file.open("a", encoding="utf-8") as _f:
-                _f.write(
-                    "\n# OpenRouter — set key to enable or-* models (e.g. or-kimi-k2, or-grok-3)\n"
-                    "#OPENROUTER_API_KEY=sk-or-v1-...\n"
-                )
-            print(f"Updated {env_file}: added OPENROUTER_API_KEY placeholder")
+                _f.write("".join(additions))
+            print(f"Updated {env_file}: added proxy key placeholders")
     return env_file
 
 
