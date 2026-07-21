@@ -239,7 +239,7 @@ nav {
       <div class="status-dot check" id="dot-corpus"></div>
       <span class="tab-name">Corpus</span>
     </div>
-    <div class="tab" data-tab="market-signals">
+    <div class="tab" data-tab="market-signals" style="display:none" id="tab-market-signals">
       <div class="status-dot check" id="dot-market-signals"></div>
       <span class="tab-name">Market</span>
     </div>
@@ -332,6 +332,10 @@ async function initConfig() {
     };
     pushTheme('frame-northstar',      cfg.northstar_url);
     pushTheme('frame-market-signals', cfg.market_signals_url || '/market-signals');
+    if (cfg.show_market) {
+      const mt = document.getElementById('tab-market-signals');
+      if (mt) mt.style.display = '';
+    }
   } catch (_) {}
 }
 initConfig();

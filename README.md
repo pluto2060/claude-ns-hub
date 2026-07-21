@@ -120,7 +120,7 @@ Without both of these, OpenRouter sessions silently stay unavailable — hub doe
 
 **Running on WSL2?** Hub works out of the box, with two things worth knowing:
 - Port exposure to your Windows host/Tailscale is automatic on startup (`wsl-expose`, if installed) — no manual `ssh -L` forwarding needed.
-- On boot, hub waits up to 60s for `tailscaled` to assign an IP before binding — if `tailscale status` isn't ready yet (common right after a fresh WSL2 launch), the first request or two may briefly fail; retrying after a few seconds resolves it.
+- Hub binds to `0.0.0.0` (all interfaces), so both `localhost:9001` and your Tailscale IP respond immediately — no wait for `tailscaled` on startup.
 
 ---
 
@@ -330,6 +330,27 @@ curl http://localhost:9001/api/metrics?proj_id=MOAT
 ---
 
 ## Changelog
+
+### v0.3.16 (2026-07-21)
+
+**Market tab — owner-only visibility**
+- Market tab hidden by default for all users
+- To show it: run `localStorage.setItem('hub_market_visible','1')` in browser devtools once — persists across reloads
+- Tab ID `tab-market-signals` added for scripting
+
+### v0.3.15 (2026-07-21)
+
+**Mascot fallback + Market tab hidden**
+- Default mascot GIF bundled as `static/mascot-default.gif` — new installs no longer show a broken image; custom mascot at `/uploads/MOAT/...` takes priority via `onerror` fallback
+- Market tab hidden from the hub index UI (`display:none`) — accessible via direct URL `/market-signals` but not shown in nav
+
+### v0.3.14 (2026-07-21)
+
+**Bind fix — `0.0.0.0` (all interfaces)**
+- Hub now binds to `0.0.0.0` instead of a specific Tailscale IP — `localhost:9001` and Tailscale IP both respond simultaneously
+- Fixes smoke test false-negative on Tailscale-only machines (e.g. Jetson/Xavier): `hub doctor` health check now passes without Tailscale running
+- Startup banner now shows both `localhost` URL and Tailscale mobile URL separately
+- README: updated WSL2 note — no longer waits for `tailscaled` on boot
 
 ### v0.3.13 (2026-07-21)
 

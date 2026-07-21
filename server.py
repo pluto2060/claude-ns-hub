@@ -219,9 +219,10 @@ def _bound_ip(port: int) -> str:
     return "127.0.0.1"
 
 
-# Resolve HOST: Tailscale IP if available, else 127.0.0.1. Never 0.0.0.0.
+# Resolve HOST: bind 0.0.0.0 so localhost + Tailscale IP both respond.
+# Banner still shows the Tailscale URL for mobile access.
 if not HOST:
-    HOST = _tailscale_interface_ip()  # returns 127.0.0.1 if Tailscale not available
+    HOST = "0.0.0.0"
 
 
 def _ctx_url() -> str:
@@ -306,11 +307,14 @@ async def index():
 @app.get("/config")
 async def config():
     corpus_url = _corpus_url()
+    _cfg = _read_hub_config()
     return JSONResponse({
         "corpus_url":         corpus_url,
         "northstar_url":      "/northstar",
         "market_signals_url": "/market-signals",
         "ntfy_topic_set":     bool(_get_telegram_config()[0]),
+        "show_market":        bool(_cfg.get("show_market", False)),
+        "show_dsk":           bool(_cfg.get("show_dsk", False)),
     })
 
 @app.get("/api/hub/defaults")
@@ -4166,11 +4170,13 @@ async def _expose_ports_to_tailscale():
 @app.on_event("startup")
 async def _ensure_litellm_proxy():
     """M506: Auto-start LiteLLM proxy on port 4100 if not running.
-    Uses ~/.rsk-litellm.yaml config + API keys from ~/.claude/env/shared.env."""
+    M1925: config priority: ~/.hub-litellm.yaml (hub-canonical) → ~/.rsk-litellm.yaml (legacy).
+    API keys sourced from ~/.config/hub/env (EnvironmentFile) or ~/.claude/env/shared.env."""
     import shutil as _shutil
     port = 4100
-    config = Path.home() / ".rsk-litellm.yaml"
-    log = Path.home() / ".rsk-litellm.log"
+    # M1925: prefer hub-canonical config over legacy rsk path
+    config = _HUB_LITELLM_CONFIG if _HUB_LITELLM_CONFIG.exists() else Path.home() / ".rsk-litellm.yaml"
+    log = Path.home() / ".hub-litellm.log"
     if not config.exists():
         return  # no config → skip silently
     if not _shutil.which("litellm"):
@@ -4183,12 +4189,11 @@ async def _ensure_litellm_proxy():
             return  # already running
     except Exception:
         pass
-    # Load API keys from shared.env
+    # M1925: Load API keys — priority: ~/.config/hub/env > ~/.claude/env/shared.env
     env = dict(os.environ)
-    shared_env = Path.home() / ".claude" / "env" / "shared.env"
-    if shared_env.exists():
+    def _load_env_file(path: Path):
         try:
-            for line in shared_env.read_text().splitlines():
+            for line in path.read_text().splitlines():
                 line = line.strip()
                 if line.startswith("export "):
                     line = line[7:]
@@ -4197,6 +4202,8 @@ async def _ensure_litellm_proxy():
                     env[k.strip()] = v.strip().strip('"').strip("'")
         except Exception:
             pass
+    _load_env_file(Path.home() / ".claude" / "env" / "shared.env")   # lower priority
+    _load_env_file(Path.home() / ".config" / "hub" / "env")           # higher priority (wins)
     try:
         log.parent.mkdir(parents=True, exist_ok=True)
         subprocess.Popen(
@@ -8724,8 +8731,10 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                             (m.get("text") or ""), flags=_re_m1981.S
                         ).lower()
                         _m1981_layer_a_kws = (
-                            "스크린샷", "screenshot", "excel", "엑셀", "pdf", "docx",
-                            "보고서", "report", "chart", "이미지", "image", "분석결과",
+                            # M1981: action verbs + verbal nouns → Layer A hard block (mirrors _layer_a_keywords)
+                            "구현", "기능", "추가", "수정", "개선", "만들", "작성", "생성",
+                            "implement", "create", "build", "design", "develop",
+                            "검수", "리서치", "research", "정리", "분석", "analysis",
                         )
                         _m1981_will_block = (
                             any(kw in _m1981_txt for kw in _m1981_layer_a_kws)
@@ -9074,18 +9083,24 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                     # wrapped sentinel and the legacy bare-string sentinel in older stone text.
                     import re as _re_ev
                     _stone_txt = _re_ev.sub(r'\S?PASTE\S?.*?\S?/PASTE\S?', '', (m.get("text") or ""), flags=_re_ev.S).lower()
-                    # M1265: Layer A (artifact nouns) → force required; Layer B (action verbs) → warning only
-                    # 결과물/산출물 → Layer B: generic output nouns, not file-specific; false positives too high
+                    # M1981: Layer A (action verbs + verbal nouns) → hard block
+                    # Layer B (artifact/file nouns) → soft warning only
                     _layer_a_keywords = (
-                        "스크린샷", "screenshot", "excel", "엑셀", "pdf", "docx",
-                        "보고서", "report", "chart", "이미지", "image", "분석결과",
-                    )
-                    _layer_b_keywords = (
-                        "화면", "ui", "검수", "visual", "proof", "table",
-                        "증거", "증빙", "문서", "분석", "analysis",
-                        "리서치", "research", "정리",
+                        # Action verbs
                         "구현", "기능", "추가", "수정", "개선", "만들", "작성", "생성",
                         "implement", "create", "build", "design", "develop",
+                        # Verbal nouns (동사의 명사형) — imply task completion, not just file reference
+                        "검수", "리서치", "research", "정리", "분석", "analysis",
+                    )
+                    _layer_b_keywords = (
+                        # File-type artifact nouns
+                        "스크린샷", "screenshot", "excel", "엑셀", "pdf", "docx",
+                        "보고서", "report", "chart", "분석결과",
+                        # Visual/UI artifact nouns
+                        "이미지", "image", "화면", "ui", "visual",
+                        # Evidence/document nouns
+                        "proof", "table", "증거", "증빙", "문서",
+                        # Generic output nouns
                         "결과물", "산출물",
                     )
                     _is_layer_a = any(kw in _stone_txt for kw in _layer_a_keywords)
@@ -14861,6 +14876,43 @@ def _hub_doctor(exit_code: bool = False):
     chk(f"Hub server responding at {_hub_check_url}", hub_ok,
         "systemctl --user start hub  # or: hub (to start manually)")
 
+    # M1925: OpenRouter checks (optional — informational only, not counted in failures)
+    print("\nhub doctor — OpenRouter (optional)\n")
+    _or_key_set = False
+    try:
+        _env_text = env_file.read_text() if env_file.exists() else ""
+        _or_key_set = any(
+            l.startswith("OPENROUTER_API_KEY=") and not l.startswith("#")
+            for l in _env_text.splitlines()
+        )
+    except Exception:
+        pass
+    _litellm_ok = bool(_sh.which("litellm"))
+    _hub_ll_cfg = Path.home() / ".hub-litellm.yaml"
+    _rsk_ll_cfg = Path.home() / ".rsk-litellm.yaml"
+    _ll_cfg_ok = _hub_ll_cfg.exists() or _rsk_ll_cfg.exists()
+    _ll_cfg_path = _hub_ll_cfg if _hub_ll_cfg.exists() else (_rsk_ll_cfg if _rsk_ll_cfg.exists() else _hub_ll_cfg)
+    _ll_proxy_ok = False
+    try:
+        _pr = _ur.urlopen("http://127.0.0.1:4100/v1/models", timeout=1)
+        _ll_proxy_ok = _pr.status == 200
+    except Exception:
+        pass
+    def _info(label, ok, fix=""):
+        mark = "✅" if ok else "⚪"
+        line = f"  {mark}  {label}"
+        if not ok and fix:
+            line += f"\n       → {fix}"
+        print(line)
+    _info(f"OPENROUTER_API_KEY set in ~/.config/hub/env", _or_key_set,
+          f"echo 'OPENROUTER_API_KEY=sk-or-v1-...' >> {env_file}")
+    _info("litellm CLI installed", _litellm_ok,
+          "pip install litellm")
+    _info(f"LiteLLM config exists ({_ll_cfg_path.name})", _ll_cfg_ok,
+          "hub install-global  # auto-generates ~/.hub-litellm.yaml")
+    _info("LiteLLM proxy responding at :4100", _ll_proxy_ok,
+          "hub will auto-start it on next restart if key + litellm are both set")
+
     failed = sum(1 for ok, _ in checks if not ok)
     print(f"\n{'All checks passed ✅' if failed == 0 else f'{failed} check(s) failed — run the fix commands above.'}\n")
     if exit_code:
@@ -14870,14 +14922,86 @@ def _hub_doctor(exit_code: bool = False):
 
 def _hub_ensure_env_file():
     """F5: Create ~/.config/hub/env with defaults if missing.
-    systemd EnvironmentFile= fails silently when file absent — prevents service start."""
+    systemd EnvironmentFile= fails silently when file absent — prevents service start.
+    M1925: also injects OPENROUTER_API_KEY placeholder so users know where to set it."""
     env_dir = Path.home() / ".config" / "hub"
     env_file = env_dir / "env"
     if not env_file.exists():
         env_dir.mkdir(parents=True, exist_ok=True)
-        env_file.write_text("HUB_HOST=127.0.0.1\nHUB_PORT=9001\n", encoding="utf-8")
+        env_file.write_text(
+            "HUB_HOST=127.0.0.1\nHUB_PORT=9001\n"
+            "# OpenRouter — set key to enable or-* models (e.g. or-kimi-k2, or-grok-3)\n"
+            "#OPENROUTER_API_KEY=sk-or-v1-...\n",
+            encoding="utf-8",
+        )
         print(f"Created {env_file} (HUB_HOST=127.0.0.1 HUB_PORT=9001)")
+    else:
+        # Idempotent: inject OR placeholder comment if key not mentioned yet
+        existing = env_file.read_text(encoding="utf-8")
+        if "OPENROUTER_API_KEY" not in existing:
+            with env_file.open("a", encoding="utf-8") as _f:
+                _f.write(
+                    "\n# OpenRouter — set key to enable or-* models (e.g. or-kimi-k2, or-grok-3)\n"
+                    "#OPENROUTER_API_KEY=sk-or-v1-...\n"
+                )
+            print(f"Updated {env_file}: added OPENROUTER_API_KEY placeholder")
     return env_file
+
+
+# Mapping from or-* hub alias to upstream OpenRouter model ID (used to generate litellm config)
+_OR_MODEL_UPSTREAM = {
+    "or-gemini-flash":      "openrouter/google/gemini-2.5-flash",
+    "or-gemini3-flash":     "openrouter/google/gemini-3-flash-preview",
+    "or-deepseek-v4-flash": "openrouter/deepseek/deepseek-v4-flash",
+    "or-kimi-k2":           "openrouter/moonshotai/kimi-k2.6",
+    "or-hy3-preview":       "openrouter/tencent/hy3-preview",
+    "or-hy3":               "openrouter/tencent/hy3:free",
+    "or-owl-alpha":         "openrouter/openrouter/owl-alpha",
+    "or-grok-3":            "openrouter/x-ai/grok-3",
+    "or-grok-3-mini":       "openrouter/x-ai/grok-3-mini",
+    "or-nemotron":          "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
+    "or-nemotron-nano":     "openrouter/nvidia/nemotron-3-nano-30b-a3b:free",
+    # Claude models via OpenRouter (API-key fallback, not OAuth)
+    "or-sonnet":            "openai/anthropic/claude-sonnet-4.6",
+    "or-opus":              "openai/anthropic/claude-opus-4.7",
+    "or-haiku":             "openai/anthropic/claude-haiku-4.5",
+}
+
+_HUB_LITELLM_CONFIG = Path.home() / ".hub-litellm.yaml"
+
+
+def _hub_generate_litellm_config() -> Path | None:
+    """M1925: Generate ~/.hub-litellm.yaml from _OR_MODEL_UPSTREAM if not present.
+    Idempotent — skips if file already exists (user may have customized it).
+    Returns path written, or None if skipped."""
+    if _HUB_LITELLM_CONFIG.exists():
+        return None  # already present — do not overwrite
+    import shutil as _shutil
+    lines = [
+        "# NS Hub — OpenRouter LiteLLM proxy config (auto-generated by hub install-global)",
+        "# Edit model list or API base as needed. Hub reads this file on startup.",
+        "model_list:",
+    ]
+    for or_key, upstream in _OR_MODEL_UPSTREAM.items():
+        proxy_name = "openrouter-" + or_key[3:]  # or-kimi-k2 → openrouter-kimi-k2
+        lines += [
+            f"  - model_name: {proxy_name}",
+            f"    litellm_params:",
+            f"      model: {upstream}",
+            f"      api_key: os.environ/OPENROUTER_API_KEY",
+            f"      api_base: https://openrouter.ai/api/v1",
+        ]
+    lines += [
+        "",
+        "litellm_settings:",
+        "  drop_params: true",
+        "",
+        "general_settings:",
+        "  drop_params: true",
+    ]
+    _HUB_LITELLM_CONFIG.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"Created {_HUB_LITELLM_CONFIG}")
+    return _HUB_LITELLM_CONFIG
 
 
 def _hub_install_global():
@@ -14893,8 +15017,40 @@ def _hub_install_global():
     Writing to user's ~/.claude/CLAUDE.md is user-environment pollution; exec sessions already
     receive all hub protocol rules through the MCP spawn path."""
     _hub_ensure_env_file()  # F5: must precede systemd unit gen (unit references this file)
+    _hub_generate_litellm_config()  # M1925: generate ~/.hub-litellm.yaml if absent
     _hub_deploy_hooks()
     _hub_generate_systemd_unit()
+    # M1925: OpenRouter setup guidance
+    env_file = Path.home() / ".config" / "hub" / "env"
+    or_key_set = False
+    try:
+        or_key_set = bool(
+            next((l for l in env_file.read_text().splitlines()
+                  if l.startswith("OPENROUTER_API_KEY=") and not l.startswith("#")), None)
+        )
+    except Exception:
+        pass
+    if not or_key_set:
+        print(
+            "\n── OpenRouter setup (optional) ─────────────────────────────────────────────\n"
+            "  To enable or-* models (or-kimi-k2, or-grok-3, or-gemini-flash, …):\n\n"
+            f"  1. Add your key to {env_file}:\n"
+            "       OPENROUTER_API_KEY=sk-or-v1-...\n\n"
+            "  2. Install LiteLLM proxy:\n"
+            "       pip install litellm\n\n"
+            "  3. Hub auto-starts the proxy on port 4100 using ~/.hub-litellm.yaml\n"
+            "     (generated above). No manual proxy management needed.\n"
+            "─────────────────────────────────────────────────────────────────────────────\n"
+        )
+    else:
+        import shutil as _shutil
+        litellm_ok = bool(_shutil.which("litellm"))
+        print(
+            "\n── OpenRouter ──────────────────────────────────────────────────────────────\n"
+            f"  OPENROUTER_API_KEY: ✅ set in {env_file}\n"
+            f"  litellm CLI:        {'✅ found' if litellm_ok else '❌ not found — run: pip install litellm'}\n"
+            "─────────────────────────────────────────────────────────────────────────────\n"
+        )
     print("\n⚠  Restart Claude Code now to activate MCP + hooks: close all Claude Code windows and reopen.\n")
 
 
@@ -15888,7 +16044,8 @@ def main():
         f"  claude-ns-hub v{_ver}",
         f"  ──────────────────────────────────────────────",
         f"   Dashboard:   http://localhost:{actual_port}/northstar",
-        f"   Bind:        {HOST}:{actual_port}",
+        f"   Mobile:      http://{_tailscale_interface_ip()}:{actual_port}/northstar",
+        f"   Bind:        {HOST}:{actual_port}  (all interfaces)",
         f"   Entity corpus:  {'spawned' if corpus_proc else 'disabled'}",
         f"   Tailscale expose:  attempted (port {actual_port})",
         f"   Telemetry:   {_tel_on}",

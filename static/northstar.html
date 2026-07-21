@@ -1742,6 +1742,7 @@ header {
         <div class="ns-mascot-wrap" id="ns-mascot-wrap">
         <img class="ns-mascot" src="/uploads/MOAT/B6332969-541C-4314-9384-6993D8B12CD7.gif" alt="" draggable="false"
           onclick="_feedMascot(event)" title="Click to feed!"
+          onerror="if(this.src.indexOf('mascot-default')<0)this.src='/static/mascot-default.gif'"
           id="ns-mascot-img">
         </div>
         <!-- M212 v5 → M227 v2: free-moving multi-pointer system retired in favor of per-card pointer. Container hidden. -->
@@ -2105,6 +2106,12 @@ header {
 
 let projects = [];
 let activeIdx = null;
+
+// Hub feature flags — populated async from /config; defaults safe for deploy
+let _hubCfg = { show_dsk: false, show_market: false };
+(async () => {
+  try { _hubCfg = await fetch('/config').then(r => r.json()); } catch (_) {}
+})();
 
 // M140: update the watching pill in the header bar (visible on mobile)
 function _updateWatchPill() {
@@ -12998,7 +13005,7 @@ function _refreshCommentThread(mid) {
             return seg.trim() ? {role:'user', text:seg.trim()} : null;
           }).filter(Boolean);
           const _header = `<div style="font-size:8px;color:var(--text-dim);margin-bottom:3px;padding:2px 4px;background:var(--bg-deep);border-radius:2px;display:inline-block">∑ ${msg.compressed_count||'?'} turns compressed</div>`;
-          const _body = _turns.map(t => `<div style="margin-bottom:5px"><div style="font-size:9px;color:${t.role==='user'?'var(--text-dim)':'var(--accent)'}">${t.role==='user'?'you':'claude'}</div><div style="font-size:11px;color:var(--text);margin-top:1px">${_renderNtTextHtml(t.text)}</div></div>`).join('');
+          const _body = _turns.map(t => `<div style="margin-bottom:5px"><div style="margin-bottom:2px"><span style="font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px;letter-spacing:.03em;${t.role==='user'?'background:#fff;color:#111':'background:var(--accent);color:#fff'}">${t.role==='user'?'you':'agent'}</span></div><div style="font-size:11px;color:var(--text);margin-top:1px">${_renderNtTextHtml(t.text)}</div></div>`).join('');
           return `<div style="margin-bottom:8px;padding:6px 8px;border-left:2px solid var(--text-dim);border-radius:0 3px 3px 0;opacity:.85">${_header}${_body}</div>`;
         }
         const skillTag = [
@@ -13013,8 +13020,7 @@ function _refreshCommentThread(mid) {
           _lastDateKey = _dk;
         }
         return _divider + `<div style="margin-bottom:6px">
-          <div style="font-size:9px;color:${msg.role==='user'?'var(--text-dim)':'var(--accent)'}">
-            ${msg.role==='user'?'you':'claude'} · ${_fmtTs(msg.ts)}${skillTag}</div>
+          <div style="margin-bottom:2px"><span style="font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px;letter-spacing:.03em;${msg.role==='user'?'background:#fff;color:#111':'background:var(--accent);color:#fff'}">${msg.role==='user'?'you':'agent'}</span> <span style="font-size:9px;color:var(--text-dim)">${_fmtTs(msg.ts)}${skillTag}</span></div>
           <div style="font-size:11px;color:var(--text);margin-top:1px">${_applyInlineMarkdown(_renderNtTextHtml(msg.text))}</div>
         </div>`;
       }).join('') + `</div>`;
@@ -13203,8 +13209,7 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
       lastDKRef.v = _dk;
     }
     return _div + `<div style="margin-bottom:6px">
-      <div style="font-size:9px;color:${msg.role==='user'?'var(--text-dim)':'var(--accent)'}">
-        ${msg.role==='user'?'you':'claude'} · ${_fmtTs(msg.ts)}${skillTag}</div>
+      <div style="margin-bottom:2px"><span style="font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px;letter-spacing:.03em;${msg.role==='user'?'background:#fff;color:#111':'background:var(--accent);color:#fff'}">${msg.role==='user'?'you':'agent'}</span> <span style="font-size:9px;color:var(--text-dim)">${_fmtTs(msg.ts)}${skillTag}</span></div>
       <div style="font-size:11px;color:var(--text);margin-top:1px">${_applyInlineMarkdown(_renderNtTextHtml(msg.text))}</div>
     </div>`;
   }
@@ -13406,8 +13411,9 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
     );
     if (_needsRefresh) {
       // Suppress extractive badge during async fetch to avoid ∑N flash before AI∑ lands.
+      // M1979-b: if badge currently shows AI∑, preserve it — don't regress to ∑N during refresh.
       const _badgeEl = document.getElementById('comment-summary-badge');
-      if (_badgeEl) { _badgeEl.style.display = 'none'; }
+      if (_badgeEl && _badgeEl.textContent !== 'AI∑') { _badgeEl.style.display = 'none'; }
       // M1979: loadMilestones early-returns when _activeDetailProjId !== projId (cross-project
       // detail open), leaving cache empty and badge stale. Direct fetch bypasses the guard.
       fetch(`/api/northstar/${encodeURIComponent(projId)}/milestones`, {cache:'no-store'})
@@ -13565,12 +13571,29 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
 // the AI∑ badge stale until the user closed/reopened the popup or reloaded the page.
 // OVH-3: memoize the expensive _semCompress extraction — key=mid|threadLen|lastTs, LRU cap 20
 const _summaryBadgeCache = new Map();
+const _summaryBadgeRefreshInFlight = new Set(); // M1979-c: prevent re-entrant refreshes per mid
 function _updateSummaryBadge(mid) {
   // M1253 v3: AI∑ badge — LLM summary (conversation_summary) takes priority; fallback to extractive ∑N.
   { const _conv = (_msConversations[mid]||[]); const _badge = document.getElementById('comment-summary-badge'); const _detail = document.getElementById('comment-summary-detail');
     if (_badge) {
       const _stoneData = Object.values(_msCacheByProject||{}).flatMap(v=>v||[]).find(m=>m.id===mid);
       const _llmConvSum = _stoneData?.conversation_summary;
+      // M1979-c: stale cache — stone is in cache but lacks conversation_summary (loaded before compress ran).
+      // ETag 304 path never refreshes — force a targeted one-shot fetch to pick up the summary.
+      if (_stoneData && !_llmConvSum && _openCommentMid === mid && !_summaryBadgeRefreshInFlight.has(mid)) {
+        const _projId = Object.keys(_msCacheByProject||{}).find(p=>(_msCacheByProject[p]||[]).some(m=>m.id===mid));
+        if (_projId) {
+          _summaryBadgeRefreshInFlight.add(mid);
+          if (_badge.textContent !== 'AI∑') _badge.style.display = 'none'; // hide during refresh
+          fetch(`/api/northstar/${encodeURIComponent(_projId)}/milestones`, {cache:'no-store'})
+            .then(r=>r.json()).then(data => {
+              _msCacheByProject[_projId] = data.milestones || [];
+              _summaryBadgeRefreshInFlight.delete(mid);
+              if (_openCommentMid === mid) _updateSummaryBadge(mid);
+            }).catch(()=>{ _summaryBadgeRefreshInFlight.delete(mid); });
+          return;
+        }
+      }
       if (_llmConvSum && _llmConvSum.trim().length > 0) {
         // Priority 1: LLM-generated summary via attach_summary
         _badge.textContent = 'AI∑'; _badge.style.display = 'inline';
@@ -13582,6 +13605,8 @@ function _updateSummaryBadge(mid) {
         // Fallback: M1154 v9 / M1193 v2 — decision-anchored extractive compression
         // OVH-3: cache key = mid|threadLen|lastTs; skip recompute if thread unchanged
         const _raw0 = _conv.filter(c=>c.role!=='summary');
+        // M1979-b: no summary turns AND no raw turns → hide badge (don't show ∑0 / empty state)
+        if (!_conv.some(c=>c.role==='summary') && !_raw0.length) { _badge.style.display='none'; if (_detail) _detail.style.display='none'; return; }
         const _cacheKey = `${mid}|${_raw0.length}|${_raw0[_raw0.length-1]?.ts||''}`;
         let _llmSum = _summaryBadgeCache.get(_cacheKey) ?? null;
         if (_llmSum === null) { // cache miss → run extraction
@@ -13812,7 +13837,7 @@ async function _doCommentReply(projId, mid, inputEl, currentStatus) {
       ...(entry.skill_refs||[entry.skill_ref]).filter(Boolean).map(s=>`<span style="font-size:8px;padding:1px 4px;border-radius:2px;background:rgba(123,159,212,.12);color:var(--accent);margin-left:3px">⚡${esc(s)}</span>`),
       ...(entry.agent_refs||[entry.agent_ref]).filter(Boolean).map(a=>`<span style="font-size:8px;padding:1px 4px;border-radius:2px;background:rgba(61,139,94,.12);color:var(--green,#3d8b5e);margin-left:3px">🤖${esc(a)}</span>`),
     ].join('');
-    msgDiv.innerHTML = `<div style="font-size:9px;color:var(--text-dim)">you · ${_fmtTs(entry.ts)}${_skillTags}</div>
+    msgDiv.innerHTML = `<div style="margin-bottom:2px"><span style="font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px;letter-spacing:.03em;background:#fff;color:#111">you</span> <span style="font-size:9px;color:var(--text-dim)">${_fmtTs(entry.ts)}${_skillTags}</span></div>
       <div style="font-size:11px;color:var(--text);margin-top:1px">${_renderNtTextHtml(reply)}</div>`;
     threadEl.appendChild(msgDiv);
     // M465: scroll the actual scroll container (parent of threadArea), not inner threadEl
@@ -13895,8 +13920,7 @@ function showClarifyPopup(event, projId, mid, clarQ, clarA, hasAnswer) {
   const threadHtml = thread.length
     ? `<div id="clarify-thread" style="margin:8px 0;border-top:1px solid var(--panel-border);padding-top:8px">` +
       thread.map(msg => `<div style="margin-bottom:6px">
-        <div style="font-size:9px;color:${msg.role==='user'?'var(--text-dim)':'var(--accent)'}">
-          ${msg.role==='user'?'you':'claude'} · ${_fmtTs(msg.ts)}</div>
+        <div style="margin-bottom:2px"><span style="font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px;letter-spacing:.03em;${msg.role==='user'?'background:#fff;color:#111':'background:var(--accent);color:#fff'}">${msg.role==='user'?'you':'agent'}</span> <span style="font-size:9px;color:var(--text-dim)">${_fmtTs(msg.ts)}</span></div>
         <div style="font-size:11px;color:var(--text);margin-top:1px">${esc(msg.text)}</div>
       </div>`).join('') + `</div>`
     : '';
@@ -14277,7 +14301,7 @@ function renderRight(p) {
     const _agentList = [
       ['claude',      'Claude Code', false],
       ['openrouter',  'OpenRouter', false],
-      ['dsk',         'LocalLM', false],
+      ...(_hubCfg.show_dsk ? [['dsk', 'LocalLM', false]] : []),
       ['codex',       'Codex', false],
     ];
     const agentOpts = _agentList.map(([v,lbl,dis]) => `<option value="${esc(v)}"${v===curAgent?' selected':''}${dis?' disabled':''}
