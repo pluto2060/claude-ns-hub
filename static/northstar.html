@@ -1195,8 +1195,17 @@ header {
 .dm-header {
   display: flex; align-items: center; gap: 12px; padding: 16px 22px;
   border-bottom: 1px solid var(--panel-border); flex-shrink: 0;
-  background: var(--panel-soft);
+  background: var(--panel-soft); flex-wrap: wrap;
 }
+/* M1952: scroll-context strip — below dm-header, shows active substar section info */
+#dm-scroll-ctx {
+  display: none; padding: 5px 22px;
+  font-family: var(--mono); font-size: 10px; color: var(--text-dim);
+  background: var(--panel-soft); border-bottom: 1px solid var(--panel-border);
+  flex-shrink: 0; align-items: center; gap: 4px; overflow: hidden;
+}
+/* M1958: flex layout so float:right action buttons sit at the right edge */
+#dm-scroll-ctx.active { display: flex; }
 .dm-title { font-family: var(--serif); font-size: 20px; font-weight: 500; color: var(--text); flex: 1; }
 .dm-status-pill { font-size: 10px; font-family: var(--mono); padding: 3px 9px; border-radius: 8px; flex-shrink: 0; }
 .dm-status-pill.behind   { background: var(--red-soft);    color: var(--red); }
@@ -1879,6 +1888,8 @@ header {
         title="Open concept graph for this project">◇ graph</button>
       <button class="dm-close" onclick="closeDetail()">×</button>
     </div>
+    <!-- M1952: substar scroll context — below header, attached as its own bar -->
+    <div id="dm-scroll-ctx"></div>
 
     <!-- Body: left = hierarchy, right = work + actions -->
     <div class="dm-body" id="dm-body">
@@ -2190,6 +2201,18 @@ async function loadData() {
     });
 
     render();
+    // E2: show onboarding banner when no projects exist
+    { const _ob = document.getElementById('_onboard-banner');
+      if (!projects.length) {
+        if (!_ob) {
+          const _b = document.createElement('div');
+          _b.id = '_onboard-banner';
+          _b.style.cssText = 'position:fixed;top:48px;left:0;right:0;z-index:9000;background:var(--accent);color:#fff;font-size:12px;padding:8px 16px;text-align:center';
+          _b.textContent = 'No projects yet. Run: hub init <project-name> --dir <path>  (then refresh)';
+          document.body.appendChild(_b);
+        }
+      } else if (_ob) { _ob.remove(); }
+    }
     _updateWatchPill();
     document.getElementById('updated-at').textContent = new Date().toLocaleTimeString('en-GB', { hour12: false });
 
@@ -2556,6 +2579,14 @@ let _resumeInfo = {}; // proj_id → {session_id_preview, at, at_epoch, has_tran
 let _msProjectId = null;
 let _msRenderFingerprint = {}; // proj_id → last-render fingerprint (M129 blink guard)
 let _swimlaneLaneFp = {};      // lane_idx → last swimlane fingerprint (skip DOM rebuild if unchanged)
+// M1899-R18B: global render fingerprint — skip badge scan entirely on mobile when exec+session state unchanged.
+// ROLLBACK: remove this line + the _swimlaneGlobalFp guard in render().
+let _swimlaneGlobalFp = '';
+
+// M1899-R9: per-card nodeCard() HTML cache. Key = "projId:perCardFP", value = HTML string.
+// Skips 383-line string concatenation on every 60s swimlaneTick when card data is unchanged.
+// ROLLBACK: remove this line + all _nodeCardCache references below.
+let _nodeCardCache = new Map();
 let _msCollapsedParents = {}; // M548 A+C: projId → Set of collapsed parent IDs
 let _msExtFingerprint = {};   // M300: per-stone ext-cell fingerprint → skip re-inject if unchanged
 let _groupingFingerprint = {}; // M649: proj_id → last grouping fingerprint (skip DOM rearrange when unchanged)
@@ -2668,6 +2699,8 @@ async function loadMilestones(projId) {
     // has flat milestones available for any downstream consumer.
     _msCacheByProject[projId] = d2.milestones || [];
     renderMilestoneCreator(projId, d2.milestones || []);
+    // M822: keep timeline in sync if currently visible
+    if (_msViewMode === 'timeline') _renderMsTimeline();
     // M1435 v6: re-apply elapsed display after panel DOM is ready (per-project)
     _updateBlinkLastElapsed(window._lastBlinkData || null, projId);
     // Set up touch drag for mobile
@@ -3474,7 +3507,7 @@ function renderMilestoneCreator(projId, milestones) {
               <!-- M226: msg badge styled as a hold-style pill. -->
               <button class="nt-why" title="Needs clarification — click to view question & reply" style="${_msBadgeStyle('clar')}" ${clarDataAttrs} onclick="${clarOnClick}">${msgCnt>0 ? msgCnt+' msg' : '?'}</button>${_msBangHtml(m.id, projId)}
               ${_msHoldBtnHtml(projId, m.id, !!m.held)}
-              ${_ssScoreBadgeHtml(m)}
+              ${_ssScoreBadgeHtml(m, projId)}
               ${children.length>0?`<button id="sub-tog-${esc(m.id)}" title="Expand/collapse children (${children.length})"
                 style="display:flex;align-items:center;justify-content:center;margin:3px auto 0;height:22px;padding:0 6px;border-radius:3px;border:1px solid var(--accent-soft);background:none;color:var(--accent);cursor:pointer;font-size:10px;line-height:1;font-family:var(--mono)"
                 onclick="event.stopPropagation();_toggleSubstones('${esc(m.id)}',this)">${(_msCollapsedParents[projId]||new Set()).has(m.id)?`▷ ${children.length}`:`▾ ${children.length}`}</button>`:''}
@@ -3495,12 +3528,14 @@ function renderMilestoneCreator(projId, milestones) {
           const cMsgOnclick = cShowPopup
             ? `event.stopPropagation();showCommentPopup(event,'${escJsC(c.claude_comment||'')}','${esc(projId)}','${esc(c.id)}','${esc(cS)}')`
             : `event.stopPropagation();_msAddMsg(event,'${esc(projId)}','${esc(c.id)}','${esc(cS)}',this)`;
-          return `<tr class="ms-child-row nt-draggable-row${(_msCollapsedParents[projId]||new Set()).has(m.id)?' ms-collapsed':''}" data-mid="${esc(c.id)}" data-status="${esc(cS)}" data-parent="${esc(m.id)}" data-held="${c.held?'1':'0'}" data-last-turn="${_isLastTurn(c)?'1':'0'}" style="position:relative">
+          // M1907: is_progress=true → dimmed opacity + ~prefix on id (mid-flight M190-bypass progress child)
+          const _cIsProgress = !!c.is_progress;
+          return `<tr class="ms-child-row nt-draggable-row${(_msCollapsedParents[projId]||new Set()).has(m.id)?' ms-collapsed':''}${_cIsProgress?' ms-progress-child':''}" data-mid="${esc(c.id)}" data-status="${esc(cS)}" data-parent="${esc(m.id)}" data-held="${c.held?'1':'0'}" data-last-turn="${_isLastTurn(c)?'1':'0'}" style="position:relative${_cIsProgress?';opacity:0.75':''}">
             <td class="ms-td-drag"><span class="nt-drag-handle" title="Drag to reorder">⋮⋮</span></td>
             ${_gapCells(c)}
             <td class="ms-td-id">
               <div class="nt-id-stack">
-                <span><span class="nt-mid">${esc(c.id)}</span>${cS === 'queued' ? ` <span class="nt-priority-tag" title="Queued">▶</span>` : ''}</span>
+                <span><span class="nt-mid">${_cIsProgress?'~':''}${esc(c.id)}</span>${cS === 'queued' ? ` <span class="nt-priority-tag" title="Queued">▶</span>` : ''}${_cIsProgress ? ` <span style="font-size:9px;color:var(--text-dim)" title="Mid-flight progress update (M190 bypass)">진행</span>` : ''}</span>
                 ${c.user_added_at ? `<span style="font-family:var(--mono);font-size:9px;color:var(--accent-deep);font-weight:600;letter-spacing:.04em;line-height:1.3" class="nt-time-span">${esc(c.user_added_at.slice(5,10))}<br>${esc(c.user_added_at.slice(11,16))}</span>` : ''}
                 ${(() => {
                   const _cShotUrl = [...(_msConversations[c.id]||[])].reverse().reduce((f,x)=>{if(f)return f;const u=(x.text||'').match(/https?:\/\/(?:[^\s"']*\.)?drive\.google\.com[^\s"')>]*/g)||[];return u[0]||null;},null);
@@ -3632,7 +3667,7 @@ function renderMilestoneCreator(projId, milestones) {
               })()}${_msBangHtml(m.id, projId)}
               ${_msWatchBadgeHtml(projId, m.id, !!m.watching)}
               ${_msHoldBtnHtml(projId, m.id, !!m.held)}
-              ${_ssScoreBadgeHtml(m)}
+              ${_ssScoreBadgeHtml(m, projId)}
               ${children.length>0?`<button id="sub-tog-${esc(m.id)}" title="Expand/collapse children (${children.length})"
                 style="display:flex;align-items:center;justify-content:center;margin:3px auto 0;height:22px;padding:0 6px;border-radius:3px;border:1px solid var(--accent-soft);background:none;color:var(--accent);cursor:pointer;font-size:10px;line-height:1;font-family:var(--mono)"
                 onclick="event.stopPropagation();_toggleSubstones('${esc(m.id)}',this)">${(_msCollapsedParents[projId]||new Set()).has(m.id)?`▷ ${children.length}`:`▾ ${children.length}`}</button>`:''}
@@ -3654,12 +3689,14 @@ function renderMilestoneCreator(projId, milestones) {
           const cMsgOnclick = cShowPopup
             ? `event.stopPropagation();showCommentPopup(event,'${escJsC(c.claude_comment||'')}','${esc(projId)}','${esc(c.id)}','${esc(cS)}')`
             : `event.stopPropagation();_msAddMsg(event,'${esc(projId)}','${esc(c.id)}','${esc(cS)}',this)`;
-          return `<tr class="ms-child-row nt-draggable-row${(_msCollapsedParents[projId]||new Set()).has(m.id)?' ms-collapsed':''}" data-mid="${esc(c.id)}" data-status="${esc(cS)}" data-parent="${esc(m.id)}" data-held="${c.held?'1':'0'}" data-last-turn="${_isLastTurn(c)?'1':'0'}" style="position:relative">
+          // M1907: is_progress=true → dimmed opacity + ~prefix on id (mid-flight M190-bypass progress child)
+          const _cIsProgress = !!c.is_progress;
+          return `<tr class="ms-child-row nt-draggable-row${(_msCollapsedParents[projId]||new Set()).has(m.id)?' ms-collapsed':''}${_cIsProgress?' ms-progress-child':''}" data-mid="${esc(c.id)}" data-status="${esc(cS)}" data-parent="${esc(m.id)}" data-held="${c.held?'1':'0'}" data-last-turn="${_isLastTurn(c)?'1':'0'}" style="position:relative${_cIsProgress?';opacity:0.75':''}">
             <td class="ms-td-drag"><span class="nt-drag-handle" title="Drag to reorder">⋮⋮</span></td>
             ${_gapCells(c)}
             <td class="ms-td-id">
               <div class="nt-id-stack">
-                <span><span class="nt-mid">${esc(c.id)}</span>${cS === 'queued' ? ` <span class="nt-priority-tag" title="Queued">▶</span>` : ''}</span>
+                <span><span class="nt-mid">${_cIsProgress?'~':''}${esc(c.id)}</span>${cS === 'queued' ? ` <span class="nt-priority-tag" title="Queued">▶</span>` : ''}${_cIsProgress ? ` <span style="font-size:9px;color:var(--text-dim)" title="Mid-flight progress update (M190 bypass)">진행</span>` : ''}</span>
                 ${c.user_added_at ? `<span style="font-family:var(--mono);font-size:9px;color:var(--accent-deep);font-weight:600;letter-spacing:.04em;line-height:1.3" class="nt-time-span">${esc(c.user_added_at.slice(5,10))}<br>${esc(c.user_added_at.slice(11,16))}</span>` : ''}
                 ${(() => {
                   const _cShotUrl = [...(_msConversations[c.id]||[])].reverse().reduce((f,x)=>{if(f)return f;const u=(x.text||'').match(/https?:\/\/(?:[^\s"']*\.)?drive\.google\.com[^\s"')>]*/g)||[];return u[0]||null;},null);
@@ -3846,7 +3883,7 @@ function renderMilestoneCreator(projId, milestones) {
               return `<button class="nt-why" title="${_title}" style="${_msBadgeStyle(_variant)}" onclick="${_onclick}">${_label}</button>`;
             })()}${_msBangHtml(m.id, projId)}
             ${_msHoldBtnHtml(projId, m.id, !!m.held)}
-            ${_ssScoreBadgeHtml(m)}
+            ${_ssScoreBadgeHtml(m, projId)}
             ${children.length>0?`<button id="sub-tog-${esc(m.id)}" title="Expand/collapse children (${children.length})"
               style="display:flex;align-items:center;justify-content:center;margin:3px auto 0;height:22px;padding:0 6px;border-radius:3px;border:1px solid var(--accent-soft);background:none;color:var(--accent);cursor:pointer;font-size:10px;line-height:1;font-family:var(--mono)"
               onclick="event.stopPropagation();_toggleSubstones('${esc(m.id)}',this)">${(_msCollapsedParents[projId]||new Set()).has(m.id)?`▷ ${children.length}`:`▾ ${children.length}`}</button>`:''}
@@ -3869,12 +3906,14 @@ function renderMilestoneCreator(projId, milestones) {
           const cMsgOnclick = cShowPopup
             ? `event.stopPropagation();showCommentPopup(event,'${escJsC(c.claude_comment||'')}','${esc(projId)}','${esc(c.id)}','${esc(cS)}')`
             : `event.stopPropagation();_msAddMsg(event,'${esc(projId)}','${esc(c.id)}','${esc(cS)}',this)`;
-          return `<tr class="ms-child-row nt-draggable-row ${cS==='done'?'nt-done':''}${(_msCollapsedParents[projId]||new Set()).has(m.id)?' ms-collapsed':''}" data-mid="${esc(c.id)}" data-status="${esc(cS)}" data-parent="${esc(m.id)}" data-held="${c.held?'1':'0'}" data-last-turn="${_isLastTurn(c)?'1':'0'}" style="position:relative">
+          // M1907: is_progress=true → dimmed opacity + ~prefix on id (mid-flight M190-bypass progress child)
+          const _cIsProgress = !!c.is_progress;
+          return `<tr class="ms-child-row nt-draggable-row ${cS==='done'?'nt-done':''}${(_msCollapsedParents[projId]||new Set()).has(m.id)?' ms-collapsed':''}${_cIsProgress?' ms-progress-child':''}" data-mid="${esc(c.id)}" data-status="${esc(cS)}" data-parent="${esc(m.id)}" data-held="${c.held?'1':'0'}" data-last-turn="${_isLastTurn(c)?'1':'0'}" style="position:relative${_cIsProgress?';opacity:0.75':''}">
             <td class="ms-td-drag"><span class="nt-drag-handle" title="Drag to reorder">⋮⋮</span></td>
             ${_gapCells(c)}
             <td class="ms-td-id">
               <div class="nt-id-stack">
-                <span><span class="nt-mid">${esc(c.id)}</span>${cS === 'queued' ? ` <span class="nt-priority-tag" title="Queued">▶</span>` : ''}</span>
+                <span><span class="nt-mid">${_cIsProgress?'~':''}${esc(c.id)}</span>${cS === 'queued' ? ` <span class="nt-priority-tag" title="Queued">▶</span>` : ''}${_cIsProgress ? ` <span style="font-size:9px;color:var(--text-dim)" title="Mid-flight progress update (M190 bypass)">진행</span>` : ''}</span>
                 ${c.user_added_at ? `<span style="font-family:var(--mono);font-size:9px;color:var(--accent-deep);font-weight:600;letter-spacing:.04em;line-height:1.3" class="nt-time-span">${esc(c.user_added_at.slice(5,10))}<br>${esc(c.user_added_at.slice(11,16))}</span>` : ''}
                 ${(() => {
                   const _cShotUrl = [...(_msConversations[c.id]||[])].reverse().reduce((f,x)=>{if(f)return f;const u=(x.text||'').match(/https?:\/\/(?:[^\s"']*\.)?drive\.google\.com[^\s"')>]*/g)||[];return u[0]||null;},null);
@@ -4014,10 +4053,12 @@ function renderMilestoneCreator(projId, milestones) {
   if (window._cgActiveNodeFilter) {
     const _b2 = document.createElement('div');
     _b2.id = 'cg-filter-banner';
-    _b2.style.cssText = 'background:rgba(123,159,212,.12);border:1px solid rgba(123,159,212,.3);border-radius:5px;padding:5px 10px;margin-bottom:8px;font-size:10px;font-family:var(--mono);color:#7b9fd4;display:flex;align-items:center;justify-content:space-between;gap:8px';
+    _b2.style.cssText = 'background:rgba(123,159,212,.12);border:1px solid rgba(123,159,212,.3);border-radius:5px;padding:5px 10px;margin-bottom:8px;font-size:10px;font-family:var(--mono);color:#7b9fd4;display:flex;align-items:center;justify-content:space-between;gap:8px;overflow:hidden;white-space:nowrap';
     // M1471: show active stones only (exclude done/held) to match section header q/review/pc|watch sum
     const _cgfActiveCount = _cgFilteredMilestones.filter(m => !m.done && !m.held && (m.status||'') !== 'done').length;
-    _b2.innerHTML = `<span>◇ ${window._cgActiveNodeFilter.nodeName} (${_cgfActiveCount} stones)</span><button onclick="_cgClearNodeFilter();loadMilestones('${projId}')" style="background:none;border:1px solid rgba(123,159,212,.4);border-radius:3px;color:#7b9fd4;cursor:pointer;font-size:9px;padding:2px 7px;font-family:var(--mono)">✕ clear</button>`;
+    const _cgfFullName = (window._cgActiveNodeFilter.nodeName || '');
+    const _cgfShortName = _cgfFullName.includes('/') ? _cgfFullName.split('/')[0].trim() + '…' : _cgfFullName.trim();
+    _b2.innerHTML = `<span style="overflow:hidden;text-overflow:ellipsis;min-width:0">◇ ${esc(_cgfShortName)} (${_cgfActiveCount} stones)</span><button onclick="_cgClearNodeFilter();loadMilestones('${projId}')" style="flex-shrink:0;background:none;border:1px solid rgba(123,159,212,.4);border-radius:3px;color:#7b9fd4;cursor:pointer;font-size:9px;padding:2px 7px;font-family:var(--mono)">✕ clear</button>`;
     el.prepend(_b2);
   }
   // M608: group milestones under substar headers when substars are loaded
@@ -4790,11 +4831,11 @@ function _renderNtTextHtml(text) {
     return esc(text)
       .replace(/\n/g, '<br>')
       .replace(/\\n/g, '<br>')
-      .replace(/(?<=[^\s<>])\s*([①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳❶❷❸❹❺❻❼❽❾❿])/g, '<br>$1');
+      .replace(/(?<=[^\s<>|])\s*([①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳❶❷❸❹❺❻❼❽❾❿])/g, '<br>$1');
   }
   // M1855: shared inline-text escape+transform (same rules as no-PASTE path above)
   const _escInline = s => esc(s).replace(/\n/g,'<br>').replace(/\\n/g,'<br>')
-    .replace(/(?<=[^\s<>])\s*([①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳❶❷❸❹❺❻❼❽❾❿])/g,'<br>$1');
+    .replace(/(?<=[^\s<>|])\s*([①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳❶❷❸❹❺❻❼❽❾❿])/g,'<br>$1');
   let out = '';
   let i = 0;
   while (i < text.length) {
@@ -4880,9 +4921,9 @@ function _reviewBadgeHtml(projId, mid, milestones) {
   const verifyOn = !!(stone && stone.verify_flag);
   const _p = esc(projId).replace(/'/g,'&#39;'), _m = esc(mid).replace(/'/g,'&#39;');
   if (verifyOn) {
-    return `<button title="verify ON — a review child stone will be created on next dispatch. Click to turn off." style="font-family:var(--mono);font-size:8px;padding:2px 6px;border-radius:3px;background:rgba(61,139,94,.15);color:var(--green,#3d8b5e);border:1px solid rgba(61,139,94,.4);cursor:pointer;line-height:1.3;white-space:nowrap;display:inline-flex;align-items:center;gap:2px" onclick="event.stopPropagation();_toggleVerifyFlag('${_p}','${_m}',false,this)" >verify ✓</button>`;
+    return `<button title="e2e ON — a review child stone will be created on next dispatch. Click to turn off." style="font-family:var(--mono);font-size:8px;padding:2px 6px;border-radius:3px;background:rgba(61,139,94,.15);color:var(--green,#3d8b5e);border:1px solid rgba(61,139,94,.4);cursor:pointer;line-height:1.3;white-space:nowrap;display:inline-flex;align-items:center;gap:2px" onclick="event.stopPropagation();_toggleVerifyFlag('${_p}','${_m}',false,this)" >e2e ✓</button>`;
   }
-  return `<button title="verify OFF — click to flag this stone for review on next dispatch." style="font-family:var(--mono);font-size:8px;padding:2px 6px;border-radius:3px;background:rgba(123,159,212,.1);color:#7b9fd4;border:1px solid rgba(123,159,212,.4);cursor:pointer;line-height:1.3;white-space:nowrap;display:inline-flex;align-items:center;gap:2px" onclick="event.stopPropagation();_toggleVerifyFlag('${_p}','${_m}',true,this)" >verify</button>`;
+  return `<button title="e2e OFF — click to flag this stone for E2E review on next dispatch." style="font-family:var(--mono);font-size:8px;padding:2px 6px;border-radius:3px;background:rgba(123,159,212,.1);color:#7b9fd4;border:1px solid rgba(123,159,212,.4);cursor:pointer;line-height:1.3;white-space:nowrap;display:inline-flex;align-items:center;gap:2px" onclick="event.stopPropagation();_toggleVerifyFlag('${_p}','${_m}',true,this)" >e2e</button>`;
 }
 async function _toggleVerifyFlag(projId, mid, flagValue, btn) {
   // M964: optimistic UI — immediately update button before server round-trip
@@ -4893,8 +4934,8 @@ async function _toggleVerifyFlag(projId, mid, flagValue, btn) {
     const _nextFlag = !flagValue;  // what the next click should toggle to
     const _ocAttr = `event.stopPropagation();_toggleVerifyFlag('${projId.replace(/'/g,'&#39;')}','${mid.replace(/'/g,'&#39;')}',${_nextFlag},this)`;
     btn.setAttribute('onclick', _ocAttr);
-    if (flagValue) { btn.textContent = 'verify ✓'; btn.style.color = 'var(--green,#3d8b5e)'; btn.style.background = 'rgba(61,139,94,.15)'; btn.style.borderColor = 'rgba(61,139,94,.4)'; }
-    else { btn.textContent = 'verify'; btn.style.color = '#7b9fd4'; btn.style.background = 'rgba(123,159,212,.1)'; btn.style.borderColor = 'rgba(123,159,212,.4)'; }
+    if (flagValue) { btn.textContent = 'e2e ✓'; btn.style.color = 'var(--green,#3d8b5e)'; btn.style.background = 'rgba(61,139,94,.15)'; btn.style.borderColor = 'rgba(61,139,94,.4)'; }
+    else { btn.textContent = 'e2e'; btn.style.color = '#7b9fd4'; btn.style.background = 'rgba(123,159,212,.1)'; btn.style.borderColor = 'rgba(123,159,212,.4)'; }
   }
   await fetch(`/api/northstar/${encodeURIComponent(projId)}/milestones/${encodeURIComponent(mid)}`, {
     method: 'PATCH',
@@ -4927,8 +4968,8 @@ async function _toggleCommentVerify(projId, mid, btn) {
   const next = !current;
   if (btn) {
     btn.style.opacity = '0.5'; btn.disabled = true;
-    if (next) { btn.textContent = 'verify ✓'; btn.style.color = 'var(--green,#3d8b5e)'; btn.style.background = 'rgba(61,139,94,.15)'; btn.style.borderColor = 'rgba(61,139,94,.4)'; }
-    else { btn.textContent = 'verify'; btn.style.color = '#7b9fd4'; btn.style.background = 'rgba(123,159,212,.08)'; btn.style.borderColor = 'rgba(123,159,212,.4)'; }
+    if (next) { btn.textContent = 'e2e ✓'; btn.style.color = 'var(--green,#3d8b5e)'; btn.style.background = 'rgba(61,139,94,.15)'; btn.style.borderColor = 'rgba(61,139,94,.4)'; }
+    else { btn.textContent = 'e2e'; btn.style.color = '#7b9fd4'; btn.style.background = 'rgba(123,159,212,.08)'; btn.style.borderColor = 'rgba(123,159,212,.4)'; }
   }
   await _toggleVerifyFlag(projId, mid, next, null);
   if (btn) { btn.style.opacity = '1'; btn.disabled = false; }
@@ -5258,7 +5299,7 @@ function _toggleLogPanel() {
     _refreshLogPanel();
     // M698: realtime — refresh every 3s while panel is open
     clearInterval(_logAutoRefreshTimer);
-    _logAutoRefreshTimer = setInterval(() => { if (!document.hidden) _refreshLogPanel(); }, 8000);
+    _logAutoRefreshTimer = setInterval(() => { if (!document.hidden) _refreshLogPanel(); }, window._NS_IS_MOBILE ? 15000 : 8000); // M1899: mobile→15s
   } else {
     clearInterval(_logAutoRefreshTimer);
     _logAutoRefreshTimer = null;
@@ -5534,6 +5575,34 @@ async function toggleQueueStatus(projId, mid, nextStatus, _ev) {
   });
   // M800/M1515: show "Queue cancelled" toast when unqueuing (any non-queued restore target)
   if (nextStatus !== 'queued') _showUnqueueToast(projId, mid);
+  // M1943: on dequeue, if comment popup is open for this stone:
+  //   1. Remove any stone-text fallback draft so it never appears in input on reopen.
+  //   2. If last _msConversations entry is a user message (the one that triggered the queue),
+  //      remove it from in-memory cache + live DOM thread, and restore it to the input field.
+  // ROLLBACK: remove the if-block below (keep everything else).
+  if (nextStatus !== 'queued') {
+    // Always clear any saved draft so stone text never leaks into input on next open
+    sessionStorage.removeItem(`comment-draft-${mid}`);
+    // If popup is open for this stone, restore last user message to input
+    if (_openCommentMid === mid) {
+      const _conv = _msConversations[mid];
+      if (_conv && _conv.length > 0 && _conv[_conv.length - 1].role === 'user') {
+        const _lastEntry = _conv.pop(); // remove from in-memory conversation
+        // Remove last message div from the live thread DOM
+        const _threadEl = document.getElementById('comment-thread');
+        if (_threadEl) {
+          const _msgDivs = _threadEl.querySelectorAll(':scope > div[style*="margin-bottom"]');
+          if (_msgDivs.length) _msgDivs[_msgDivs.length - 1].remove();
+        }
+        // Restore text to input
+        const _replyInp = document.getElementById('comment-reply-input');
+        if (_replyInp) {
+          _replyInp.value = _lastEntry.text || '';
+          _replyInp.focus();
+        }
+      }
+    }
+  }
   // M515: cache already updated optimistically above — render from cache, skip full network fetch
   _recentPatchMs.set(mid + ':' + projId, Date.now());
   // M583: preserve stone text from DOM before re-render — blur fires before click so activeElement
@@ -6564,7 +6633,7 @@ function toggleDmPane(paneId) {
       window._activityLogTimer = setInterval(() => {
         if (document.hidden) return;
         if (window._msProjectId) _loadActivityLog(window._msProjectId);
-      }, 5000);
+      }, window._NS_IS_MOBILE ? 30000 : 15000); // M1899-R12b: mobile→30s (ROLLBACK: replace ternary with flat 15000)
     } else {
       clearInterval(window._activityLogTimer);
       window._activityLogTimer = null;
@@ -6575,7 +6644,8 @@ function toggleDmPane(paneId) {
     if (!open) {
       _loadSubagentActivity();
       clearInterval(window._subagentActivityTimer);
-      window._subagentActivityTimer = setInterval(() => { if (!document.hidden) _loadSubagentActivity(); }, 15000);
+      // M1899-P3: 15s→30s mobile (ROLLBACK: remove ternary, use 15000 flat)
+      window._subagentActivityTimer = setInterval(() => { if (!document.hidden) _loadSubagentActivity(); }, window._NS_IS_MOBILE ? 30000 : 15000);
     } else {
       clearInterval(window._subagentActivityTimer);
       window._subagentActivityTimer = null;
@@ -6586,7 +6656,7 @@ function toggleDmPane(paneId) {
     if (!open) {
       _loadEfficiencyMetrics();
       clearInterval(window._efficiencyMetricsTimer);
-      window._efficiencyMetricsTimer = setInterval(() => { if (!document.hidden) _loadEfficiencyMetrics(); }, 30000);
+      window._efficiencyMetricsTimer = setInterval(() => { if (!document.hidden) _loadEfficiencyMetrics(); }, window._NS_IS_MOBILE ? 60000 : 30000); // M1899-R7.5: 30s→60s mobile (ROLLBACK: change 60000 back to 30000)
     } else {
       clearInterval(window._efficiencyMetricsTimer);
       window._efficiencyMetricsTimer = null;
@@ -6754,7 +6824,9 @@ function _selectSession(agent, model, sessionId) {
     const isPicked = sessionId ? (r.dataset.session === sessionId) : (r.dataset.agent === agent && r.dataset.model === model);
     r.classList.toggle('picked', isPicked);
     const dot = r.querySelector('span');
-    if (dot) dot.style.color = isPicked ? 'var(--green)' : 'var(--text-dim)';
+    // M1911-b/c: dot color = process-alive state only, not picked state.
+    // live dot (data-dot-live) stays green always; dead dot stays text-dim always.
+    if (dot && !dot.dataset.dotLive) dot.style.color = 'var(--text-dim)';
   });
   // M1793: do NOT sync agent/model dropdowns on session row click.
   // Both dropdowns are user-intent; row click sets resume target only.
@@ -6872,7 +6944,7 @@ async function executeProject(projId, btn) {
       let _optChanged2 = false;
       const _optSuffix = sessName.replace(new RegExp(`.*-exec-${projId}-?`), '') || '';
       const _optIsMain2 = !_optSuffix || _optSuffix === sessName; // shouldn't happen with M1796, but guard
-      const _optBtnLabel = _optIsMain2 ? 'main' : (_optSuffix || 'branch');
+      const _optBtnLabel = _optIsMain2 ? 'main' : (_optSuffix.slice(0,4) || 'brch');
       const _optBtnColor = 'var(--green)';
       const _optBtnBorder = 'rgba(61,139,94,.4)';
       const _optBtnBg = 'rgba(61,139,94,.12)';
@@ -7031,8 +7103,9 @@ async function executeProject(projId, btn) {
             }
           } catch(_) {}
           loadTaskBoard(projId);
-          if (polls >= 12) clearInterval(poll);
-        }, 5000);
+          // M1899-P5: mobile polls 6x at 10s vs desktop 12x at 5s (ROLLBACK: change back to polls>=12, 5000)
+          if (polls >= (window._NS_IS_MOBILE ? 6 : 12)) clearInterval(poll);
+        }, window._NS_IS_MOBILE ? 10000 : 5000);
       }
     } else {
       delete window._dispatchInFlight;
@@ -7665,7 +7738,7 @@ document.addEventListener('DOMContentLoaded', () => {
     } catch(_) {}
   }
   if (!document.hidden) _loadClaudeUsage(); // M1581: skip initial call when hidden
-  setInterval(() => { if (!document.hidden) _loadClaudeUsage(); }, 10 * 1000);
+  setInterval(() => { if (!document.hidden) _loadClaudeUsage(); }, window._NS_IS_MOBILE ? 60000 : 10000); // M1899: mobile→20s; M1899-R3: mobile→60s (ROLLBACK: change 60000 back to 20000)
 });
 // M1418: pause CSS animations when tab hidden — reduces SwiftShader compositing CPU load
 // M1581: also pause/resume tmux 1s poll to reduce mobile radio wakeups and CPU heat
@@ -7677,7 +7750,10 @@ document.addEventListener('DOMContentLoaded', () => {
 // foreground-idle timeout has elapsed; any user activity (mouse/touch/scroll/key) or the tab
 // becoming visible immediately resumes.
 let _fgIdleTimer = null;
-const _FG_IDLE_MS = 20000; // 20s of no interaction while the tab is foreground/visible
+// M1899-R11a: mobile→8s so decorative CSS animations (spinners, mascot) pause sooner.
+// --busy-anim-state is a separate gate (hidden-only) so session-running indicators unaffected.
+// ROLLBACK: replace the ternary with the flat `20000` literal.
+const _FG_IDLE_MS = window._NS_IS_MOBILE ? 8000 : 20000;
 // M1791-c: hard-stop fallback for the dispatch+tmux loading overlay. Covers cases where
 // tmux never responds (network hiccup, mobile background kill) so the spinner doesn't hang forever.
 const _SPAWN_LOADING_TIMEOUT_MS = 60000; // 60s — long enough for slow mobile spawns
@@ -7716,12 +7792,32 @@ document.addEventListener('visibilitychange', () => {
       _tmuxWatchInterval = null;
       window._tmuxWatchPaused = true;
     }
+    // M1899-R6: suspend swimlane + secondary polls on mobile background — clearInterval eliminates
+    // even the JS timer wake. ROLLBACK: remove the if(window._NS_IS_MOBILE) block below.
+    if (window._NS_IS_MOBILE) {
+      if (window._swimlaneInterval) { clearInterval(window._swimlaneInterval); window._swimlaneInterval = null; }
+      if (window._resumablePoll) { clearInterval(window._resumablePoll); window._resumablePoll = null; }
+      if (window._apiErrorPollTimer) { clearInterval(window._apiErrorPollTimer); window._apiErrorPollTimer = null; }
+    }
   } else {
     // Resume tmux poll if it was paused by visibility change
     if (window._tmuxWatchPaused && window._tmuxWatchActive && !_tmuxWatchInterval) {
       window._tmuxWatchPaused = false;
       const _poll = window._tmuxWatchPollFn;
       if (_poll) { _poll(); if (window._schedTmuxPoll) window._schedTmuxPoll(); else _tmuxWatchInterval = setInterval(_poll, 2000); } // M1757: use adaptive backoff scheduler; fallback to 2s
+    }
+    // M1899-R6: resume swimlane + secondary polls on foreground — ROLLBACK: remove this block
+    if (window._NS_IS_MOBILE) {
+      if (!window._swimlaneInterval) window._swimlaneInterval = setInterval(_swimlaneTick, _swimlaneTickMs);
+      // Restart detail-modal polls only if modal is currently open
+      if (window._detailModalOpenProjId) {
+        if (!window._resumablePoll && typeof window._renderResumableSessions === 'function') {
+          window._resumablePoll = setInterval(() => { if (!document.hidden) window._renderResumableSessions(); }, 120000); // M1899-R7
+        }
+        if (!window._apiErrorPollTimer && typeof window._checkApiErrors === 'function') {
+          window._apiErrorPollTimer = setInterval(() => { if (!document.hidden) window._checkApiErrors(); }, 120000); // M1899-R7
+        }
+      }
     }
   }
 });
@@ -7745,15 +7841,29 @@ document.addEventListener('DOMContentLoaded', () => {
 
 async function refreshSessionStatus() {
   try {
-    const [sessR, execR, resumeR] = await Promise.all([
-      fetch('/api/northstar/sessions'),
-      fetch('/api/exec-sessions'),
-      fetch('/api/northstar/resume-info').catch(() => null),
-    ]);
+    // M1899-R5: mobile skips resume-info (covered by 60s _resumablePoll) — saves 1 req per swimlane tick
+    // ROLLBACK: remove the ternary; restore: fetch('/api/northstar/resume-info').catch(() => null)
+    // M1899-R20: mobile uses single batch endpoint (sessions+exec in 1 TCP) instead of Promise.all of 2 fetches.
+    // ROLLBACK: remove the _rssIsMobile branch; restore the original Promise.all below.
+    const _rssIsMobile = window._NS_IS_MOBILE;
+    let newPty, execData, resumeR = null;
+    if (_rssIsMobile) {
+      const _batchR = await fetch('/api/northstar/mobile-status');
+      const _batch = await _batchR.json();
+      newPty = _batch.sessions;
+      execData = _batch.exec;
+    } else {
+      const [sessR, execR, _resumeR] = await Promise.all([
+        fetch('/api/northstar/sessions'),
+        fetch('/api/exec-sessions'),
+        fetch('/api/northstar/resume-info').catch(() => null),
+      ]);
+      newPty = await sessR.json();
+      execData = await execR.json();
+      resumeR = _resumeR;
+    }
     // M178: PTY and exec states tracked independently; no merging.
-    const newPty = await sessR.json();
     const newExec = {};
-    const execData = await execR.json();
     // M373: also capture model name globally so ns-card model chip shows on first load
     // M377: always overwrite (even empty string) to clear stale model from prior agent session
     window._execModel = window._execModel || {};
@@ -7825,22 +7935,24 @@ async function refreshSessionStatus() {
     _execStatus = newExec;
     if (JSON.stringify(newExec) !== _prevExecKeys || _newSessListKeys !== _prevSessListSnap) {
       // M976 fix: use actual let var (not window.) to invalidate lane fingerprints
-      Object.keys(_swimlaneLaneFp).forEach(k => delete _swimlaneLaneFp[k]);
+      Object.keys(_swimlaneLaneFp).forEach(k => delete _swimlaneLaneFp[k]); _nodeCardCache.clear(); _swimlaneGlobalFp = ''; // M1899-R9/R18B
       if (typeof render === 'function') render();
+      window._rssDidRender = true; // M1899-R12a: sentinel so _swimlaneTick skips duplicate render
     }
     // Last-used Claude session per project (.last-session-id captured by Stop hook)
     if (resumeR && resumeR.ok) {
       try { _resumeInfo = await resumeR.json(); } catch(_) { _resumeInfo = {}; }
     }
     // M190/M257: refresh session pane PTY buttons whenever PTY status changes
-    // Force re-render if PTY state changed (hash will detect difference via _ptyHashKey)
-    if (typeof window._renderResumableSessions === 'function') {
+    // M1899-R5: mobile skips these — _resumablePoll (60s) handles resume-info fetches
+    // ROLLBACK: remove the `if (!_rssIsMobile)` guards below
+    if (!_rssIsMobile && typeof window._renderResumableSessions === 'function') {
       window._renderResumableSessions();
     }
     // M257: also trigger when PTY state changes (detect new/removed sessions)
     const _prevPtyKeys = Object.keys(_prevPtyStatus||{}).sort().join(',');
     const _newPtyKeys = Object.keys(newPty||{}).sort().join(',');
-    if (_prevPtyKeys !== _newPtyKeys && typeof window._renderResumableSessions === 'function') {
+    if (!_rssIsMobile && _prevPtyKeys !== _newPtyKeys && typeof window._renderResumableSessions === 'function') {
       setTimeout(window._renderResumableSessions, 100); // slight delay to let hash invalidate
     }
   } catch(_) {}
@@ -7920,6 +8032,23 @@ function _msArcColor(pct) {
   if (pct < 50) { return `hsl(${Math.round(pct * 0.6)},85%,45%)`; }
   const t = (pct - 50) / 50;
   return `rgb(${Math.round(220+(gr-220)*t)},${Math.round(120+(gg-120)*t)},${Math.round(20+(gb-20)*t)})`;
+}
+
+// M1899-R9: per-card fingerprint — same fields as _laneFp per-entry + session list snapshot.
+// Must cover every visible property that nodeCard() reads; if nodeCard output changes for a
+// given (p, idx) pair this key must also change so the cache is invalidated automatically.
+function _nodeCardFP(p, idx) {
+  const _msDone = (p.milestones||[]).filter(m=>m.done||m.status==='done').length;
+  const _msTotal = (p.milestones||[]).length;
+  const _pid = p.id||p.name;
+  const _execMod = (window._execModel||{})[_pid]||'';
+  // M1899-R10: sessList removed from FP — session changes are handled by the badge-only + avatar
+  // patch paths in the fingerprint-match branch, so including it here caused full cache-miss on
+  // every session_running SSE even when card layout was unchanged. Active-session cache hit rate
+  // goes from ~0% to ~100% on steady active work.
+  // ROLLBACK: add back: const _sessList = JSON.stringify((window._execSessionList||{})[_pid]||[]);
+  //           and append `:${_sessList}` to the return string.
+  return `${_pid}:${p.stage||''}:${p.position_x||0}:${p.exec_session_id||''}:${p.current||''}:${p.deadline||''}:${_msDone}/${_msTotal}:${p.status||''}:${_execMod}:${idx}`;
 }
 
 function nodeCard(p, idx) {
@@ -8029,14 +8158,12 @@ function nodeCard(p, idx) {
       ? (_modelAvatars[_mdlKey||''] || _modelAvatars['default'])
       : (_execKey ? _modelAvatars['default'] : null)
   ) || null;
-  let _avatarOpacity = _execKey === 'running' ? '1' : _execKey === 'idle' ? '0.3' : '0.4';
+  // M1892: initial opacity/statusCls from _execKey is overridden by _sessList[0] below.
+  // Use idle-default here so _sessList-empty cold-start doesn't flash opacity:1 via any-busy-wins.
+  let _avatarOpacity = _execKey === 'idle' ? '0.3' : '0.3';
   const _avatarUrl = _avatarChar;
-  let _statusCls = _execKey === 'running' ? 'status-active' : _execKey === 'idle' ? 'status-idle' : 'status-idle';
+  let _statusCls = 'status-idle';
   const _initials = (p.name||p.id||'?')[0].toUpperCase();
-  const _avatarHtml = _avatarUrl
-    ? `<img class="avatar-img" src="${esc(_avatarUrl)}" alt="${esc(p.name||p.id)}" loading="lazy" style="opacity:${_avatarOpacity}" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">`
-      + `<div class="avatar-fallback" style="display:none">${esc(_initials)}</div>`
-    : `<div class="avatar-fallback">${esc(_initials)}</div>`;
   // M1326: removed deadline arc (r=54) — deadline now shown as battery bar below card name
   // M1331: removed star-arc ring — milestone arc only (r=40)
   // M1333: arc color = red(0%) → yellow(50%) → green(100%) based on pc% (shared: _msArcColor)
@@ -8080,6 +8207,12 @@ function nodeCard(p, idx) {
     _avatarOpacity = _s0Running ? '1' : '0.3';
     _statusCls = _s0Running ? 'status-active' : 'status-idle';
   }
+  // M1894: _avatarHtml must be built AFTER _sessList override so opacity reflects [0].idle correctly.
+  // Previously built before _sessList block → always baked in 0.4 (cold-start default), ignoring busy.
+  const _avatarHtml = _avatarUrl
+    ? `<img class="avatar-img" src="${esc(_avatarUrl)}" alt="${esc(p.name||p.id)}" loading="lazy" style="opacity:${_avatarOpacity}" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">`
+      + `<div class="avatar-fallback" style="display:none">${esc(_initials)}</div>`
+    : `<div class="avatar-fallback">${esc(_initials)}</div>`;
   // _mkMiniAvatarInner: avatar div for one session. Optional innerHtml is appended inside the
   // div so deeper nested avatars can be injected (M1838: 4th session = 4-level fractal chain).
   // M1741: _sessList is now [{idle, model, session, isMother}, ...] objects (was strings)
@@ -8089,7 +8222,7 @@ function nodeCard(p, idx) {
     // so the 1st busy avatar bleeds through the idle 2nd at 30% opacity. Fix: keep outer div
     // at opacity:1 (background stays opaque/blocking), apply dimming only to the inner <img>.
     // grayscale filter stays on the outer div — affects the whole element including border.
-    const _imgOp = st === 'running' ? '1' : '0.4';
+    const _imgOp = st === 'running' ? '1' : '0.3';
     const _filter = st === 'idle' ? 'grayscale(1)' : 'none';
     const _runCls = st === 'running' ? ' ns-sess-mini-active' : '';
     // M1741: use per-session model avatar so Clone with opus+sonnet shows correct images per child
@@ -8322,6 +8455,24 @@ function render() {
     lanes[layer].push({p, i});
   });
 
+  // M1899-R18B: on mobile, compute a global fingerprint covering project list + exec/session state.
+  // If unchanged since last render(), the badge scan loop (querySelector per card) is a no-op — skip it.
+  // Invalidated by same paths that clear _swimlaneLaneFp (exec change, project add/remove).
+  // ROLLBACK: remove the if-block below (leave the rest of render unchanged).
+  if (window._NS_IS_MOBILE) {
+    const _gfp = projects.map(p => {
+      const _pid = p.id || p.name;
+      const _sl = (window._execSessionList || {})[_pid];
+      const _sSnap = _sl ? _sl.map(s => s.idle ? '0' : '1').join('') : '';
+      const _msDone = (p.milestones||[]).filter(m=>m.done||m.status==='done').length;
+      // Must match all fields in _laneFp (L~8500) + session idle state.
+      // position_x, exec_session_id, current(model), deadline: drag/dispatch/model changes invalidate gfp correctly.
+      return `${_pid}:${p.stage||''}:${p.position_x||0}:${p.exec_session_id||''}:${p.current||''}:${p.deadline||''}:${p.status||''}:${_execStatus[_pid]||''}:${(window._execModel||{})[_pid]||''}:${_sSnap}:${_msDone}/${(p.milestones||[]).length}`;
+    }).join('|') + '|' + laneLabels.join(',');
+    if (_gfp === _swimlaneGlobalFp) return; // nothing changed — skip entire render pass
+    _swimlaneGlobalFp = _gfp;
+  }
+
   let _lanesRebuilt = false; // true when any lane DOM was actually rebuilt this render cycle
   laneLabels.forEach((_, l) => {
     const el = document.getElementById(`lane-nodes-${l}`);
@@ -8367,10 +8518,14 @@ function render() {
       displayLane.forEach(({p, i}, orderIdx) => {
         const wrapper = el.children[orderIdx];
         if (!wrapper) return;
+        // M1899-R9: single nodeCard() call (or cache hit) shared by badge + avatar patch below.
+        const _fpKey2 = _nodeCardFP(p, i);
+        let _cachedHtml2 = _nodeCardCache.get(_fpKey2);
+        if (!_cachedHtml2) { _cachedHtml2 = nodeCard(p, i); _nodeCardCache.set(_fpKey2, _cachedHtml2); }
         const badge = wrapper.querySelector('.ns-exec-badge, .sess-badge, [class*="exec-state"]');
         if (badge) {
           const newNode = document.createElement('div');
-          newNode.innerHTML = nodeCard(p, i);
+          newNode.innerHTML = _cachedHtml2;
           const newBadge = newNode.querySelector('.ns-exec-badge, .sess-badge, [class*="exec-state"]');
           if (newBadge && badge.outerHTML !== newBadge.outerHTML) badge.replaceWith(newBadge);
         }
@@ -8384,7 +8539,7 @@ function render() {
         const _newSessList = (window._execSessionList || {})[_pid3] || [];
         if (_newSessList.length > 1) {
           const _tmp = document.createElement('div');
-          _tmp.innerHTML = nodeCard(p, i);
+          _tmp.innerHTML = _cachedHtml2;
           const _newStack = _tmp.querySelector('.ns-sess-avatars');
           if (_newStack && _existingStack) {
             if (_existingStack.innerHTML !== _newStack.innerHTML) _existingStack.replaceWith(_newStack);
@@ -8428,7 +8583,11 @@ function render() {
       // M968: height:fit-content prevents wrapper from expanding to lane height on mobile
       const _isTouchDevice = window.matchMedia('(pointer:coarse)').matches;
       wrapper.style.cssText = 'align-self:flex-start;width:fit-content;flex-shrink:0;height:fit-content';
-      wrapper.innerHTML = nodeCard(p, i);
+      // M1899-R9: use cached HTML when per-card fingerprint unchanged; call nodeCard() on miss.
+      const _cKey = _nodeCardFP(p, i);
+      let _cardHtml = _nodeCardCache.get(_cKey);
+      if (!_cardHtml) { _cardHtml = nodeCard(p, i); _nodeCardCache.set(_cKey, _cardHtml); }
+      wrapper.innerHTML = _cardHtml;
       el.appendChild(wrapper);
     });
   });
@@ -8697,7 +8856,10 @@ function render() {
   window._dropOnGhost = _dropOnGhost;
   // Apply card alignment + draw connection lines
   // rAF so offsetWidth is available when applyAlign reads card dimensions
-  requestAnimationFrame(() => { applyAlign(); requestAnimationFrame(() => drawParentLines()); });
+  // M1899-R11b: on mobile, skip drawParentLines() when no lane was rebuilt — card positions
+  // are unchanged so SVG lines are still valid. Saves canvas recalc every 60s swimlaneTick.
+  // ROLLBACK: remove the _lanesRebuilt condition, always call drawParentLines().
+  requestAnimationFrame(() => { applyAlign(); if (!window._NS_IS_MOBILE || _lanesRebuilt) requestAnimationFrame(() => drawParentLines()); });
   _nodeTouchDrag(); // touch drag for iPad/mobile
 
   // M914: pan-to-scroll for .grid-wrap (desktop mouse drag on empty swimlane area)
@@ -9218,7 +9380,7 @@ function _ncpToggle(pid) {
     }
   }
   // M999: pointer change → invalidate lane fingerprint so sort re-evaluates
-  Object.keys(_swimlaneLaneFp).forEach(k => delete _swimlaneLaneFp[k]);
+  Object.keys(_swimlaneLaneFp).forEach(k => delete _swimlaneLaneFp[k]); _nodeCardCache.clear(); _swimlaneGlobalFp = ''; // M1899-R9/R18B
   render();
 }
 
@@ -10096,21 +10258,35 @@ function _hideColToggleBtn() {
   if (gFab) gFab.style.display = 'none';
 }
 
+// M822: 3-mode view: table | map | timeline
+const _MS_VIEW_BTN_ACTIVE  = {background:'var(--accent)', color:'#fff', borderColor:'var(--accent)'};
+const _MS_VIEW_BTN_INACTIVE = {background:'none', color:'var(--text-dim)', borderColor:'var(--panel-border)'};
+
 function _setMsView(mode) {
   _msViewMode = mode;
   const inner = document.getElementById('ms-slide-inner');
   const btnT  = document.getElementById('ms-view-table');
   const btnM  = document.getElementById('ms-view-map');
+  const btnTL = document.getElementById('ms-view-timeline');
   if (!inner) return;
+  // M822: 3-panel carousel — each panel is 33.33% of 300% container
   if (mode === 'map') {
-    inner.style.transform = 'translateX(-50%)';
-    if (btnT) Object.assign(btnT.style, {background:'none', color:'var(--text-dim)'});
-    if (btnM) Object.assign(btnM.style, {background:'var(--accent)', color:'#fff'});
+    inner.style.transform = 'translateX(-33.333%)';
+    if (btnT)  Object.assign(btnT.style,  _MS_VIEW_BTN_INACTIVE);
+    if (btnM)  Object.assign(btnM.style,  _MS_VIEW_BTN_ACTIVE);
+    if (btnTL) Object.assign(btnTL.style, _MS_VIEW_BTN_INACTIVE);
     requestAnimationFrame(() => setTimeout(_renderMsMindmap, 300));
+  } else if (mode === 'timeline') {
+    inner.style.transform = 'translateX(-66.667%)';
+    if (btnT)  Object.assign(btnT.style,  _MS_VIEW_BTN_INACTIVE);
+    if (btnM)  Object.assign(btnM.style,  _MS_VIEW_BTN_INACTIVE);
+    if (btnTL) Object.assign(btnTL.style, _MS_VIEW_BTN_ACTIVE);
+    requestAnimationFrame(() => setTimeout(_renderMsTimeline, 300));
   } else {
     inner.style.transform = 'translateX(0)';
-    if (btnT) Object.assign(btnT.style, {background:'var(--accent)', color:'#fff'});
-    if (btnM) Object.assign(btnM.style, {background:'none', color:'var(--text-dim)'});
+    if (btnT)  Object.assign(btnT.style,  _MS_VIEW_BTN_ACTIVE);
+    if (btnM)  Object.assign(btnM.style,  _MS_VIEW_BTN_INACTIVE);
+    if (btnTL) Object.assign(btnTL.style, _MS_VIEW_BTN_INACTIVE);
   }
 }
 
@@ -10216,6 +10392,104 @@ function _renderMsMindmap() {
     });
   }
 }
+
+// ── M822: Daily Timeline View ─────────────────────────────────────────────────
+function _renderMsTimeline() {
+  const el = document.getElementById('dm-ms-timeline');
+  if (!el) return;
+  const projId = _msProjectId;
+  if (!projId) { el.innerHTML = '<div style="color:var(--text-dim);font-size:11px;padding:12px">No project loaded.</div>'; return; }
+  const allMs = _msCacheByProject[projId] || [];
+  if (!allMs.length) { el.innerHTML = '<div style="color:var(--text-dim);font-size:11px;padding:12px">No milestones.</div>'; return; }
+
+  // Derive a date for each stone: prefer exec_end > exec_start > user_added_at > pending_confirm_at
+  const _stoneDate = m => {
+    const d = m.exec_end || m.exec_start || m.user_added_at || m.pending_confirm_at || m.queued_at;
+    return d ? d.slice(0, 10) : null;
+  };
+
+  // Status color + label
+  const _stColor = s => s === 'queued' ? 'var(--accent)' : s === 'pending_confirmation' ? 'var(--green,#3d8b5e)' : s === 'done' ? 'var(--text-dim)' : s === 'pending' ? '#7b9fd4' : '#6b6358';
+  const _stLabel = s => s === 'queued' ? 'queued' : s === 'pending_confirmation' ? 'pc' : s === 'done' ? 'done' : s === 'pending' ? 'pending' : (s||'?');
+
+  // Group by date bucket
+  const byDate = {};
+  allMs.forEach(m => {
+    const d = _stoneDate(m);
+    if (!d) { (byDate['undated'] = byDate['undated'] || []).push(m); return; }
+    (byDate[d] = byDate[d] || []).push(m);
+  });
+
+  // Sort dates descending (newest first)
+  const dates = Object.keys(byDate).filter(d => d !== 'undated').sort().reverse();
+  if (byDate['undated']) dates.push('undated');
+
+  // Find project deadline if set
+  const proj = (window.projects || []).find(p => (p.id||p.name) === projId);
+  const deadline = proj?.deadline;
+
+  // Render
+  let html = `<div style="padding:10px 14px 24px">`;
+
+  // Deadline banner if set
+  if (deadline) {
+    const dlDays = Math.ceil((new Date(deadline) - new Date()) / 86400000);
+    const dlColor = dlDays < 0 ? 'var(--red,#c0392b)' : dlDays <= 7 ? 'var(--yellow,#d4a843)' : 'var(--accent)';
+    html += `<div style="margin-bottom:12px;padding:6px 10px;border:1px solid ${dlColor};border-radius:5px;font-family:var(--mono);font-size:10px;color:${dlColor};display:flex;align-items:center;gap:8px">
+      <span style="font-weight:700">◉ deadline</span>
+      <span>${deadline}</span>
+      <span style="opacity:.7">${dlDays < 0 ? Math.abs(dlDays)+' days overdue' : dlDays === 0 ? 'today' : dlDays+' days left'}</span>
+    </div>`;
+  }
+
+  // Vertical timeline
+  html += `<div style="position:relative;padding-left:18px">
+    <div style="position:absolute;left:5px;top:0;bottom:0;width:2px;background:var(--panel-border);border-radius:1px"></div>`;
+
+  dates.forEach(date => {
+    const stones = byDate[date];
+    const isUndated = date === 'undated';
+    const dateLabel = isUndated ? '—' : date;
+    const isToday = !isUndated && date === new Date().toISOString().slice(0, 10);
+
+    html += `<div style="margin-bottom:16px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+        <div style="position:absolute;left:0;width:12px;height:12px;border-radius:50%;background:${isToday ? 'var(--accent)' : 'var(--panel-border)'};border:2px solid ${isToday ? 'var(--accent)' : 'var(--panel-soft)'};box-sizing:border-box"></div>
+        <span style="font-family:var(--mono);font-size:10px;font-weight:${isToday?'700':'600'};color:${isToday?'var(--accent)':'var(--text)'}">${dateLabel}</span>
+        ${isToday ? '<span style="font-family:var(--mono);font-size:9px;color:var(--accent);opacity:.7">today</span>' : ''}
+        <span style="font-family:var(--mono);font-size:9px;color:var(--text-dim)">${stones.length} stone${stones.length!==1?'s':''}</span>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:4px">`;
+
+    stones.forEach(m => {
+      const sCol = _stColor(m.status);
+      const sLbl = _stLabel(m.status);
+      const txt = (m.text || '').replace(/<[^>]+>/g,'').slice(0, 80);
+      const isDone = m.done || m.status === 'done';
+      const hasDuration = m.exec_start && m.exec_end;
+      let durLabel = '';
+      if (hasDuration) {
+        const sec = Math.round((new Date(m.exec_end) - new Date(m.exec_start)) / 1000);
+        durLabel = sec < 60 ? `${sec}s` : sec < 3600 ? `${Math.round(sec/60)}m` : `${(sec/3600).toFixed(1)}h`;
+      }
+      html += `<div onclick="showCommentPopup({clientX:window.innerWidth/2,clientY:window.innerHeight/2},'${esc(projId)}','${esc(m.id)}')"
+        style="display:flex;align-items:flex-start;gap:6px;padding:5px 8px;border-radius:4px;border:1px solid var(--panel-border);background:var(--panel-soft);cursor:pointer;transition:background .1s"
+        onmouseenter="this.style.background='var(--accent-soft,rgba(204,120,92,.08))'" onmouseleave="this.style.background='var(--panel-soft)'">
+        <span style="flex-shrink:0;margin-top:2px;width:6px;height:6px;border-radius:50%;background:${sCol}"></span>
+        <span style="flex:1;min-width:0;font-family:var(--mono);font-size:10px;color:${isDone?'var(--text-dim)':'var(--text)'};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;${isDone?'text-decoration:line-through':''}" title="${esc(m.text||'')}">${esc(txt)}</span>
+        <span style="flex-shrink:0;font-family:var(--mono);font-size:9px;color:${sCol};opacity:.8">${sLbl}</span>
+        ${durLabel ? `<span style="flex-shrink:0;font-family:var(--mono);font-size:9px;color:var(--text-dim)">${durLabel}</span>` : ''}
+        <span style="flex-shrink:0;font-family:var(--mono);font-size:9px;color:var(--text-dim);opacity:.6">${esc(m.id)}</span>
+      </div>`;
+    });
+
+    html += `</div></div>`;
+  });
+
+  html += `</div></div>`;
+  el.innerHTML = html;
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 function _mmNodeClick(mid, projId, evt) {
   if (evt) evt.stopPropagation();
@@ -10369,7 +10643,7 @@ function _applyBlinkWindow(hours) {
       // M1532-reactive: invalidate swimlane fingerprint so render() forces NS-card rebuild
       // (blink interval change does not alter any field in _laneFp).
       if (typeof _swimlaneLaneFp !== 'undefined') {
-        for (const k of Object.keys(_swimlaneLaneFp)) delete _swimlaneLaneFp[k];
+        for (const k of Object.keys(_swimlaneLaneFp)) delete _swimlaneLaneFp[k]; _nodeCardCache.clear(); _swimlaneGlobalFp = ''; // M1899-R9/R18B
       }
       if (typeof render === 'function') render();
       // M1539: also re-render CG board if open, and detail card substar grouping if open.
@@ -11498,6 +11772,11 @@ function closeDetail() {
   // M1227: reset in-memory blink state cache so next loadMilestones re-fetches from server
   window._blinkState = {};
   document.getElementById('detail-overlay').classList.remove('show');
+  // M1952: tear down scroll context observer + listener on close
+  if (_ssScrollCtxObserver) { _ssScrollCtxObserver.disconnect(); _ssScrollCtxObserver = null; }
+  const _ctxBar = document.getElementById('dm-scroll-ctx'); if (_ctxBar) _ctxBar.classList.remove('active');
+  const _dmLeft = document.getElementById('dm-left');
+  if (_ssScrollCtxScrollHandler && _dmLeft) { _dmLeft.removeEventListener('scroll', _ssScrollCtxScrollHandler); _ssScrollCtxScrollHandler = null; }
   _hideColToggleBtn(); // M282: hide floating col-toggle when detail closes
   const _ssFab = document.getElementById('ms-ss-toggle-btn'); // M657: hide substar toggle FAB
   if (_ssFab) _ssFab.style.display = 'none';
@@ -11517,6 +11796,10 @@ function closeDetail() {
   clearInterval(window._resumablePoll);
   clearInterval(window._subagentActivityTimer);
   window._subagentActivityTimer = null;
+  // M1928: clean up sess popup (skeleton or full) so next detail open doesn't hit the
+  // L15589 stale-existing early-return and silently skip rendering the popup.
+  document.getElementById('_sess-ctx-popup')?.remove();
+  document.getElementById('_sess-modal-bdrop')?.remove();
   render();
 }
 
@@ -12190,9 +12473,13 @@ function _toggleVkbd() {
 // is centralized.
 function _startExecPollTimer() {
   clearInterval(window._execPollTimer);
+  // M1899-P0: 8s→15s on mobile; M1899-R2: on mobile skip when detail modal closed (exec pane not visible → redundant with swimlane fetch)
+  // ROLLBACK: remove the _NS_IS_MOBILE modal-closed guard (inner if block) to restore always-fetch behaviour
   window._execPollTimer = setInterval(() => {
-    if (!document.hidden && window._refreshExecState) window._refreshExecState();
-  }, 8000);
+    if (document.hidden) return;
+    if (window._NS_IS_MOBILE && !document.querySelector('.detail-overlay.show')) return; // M1899-R2: skip on mobile when no detail open
+    if (window._refreshExecState) window._refreshExecState();
+  }, window._NS_IS_MOBILE ? 15000 : 8000);
 }
 
 function closeTerminal() {
@@ -12412,6 +12699,8 @@ async function openDetail(idx) {
   // Render left (hierarchy) immediately, then async fill right
   // M142: clear fingerprint on open — M129 guard must not skip the very first render after dm-ms-creator is reset
   delete _msRenderFingerprint[p.id];
+  // M822: reset view to table on each card open — prevents stale timeline/map state from prior visit
+  _setMsView('table');
   renderHierarchy(p);
   document.getElementById('dm-right').innerHTML =
     '<div class="dm-loading-box"><span class="dm-spinner"></span><span>Loading…</span></div>';
@@ -12581,6 +12870,15 @@ function renderHierarchy(p) {
         <span class="dm-layer-title">Milestones</span>
         <span class="dm-layer-count" id="dm-ms-ack-badge"></span>
         <div style="margin-left:auto;display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end">
+          <!-- M822: view toggle pills — hidden per M1956 (table-only mode) -->
+          <span style="display:none">
+            <button id="ms-view-table" onclick="_setMsView('table')"
+              style="padding:2px 7px;border:none;cursor:pointer;background:var(--accent);color:#fff;transition:background .12s,color .12s" title="Table view">⊞</button>
+            <button id="ms-view-map" onclick="_setMsView('map')"
+              style="padding:2px 7px;border:none;border-left:1px solid var(--panel-border);cursor:pointer;background:none;color:var(--text-dim);transition:background .12s,color .12s" title="Mindmap view">◎</button>
+            <button id="ms-view-timeline" onclick="_setMsView('timeline')"
+              style="padding:2px 7px;border:none;border-left:1px solid var(--panel-border);cursor:pointer;background:none;color:var(--text-dim);transition:background .12s,color .12s" title="Timeline view">╌</button>
+          </span>
           <!-- M732/M1227: blink window — client-side age filter on server blink_state -->
           <span style="display:inline-flex;align-items:center;gap:4px;padding:2px 7px 2px 6px;border:1px solid var(--panel-border);border-radius:10px;background:var(--panel-bg);opacity:.8;transition:opacity .15s" onmouseenter="this.style.opacity=1" onmouseleave="this.style.opacity='.8'" title="Blink visibility window (hours) — base value. Server auto-extends per project to cover the last 2 activity clusters (last-2-clusters algorithm). Effective window = max(base, gap-to-prior-cluster + 1min), capped at 7 days. So if you set 1h but your prior cluster is 5h ago, the effective window becomes 5h to surface that cluster." onclick="event.stopPropagation()">
             <span style="font-size:9px;color:var(--text-dim);font-family:var(--mono);letter-spacing:.03em">blink</span>
@@ -12600,14 +12898,17 @@ function renderHierarchy(p) {
           <button id="dm-semantic-score-btn" title="Compute semantic proximity scores for each stone (sentence-transformers)" onclick="event.stopPropagation();_triggerSemanticScore()" style="font-size:8px;padding:2px 7px;border-radius:3px;border:1px solid var(--panel-border);background:none;color:var(--text-dim);cursor:pointer;font-family:var(--mono);display:none">⊛ score</button>
         </div>
       </div>
-      <!-- M191: slide carousel -->
+      <!-- M191/M822: slide carousel (3-panel: table | map | timeline) -->
       <div id="ms-slide-wrap" style="overflow:hidden">
-        <div id="ms-slide-inner" style="display:flex;width:200%;transition:transform .28s cubic-bezier(.4,0,.2,1)">
-          <div style="width:50%;min-width:50%">
+        <div id="ms-slide-inner" style="display:flex;width:300%;transition:transform .28s cubic-bezier(.4,0,.2,1)">
+          <div style="width:33.333%;min-width:33.333%">
             <div id="dm-ms-creator" style="font-size:12px;font-family:var(--mono);color:var(--text-dim)"><div class="dm-loading-box"><span class="dm-spinner"></span><span>Loading milestones…</span></div></div>
           </div>
-          <div style="width:50%;min-width:50%">
+          <div style="width:33.333%;min-width:33.333%">
             <div id="dm-ms-mindmap"></div>
+          </div>
+          <div style="width:33.333%;min-width:33.333%">
+            <div id="dm-ms-timeline"></div>
           </div>
         </div>
       </div>
@@ -12634,6 +12935,11 @@ function renderMultiNSLeftPanel(p, nsList, okrData) {
 let _tmuxWatchInterval = null;
 let _openCommentMid = null; // M222: tracks which stone's popup is open for toggle-close
 
+function _scrollToBottom(scrollArea) {
+  if (!scrollArea) return;
+  scrollArea.scrollTop = scrollArea.scrollHeight;
+}
+
 // M519: typing indicator — "답변중" graphic while Claude is responding
 function _showTypingIndicator() {
   const area = document.getElementById('comment-thread-area');
@@ -12650,8 +12956,7 @@ function _showTypingIndicator() {
       <span style="width:5px;height:5px;border-radius:50%;background:var(--accent);display:inline-block;animation:typingPulse 1.2s ease-in-out .8s infinite"></span>
     </div>`;
   area.appendChild(ind);
-  const scrollArea = area.parentElement;
-  if (scrollArea) scrollArea.scrollTop = scrollArea.scrollHeight;
+  _scrollToBottom(area.parentElement);
 }
 function _hideTypingIndicator() {
   document.getElementById('comment-typing-indicator')?.remove();
@@ -12669,14 +12974,9 @@ function _refreshCommentThread(mid) {
   const area = document.getElementById('comment-thread-area');
   if (!area) return;
   const thread = _msConversations[mid] || [];
-  // M531 v3: find stone status so queued stones always show indicator
-  const stoneStatus = (() => {
-    for (const proj of Object.values(_msCacheByProject || {})) {
-      const m = (proj || []).find(m => m.id === mid);
-      if (m) return m.status;
-    }
-    return null;
-  })();
+  // M531 v3: find stone status — P1: single flatMap (mirrors OVH-1 in showCommentPopup)
+  const _rctStoneCache = Object.values(_msCacheByProject||{}).flatMap(v=>v||[]).find(m=>m.id===mid);
+  const stoneStatus = _rctStoneCache?.status ?? null;
   if (thread.length) {
     // M1871: date divider — track last rendered date to inject dividers on day change
     let _lastDateKey = null;
@@ -12728,9 +13028,12 @@ function _refreshCommentThread(mid) {
     if (stoneStatus === 'queued') _showTypingIndicator();
     else _hideTypingIndicator();
   }
-  // auto-scroll to bottom so latest message is visible
-  const scrollArea = area.parentElement;
-  if (scrollArea) scrollArea.scrollTop = scrollArea.scrollHeight;
+  // STEP-1: double-rAF lets flex layout fully settle before reading scrollHeight.
+  { const scrollArea = area.parentElement;
+    if (scrollArea) requestAnimationFrame(() => requestAnimationFrame(() => {
+      _scrollToBottom(scrollArea);
+    }));
+  }
   // M1732: re-evaluate the AI∑ badge on every live refresh — a background compress can
   // complete while this popup is already open (conversation_summary written server-side),
   // and without this the badge stayed stale until close/reopen or a page reload.
@@ -12747,6 +13050,14 @@ function _closeCommentPopupNow() {
     const _cur = window._commentPendingAttachments || [];
     if (_cur.length) sessionStorage.setItem(_pendingKey, JSON.stringify(_cur));
     else sessionStorage.removeItem(_pendingKey);
+    // M1924: persist draft text on close — oninput only fires on user keystrokes, not on
+    // programmatic value changes; this guarantees the draft survives queue/unqueue cycles.
+    const _inputEl = document.getElementById('comment-reply-input');
+    if (_inputEl) {
+      const _draft = _inputEl.value || '';
+      if (_draft) sessionStorage.setItem(`comment-draft-${_openCommentMid}`, _draft);
+      else sessionStorage.removeItem(`comment-draft-${_openCommentMid}`);
+    }
   }
   // M1822/M1850: clean up all document-level listeners before removing popup so stale
   // closures from a prior toggle-close don't fire against the next popup and close it.
@@ -12857,7 +13168,7 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
   popup.style.cssText = `position:fixed;z-index:9999;background:var(--panel);border:1px solid var(--accent-soft);
     border-radius:8px;padding:0;box-shadow:0 6px 24px rgba(0,0,0,.25);
     font-family:var(--mono);font-size:11px;line-height:1.55;color:var(--text);
-    max-height:${maxH}px;overflow:hidden;display:flex;flex-direction:column;
+    max-height:${maxH}px;overflow:hidden;display:flex;flex-direction:column;will-change:width,height;
     ${isMob ? `left:8px;right:8px;bottom:${BOTTOM_GUTTER}px;max-width:calc(100vw - 16px)` : 'max-width:340px;min-width:240px'}`;
   if (!isMob) {
     const x = Math.min(event.clientX, window.innerWidth - 360);
@@ -12878,49 +13189,35 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
     popup.style.top = y + 'px';
   }
 
-  function buildThreadHtml() {
+  // _renderMsgHtml: render a single conversation message to HTML string
+  function _renderMsgHtml(msg, lastDKRef) {
+    if (msg.role === 'summary') return '';
+    const skillTag = [
+      ...(msg.skill_refs||[msg.skill_ref]).filter(Boolean).map(s=>`<span style="font-size:8px;padding:1px 4px;border-radius:2px;background:rgba(123,159,212,.12);color:var(--accent);margin-left:3px">⚡${esc(s)}</span>`),
+      ...(msg.agent_refs||[msg.agent_ref]).filter(Boolean).map(a=>`<span style="font-size:8px;padding:1px 4px;border-radius:2px;background:rgba(61,139,94,.12);color:var(--green,#3d8b5e);margin-left:3px">🤖${esc(a)}</span>`),
+    ].join('');
+    const _dk = _fmtDateKey(msg.ts);
+    let _div = '';
+    if (_dk && _dk !== lastDKRef.v) {
+      _div = `<div style="display:flex;align-items:center;gap:6px;margin:8px 0 6px"><div style="flex:1;height:1px;background:var(--text-dim)"></div><span style="font-size:9px;font-family:var(--mono);color:var(--text-soft);white-space:nowrap;font-weight:600;letter-spacing:.04em">${_fmtDateLabel(msg.ts)}</span><div style="flex:1;height:1px;background:var(--text-dim)"></div></div>`;
+      lastDKRef.v = _dk;
+    }
+    return _div + `<div style="margin-bottom:6px">
+      <div style="font-size:9px;color:${msg.role==='user'?'var(--text-dim)':'var(--accent)'}">
+        ${msg.role==='user'?'you':'claude'} · ${_fmtTs(msg.ts)}${skillTag}</div>
+      <div style="font-size:11px;color:var(--text);margin-top:1px">${_applyInlineMarkdown(_renderNtTextHtml(msg.text))}</div>
+    </div>`;
+  }
+  // buildThreadHtml: renders slice [start,end) of thread. start=0 → full wrap div.
+  function buildThreadHtml(start, end) {
     const thread = _msConversations[mid] || [];
     if (!thread.length) return '';
-    // M1871: date divider tracking
-    let _lastDK = null;
-    return `<div id="comment-thread" style="margin:7px 0 0">` +
-      thread.map(msg => {
-        if (msg.role === 'summary') {
-          // M1154 v7: summary entries entirely hidden from chatbox per user request.
-          // Legacy stones lose the compressed-out turn digest (can't recover originals from
-          // destructive pre-v4 compression). New stones (post-v4) never have summary entries.
-          return '';
-        }
-        if (false && msg.role === 'summary_v6_inline_disabled') {
-          const _segs = (msg.text||'').split(/\s*\|\s*/);
-          const _turns = _segs.map(seg => {
-            const _um = seg.match(/^U(?:n)?:\s*([\s\S]*)/i);
-            const _cm = seg.match(/^C:\s*([\s\S]*)/i);
-            if (_um) return {role:'user', text:_um[1].trim()};
-            if (_cm) return {role:'claude', text:_cm[1].trim()};
-            return seg.trim() ? {role:'user', text:seg.trim()} : null;
-          }).filter(Boolean);
-          const _header = `<div style="font-size:8px;color:var(--text-dim);margin-bottom:3px;padding:2px 4px;background:var(--bg-deep);border-radius:2px;display:inline-block">∑ ${msg.compressed_count||'?'} turns compressed</div>`;
-          const _body = _turns.map(t => `<div style="margin-bottom:5px"><div style="font-size:9px;color:${t.role==='user'?'var(--text-dim)':'var(--accent)'}">${t.role==='user'?'you':'claude'}</div><div style="font-size:11px;color:var(--text);margin-top:1px">${_renderNtTextHtml(t.text)}</div></div>`).join('');
-          return `<div style="margin-bottom:8px;padding:6px 8px;border-left:2px solid var(--text-dim);border-radius:0 3px 3px 0;opacity:.85">${_header}${_body}</div>`;
-        }
-        const skillTag = [
-          ...(msg.skill_refs||[msg.skill_ref]).filter(Boolean).map(s=>`<span style="font-size:8px;padding:1px 4px;border-radius:2px;background:rgba(123,159,212,.12);color:var(--accent);margin-left:3px">⚡${esc(s)}</span>`),
-          ...(msg.agent_refs||[msg.agent_ref]).filter(Boolean).map(a=>`<span style="font-size:8px;padding:1px 4px;border-radius:2px;background:rgba(61,139,94,.12);color:var(--green,#3d8b5e);margin-left:3px">🤖${esc(a)}</span>`),
-        ].join('');
-        // M1871: date divider
-        const _dk = _fmtDateKey(msg.ts);
-        let _div = '';
-        if (_dk && _dk !== _lastDK) {
-          _div = `<div style="display:flex;align-items:center;gap:6px;margin:8px 0 6px"><div style="flex:1;height:1px;background:var(--text-dim)"></div><span style="font-size:9px;font-family:var(--mono);color:var(--text-soft);white-space:nowrap;font-weight:600;letter-spacing:.04em">${_fmtDateLabel(msg.ts)}</span><div style="flex:1;height:1px;background:var(--text-dim)"></div></div>`;
-          _lastDK = _dk;
-        }
-        return _div + `<div style="margin-bottom:6px">
-          <div style="font-size:9px;color:${msg.role==='user'?'var(--text-dim)':'var(--accent)'}">
-            ${msg.role==='user'?'you':'claude'} · ${_fmtTs(msg.ts)}${skillTag}</div>
-          <div style="font-size:11px;color:var(--text);margin-top:1px">${_applyInlineMarkdown(_renderNtTextHtml(msg.text))}</div>
-        </div>`;
-      }).join('') + `</div>`;
+    const s = start ?? 0, e = end ?? thread.length;
+    const lastDKRef = {v: null};
+    const inner = thread.slice(s, e).map(msg => _renderMsgHtml(msg, lastDKRef)).join('');
+    return s === 0
+      ? `<div id="comment-thread" style="margin:7px 0 0">${inner}</div>`
+      : inner;
   }
 
   // M188: draft key per milestone so accidental close preserves typed message
@@ -12937,7 +13234,7 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
         style="width:100%;background:var(--panel-soft);border:1px solid var(--panel-border);border-radius:4px;
           padding:4px 7px;font-family:var(--mono);font-size:16px;color:var(--text);box-sizing:border-box;transition:border-color .15s,background .15s"
         oninput="sessionStorage.setItem('${_draftKey}',this.value)"
-        onkeydown="if(event.key==='Enter'){event.stopPropagation();_doCommentReply('${esc(projId)}','${esc(mid)}',this,'${esc(currentStatus||'')}')}"
+        onkeydown="if(event.key==='Enter'){event.stopPropagation();_doCommentReply('${esc(projId)}','${esc(mid)}',this,'${esc(currentStatus||'')}');if(window._commentPopupResetPd)window._commentPopupResetPd();}"
         onclick="event.stopPropagation()"
         onpaste="_commentPasteHandler(event)"
         ondragover="_commentInputDragOver(event)"
@@ -12959,10 +13256,10 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
           onmouseout="this.style.background='var(--accent-soft)';this.style.color='var(--accent)'">
           ⇡ attach<input type="file" accept="*/*" multiple style="display:none" onchange="event.stopPropagation();_commentFileUpload(event,'${esc(projId)}')">
         </label>
-        <!-- M987: verify (3rd) -->
+        <!-- M987: e2e (3rd) — M1920: renamed verify→e2e -->
         <button id="comment-verify-chip" onclick="event.stopPropagation();_toggleCommentVerify('${esc(projId)}','${esc(mid)}',this)"
-          title="Toggle [verify] flag for this stone"
-          style="flex-shrink:0;font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:3px;border:1px solid rgba(123,159,212,.4);background:rgba(123,159,212,.08);color:#7b9fd4;cursor:pointer">verify</button>
+          title="Toggle [e2e] flag — triggers Playwright E2E review child on next dispatch"
+          style="flex-shrink:0;font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:3px;border:1px solid rgba(123,159,212,.4);background:rgba(123,159,212,.08);color:#7b9fd4;cursor:pointer">e2e</button>
         <!-- M987: Send fills remaining space (4th) -->
         <button onclick="event.stopPropagation();_doCommentReply('${esc(projId)}','${esc(mid)}',document.getElementById('comment-reply-input'),'${esc(currentStatus||'')}')"
           style="flex:1;font-size:9px;font-family:var(--mono);padding:2px 0;border-radius:3px;
@@ -13011,22 +13308,18 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
           cursor:pointer;font-family:var(--mono);font-size:13px;line-height:1;padding:1px 7px;opacity:.8"
         onmouseenter="this.style.opacity='1'" onmouseleave="this.style.opacity='.8'">×</button>
     </div>
-    <div style="overflow-y:auto;flex:1;padding:8px 13px 4px">
+    <div style="overflow-y:auto;flex:1;padding:8px 13px 4px;contain:layout style">
     <div style="color:var(--text-soft)">${esc(comment)}</div>
-    <div id="comment-thread-area">${buildThreadHtml()}</div>
+    <div id="comment-thread-area"></div>
     </div>
     <div id="comment-summary-detail" style="display:none;flex-shrink:0;padding:6px 13px;border-top:1px solid var(--panel-border);background:var(--bg-deep);font-size:10px;color:var(--text-soft);font-style:italic;max-height:120px;overflow-y:auto"></div>
     <div style="flex-shrink:0;padding:0 13px 10px;border-top:1px solid var(--panel-border)">${buildReplyInput()}</div>`;
   _openCommentMid = mid; // M222: track for toggle-close
   document.body.appendChild(popup);
+  // OVH-1: single flatMap scan shared across all 3 lookups below (L13289/L13333/L13345)
+  const _openStoneCache = Object.values(_msCacheByProject||{}).flatMap(v=>v||[]).find(m=>m.id===mid);
   // M519/M537: show indicator using live cache status (not stale button-rendered currentStatus)
-  const _liveStatus = (() => {
-    for (const proj of Object.values(_msCacheByProject || {})) {
-      const m = (proj || []).find(m => m.id === mid);
-      if (m) return m.status;
-    }
-    return currentStatus;
-  })();
+  const _liveStatus = _openStoneCache?.status || currentStatus;
   if (_liveStatus === 'queued') _showTypingIndicator();
   // M947: restore any previously-attached-but-not-sent files from sessionStorage
   const _pendingKey = `comment-pending-attach-${mid}`;
@@ -13060,21 +13353,73 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
   // Playwright: uploaded-but-unsent attachment chip vanished on every close/reopen, 100% of the
   // time, because sessionStorage was never actually written. See _closeCommentPopupNow.
   // M458: auto-scroll to bottom on open so latest messages are visible immediately
-  setTimeout(() => {
-    // Find scroll container via thread area parent (robust across popup layout changes)
-    const threadArea = popup.querySelector('#comment-thread-area');
-    const scrollArea = threadArea?.parentElement || popup.querySelector('[style*="overflow-y"]');
-    if (scrollArea) scrollArea.scrollTop = scrollArea.scrollHeight;
-    popup.querySelector('#comment-reply-input')?.focus();
-  }, 80);
+  // STEP-1 + tail-first: render last TAIL msgs immediately (fast open for large histories),
+  // lazy-prepend older msgs when user scrolls to top. No content-visibility needed.
+  { const _TAIL = 30;
+    const _thread = _msConversations[mid] || [];
+    const _total = _thread.length;
+    const _tailStart = Math.max(0, _total - _TAIL);
+    requestAnimationFrame(() => {
+      const threadArea = popup.querySelector('#comment-thread-area');
+      if (!threadArea) return;
+      // Render tail slice — fast even for 263-message threads
+      threadArea.innerHTML = buildThreadHtml(_tailStart);
+      // Track how many msgs are rendered; prepend older on scroll-up
+      let _renderedFrom = _tailStart;
+      requestAnimationFrame(() => {
+        const scrollArea = threadArea.parentElement || popup.querySelector('[style*="overflow-y"]');
+        _scrollToBottom(scrollArea);
+        popup.querySelector('#comment-reply-input')?.focus();
+        // Lazy-load older messages when scrolled near top
+        if (_renderedFrom > 0 && scrollArea) {
+          scrollArea.addEventListener('scroll', function _lazyLoad() {
+            if (scrollArea.scrollTop > 120 || _renderedFrom <= 0) return;
+            const prevH = scrollArea.scrollHeight;
+            const newStart = Math.max(0, _renderedFrom - _TAIL);
+            const frag = buildThreadHtml(newStart, _renderedFrom);
+            const threadDiv = threadArea.querySelector('#comment-thread');
+            if (threadDiv) threadDiv.insertAdjacentHTML('afterbegin', frag);
+            _renderedFrom = newStart;
+            // Restore scroll position so prepend doesn't jump
+            scrollArea.scrollTop += scrollArea.scrollHeight - prevH;
+            if (_renderedFrom <= 0) scrollArea.removeEventListener('scroll', _lazyLoad);
+          }, {passive: true});
+        }
+      });
+    });
+  }
   // M987: initialize verify chip state from live cache
   { const _verifyChip = popup.querySelector('#comment-verify-chip');
-    if (_verifyChip) {
-      const _stone = Object.values(_msCacheByProject||{}).flatMap(v=>v||[]).find(m=>m.id===mid);
-      if (_stone?.verify_flag) { _verifyChip.textContent='verify ✓'; _verifyChip.style.color='var(--green,#3d8b5e)'; _verifyChip.style.background='rgba(61,139,94,.15)'; _verifyChip.style.borderColor='rgba(61,139,94,.4)'; }
+    const _stoneForVerify = _openStoneCache;
+    if (_verifyChip && _stoneForVerify?.verify_flag) {
+      _verifyChip.textContent='e2e ✓'; _verifyChip.style.color='var(--green,#3d8b5e)'; _verifyChip.style.background='rgba(61,139,94,.15)'; _verifyChip.style.borderColor='rgba(61,139,94,.4)';
     }
   }
-  _updateSummaryBadge(mid);
+  // M1905/M1965/M1979: determine refresh need BEFORE first badge render.
+  // If cache lacks conversation_summary for this stone (stale or cold), suppress the extractive
+  // ∑N badge during the async refresh window — it would show a wrong number then flicker to AI∑.
+  // Instead: hide badge, kick loadMilestones, then render once with authoritative data.
+  { const _stoneForRefresh = _openStoneCache;
+    const _needsRefresh = projId && (
+      !(_msCacheByProject[projId] && _msCacheByProject[projId].length > 0) ||
+      (_stoneForRefresh && !_stoneForRefresh.conversation_summary)
+    );
+    if (_needsRefresh) {
+      // Suppress extractive badge during async fetch to avoid ∑N flash before AI∑ lands.
+      const _badgeEl = document.getElementById('comment-summary-badge');
+      if (_badgeEl) { _badgeEl.style.display = 'none'; }
+      // M1979: loadMilestones early-returns when _activeDetailProjId !== projId (cross-project
+      // detail open), leaving cache empty and badge stale. Direct fetch bypasses the guard.
+      fetch(`/api/northstar/${encodeURIComponent(projId)}/milestones`, {cache:'no-store'})
+        .then(r => r.json()).then(d => {
+          window._msCacheByProject = window._msCacheByProject || {};
+          window._msCacheByProject[projId] = d.milestones || [];
+          if (_openCommentMid === mid) _updateSummaryBadge(mid);
+        }).catch(() => { if (_openCommentMid === mid) _updateSummaryBadge(mid); });
+    } else {
+      _updateSummaryBadge(mid);
+    }
+  }
   // M263: restore click-outside auto-close (user wants swimlane click to dismiss the
   // chat history popup). M255 sticky-popup intent was actually about OS notifications,
   // which already persist via requireInteraction (M255 v1). ESC also dismisses.
@@ -13096,6 +13441,7 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
   // Covers: desktop drag-select, mobile touch drag, and touch emulation flows where
   // touchstart fires before pointerdown/mousedown.
   let _pdInsidePopup = false;   // any down event started inside popup
+  window._commentPopupResetPd = () => { _pdInsidePopup = false; };
   function _trackPointerDown(e) { if (popup.contains(e.target)) _pdInsidePopup = true; }
   document.addEventListener('pointerdown', _trackPointerDown, { capture: true });
   document.addEventListener('mousedown',   _trackPointerDown, { capture: true });
@@ -13111,6 +13457,7 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
     document.removeEventListener('click', _hComment);
     document.removeEventListener('touchstart', _hComment);
     document.removeEventListener('keydown', _escClose);
+    window._commentPopupResetPd = null;
   };
   popup._cleanupDragTracker = popup._cleanupAllListeners; // M1850: alias for legacy callers
   function _hComment(e) {
@@ -13135,52 +13482,78 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
   }, 100);
   // M1874: resize handle — desktop only
   if (!isMob) {
-    const _rh = document.createElement('div');
-    _rh.style.cssText = 'position:absolute;bottom:0;right:0;width:16px;height:16px;cursor:se-resize;z-index:1;display:flex;align-items:flex-end;justify-content:flex-end;padding:2px;box-sizing:border-box;opacity:.35;transition:opacity .15s';
-    _rh.innerHTML = '<svg width="10" height="10" viewBox="0 0 10 10" fill="none"><line x1="9" y1="1" x2="1" y2="9" stroke="currentColor" stroke-width="1.5"/><line x1="9" y1="5" x2="5" y2="9" stroke="currentColor" stroke-width="1.5"/></svg>';
-    _rh.addEventListener('mouseenter', () => { _rh.style.opacity = '1'; });
-    _rh.addEventListener('mouseleave', () => { if (!_resizing) _rh.style.opacity = '.35'; });
-    // M1874-fix4: stable resize — pin explicit px size on mousedown (no visual change since
-    // px value matches current constrained size), then remove max-constraints so drag is free.
-    // No lazy-init needed: explicit width/height on a fixed-size popup is a no-op visually.
-    let _resizing = false, _rx0, _ry0, _rw0, _rh0, _dragOverlay = null;
+    // Shared resize state — both handles reference the same drag session
+    let _resizing = false, _rx0, _ry0, _rw0, _rh0, _rl0, _activeOverlayCursor = 'se-resize';
+    // OVH-2: no _dragOverlay div — documentElement.style.cursor sets cursor globally during drag
+    // (avoids a DOM element creation/deletion per drag session; same visual result)
+    // FIX-1: rAF batching — accumulate pending values per mousemove, flush once per paint frame
+    let _rafId = null, _pendingW = null, _pendingH = null, _pendingL = null;
     function _cleanupResize() {
       _resizing = false;
-      _rh.style.opacity = '.35';
-      if (_dragOverlay) { _dragOverlay.remove(); _dragOverlay = null; }
+      if (_rafId) { cancelAnimationFrame(_rafId); _rafId = null; }
+      document.documentElement.style.cursor = '';
       document.body.style.userSelect = '';
       document.removeEventListener('mousemove', _onResizeMove);
       document.removeEventListener('mouseup', _onResizeUp);
     }
     function _onResizeMove(e) {
-      const dw = e.clientX - _rx0, dh = e.clientY - _ry0;
-      popup.style.width  = Math.max(200, _rw0 + dw) + 'px';
-      popup.style.height = Math.max(120, _rh0 + dh) + 'px';
+      if (!_resizing) return;
+      if (_activeOverlayCursor === 'sw-resize') {
+        const dw = _rx0 - e.clientX, dh = e.clientY - _ry0;
+        _pendingW = Math.max(200, _rw0 + dw);
+        _pendingL = _rl0 - (_pendingW - _rw0);
+        _pendingH = Math.max(120, _rh0 + dh);
+      } else {
+        _pendingW = Math.max(200, _rw0 + (e.clientX - _rx0));
+        _pendingH = Math.max(120, _rh0 + (e.clientY - _ry0));
+        _pendingL = null;
+      }
+      if (_rafId) return;
+      _rafId = requestAnimationFrame(() => {
+        popup.style.width  = _pendingW + 'px';
+        if (_pendingL !== null) popup.style.left = _pendingL + 'px';
+        popup.style.height = _pendingH + 'px';
+        _rafId = null;
+      });
     }
     function _onResizeUp() { _cleanupResize(); }
-    _rh.addEventListener('mousedown', (e) => {
+    function _startResizeDrag(e, cursor) {
       e.stopPropagation(); e.preventDefault();
       _resizing = true;
-      // Capture current rendered size first (while constraints are still active)
+      _activeOverlayCursor = cursor;
+      _pendingW = _pendingH = _pendingL = null;
       const r = popup.getBoundingClientRect();
-      _rw0 = r.width; _rh0 = r.height;
-      // Pin explicit px — visually identical to current constrained size
+      _rw0 = r.width; _rh0 = r.height; _rl0 = r.left;
       popup.style.width = _rw0 + 'px'; popup.style.height = _rh0 + 'px';
-      // Now safe to remove constraints (explicit px already wins, no reflow jump)
+      popup.style.left  = _rl0 + 'px'; // pin left for SW drag
       popup.style.maxWidth = 'none'; popup.style.maxHeight = 'none';
       _rx0 = e.clientX; _ry0 = e.clientY;
-      // Full-viewport overlay: consistent se-resize cursor + swallows pointer events
-      // from all elements under the mouse (scroll area, buttons, etc.)
-      _dragOverlay = document.createElement('div');
-      _dragOverlay.style.cssText = 'position:fixed;inset:0;z-index:99999;cursor:se-resize';
-      document.body.appendChild(_dragOverlay);
+      // OVH-2: global cursor override instead of overlay div (no DOM alloc per drag)
+      document.documentElement.style.cursor = cursor;
       document.body.style.userSelect = 'none';
       document.addEventListener('mousemove', _onResizeMove);
       document.addEventListener('mouseup', _onResizeUp);
-    });
+    }
+
+    // SE handle (bottom-right) — existing M1874
+    const _rh = document.createElement('div');
+    // OVH-2: class rh-handle lets CSS :hover rule control opacity — no JS mouseenter/leave
+    _rh.className = 'rh-handle';
+    _rh.style.cssText = 'position:absolute;bottom:0;right:0;width:16px;height:16px;cursor:se-resize;z-index:1;display:flex;align-items:flex-end;justify-content:flex-end;padding:2px;box-sizing:border-box;opacity:.35;transition:opacity .15s';
+    _rh.innerHTML = '<svg width="10" height="10" viewBox="0 0 10 10" fill="none"><line x1="9" y1="1" x2="1" y2="9" stroke="currentColor" stroke-width="1.5"/><line x1="9" y1="5" x2="5" y2="9" stroke="currentColor" stroke-width="1.5"/></svg>';
+    _rh.addEventListener('mousedown', (e) => _startResizeDrag(e, 'se-resize'));
+
+    // M1926: SW handle (bottom-left) — mirrors SE, grows popup leftward
+    const _rhSW = document.createElement('div');
+    _rhSW.className = 'rh-handle';
+    _rhSW.style.cssText = 'position:absolute;bottom:0;left:0;width:16px;height:16px;cursor:sw-resize;z-index:1;display:flex;align-items:flex-end;justify-content:flex-start;padding:2px;box-sizing:border-box;opacity:.35;transition:opacity .15s';
+    _rhSW.innerHTML = '<svg width="10" height="10" viewBox="0 0 10 10" fill="none"><line x1="1" y1="1" x2="9" y2="9" stroke="currentColor" stroke-width="1.5"/><line x1="1" y1="5" x2="5" y2="9" stroke="currentColor" stroke-width="1.5"/></svg>';
+    _rhSW.addEventListener('mousedown', (e) => _startResizeDrag(e, 'sw-resize'));
+
     popup.style.position = 'fixed'; // ensure containing block is viewport
     popup.appendChild(_rh);
-    // Register cleanup so listeners die with the popup
+    popup.appendChild(_rhSW);
+    // Register cleanup so listeners die with the popup; also remove injected hover style
     const _origCleanup = popup._cleanupAllListeners;
     popup._cleanupAllListeners = () => { _origCleanup?.(); _cleanupResize(); };
     popup._cleanupDragTracker = popup._cleanupAllListeners;
@@ -13190,6 +13563,8 @@ function showCommentPopup(event, comment, projId, mid, currentStatus) {
 // (_refreshCommentThread) can also re-evaluate the badge — previously this only ran once at
 // popup-open, so a background compress that completed while the popup was already open left
 // the AI∑ badge stale until the user closed/reopened the popup or reloaded the page.
+// OVH-3: memoize the expensive _semCompress extraction — key=mid|threadLen|lastTs, LRU cap 20
+const _summaryBadgeCache = new Map();
 function _updateSummaryBadge(mid) {
   // M1253 v3: AI∑ badge — LLM summary (conversation_summary) takes priority; fallback to extractive ∑N.
   { const _conv = (_msConversations[mid]||[]); const _badge = document.getElementById('comment-summary-badge'); const _detail = document.getElementById('comment-summary-detail');
@@ -13205,45 +13580,57 @@ function _updateSummaryBadge(mid) {
         if (_detail) { _detail.innerHTML = `<div><span style="font-size:8px;color:var(--accent,#4a9fd4);font-weight:600">AI Summary</span><br>${_renderNtTextHtml(_llmConvSum)}</div>`; }
       } else {
         // Fallback: M1154 v9 / M1193 v2 — decision-anchored extractive compression
-        const _scoreSentence = (s) => {
-          if (!s || s.length < 3) return 0;
-          let sc = 1.0;
-          if (/\b(완료|수정|해결|적용|구현|commit|fix(ed)?|done|implemented|added|removed|replaced)\b/i.test(s)) sc += 4;
-          if (/(```|\.py|\.ts|\.html|\.md|server\.py|northstar\.html|:\d+|commit [0-9a-f]{5,})/.test(s)) sc += 3;
-          if (/\b(error|bug|fail|warn|exception|traceback|오류|버그|경고|실패)\b/i.test(s)) sc += 2.5;
-          if (/[?？]$/.test(s.trim()) || /\b(왜|어떻게|무엇|어디|언제|why|how|what|where|when)\b/i.test(s)) sc += 2;
-          if (/\b(원인|이유|because|caused|→|therefore|결론|핵심)\b/i.test(s)) sc += 1.5;
-          if (s.length < 25) sc -= 2;
-          if (/^[#*-]/.test(s)) sc += 0.5;
-          return Math.max(0, sc);
-        };
-        const _keyLine = (text, n=200) => {
-          const sents = (text||'').split(/(?<=[.!?。])\s+|\n/).map(s=>s.trim()).filter(Boolean);
-          if (!sents.length) return (text||'').replace(/\n/g,' ').trim().slice(0,n);
-          const scored = sents.filter(s=>s.length>5).map(s=>[s,_scoreSentence(s)]);
-          if (!scored.length) return sents[0].slice(0,n);
-          return scored.reduce((a,b)=>b[1]>a[1]?b:a)[0].slice(0,n);
-        };
-        const _semCompress = (turns) => {
-          let uIdx=0, cIdx=0; const parts=[];
-          for (const t of turns) {
-            const txt = t.text||t.content||'';
-            if (t.role==='user')   { uIdx++; parts.push(`U${uIdx}: ${_keyLine(txt)}`); }
-            else if (t.role==='claude') { cIdx++; parts.push(`C${cIdx}: ${_keyLine(txt)}`); }
+        // OVH-3: cache key = mid|threadLen|lastTs; skip recompute if thread unchanged
+        const _raw0 = _conv.filter(c=>c.role!=='summary');
+        const _cacheKey = `${mid}|${_raw0.length}|${_raw0[_raw0.length-1]?.ts||''}`;
+        let _llmSum = _summaryBadgeCache.get(_cacheKey) ?? null;
+        if (_llmSum === null) { // cache miss → run extraction
+        { const _scoreSentence = (s) => {
+            if (!s || s.length < 3) return 0;
+            let sc = 1.0;
+            if (/\b(완료|수정|해결|적용|구현|commit|fix(ed)?|done|implemented|added|removed|replaced)\b/i.test(s)) sc += 4;
+            if (/(```|\.py|\.ts|\.html|\.md|server\.py|northstar\.html|:\d+|commit [0-9a-f]{5,})/.test(s)) sc += 3;
+            if (/\b(error|bug|fail|warn|exception|traceback|오류|버그|경고|실패)\b/i.test(s)) sc += 2.5;
+            if (/[?？]$/.test(s.trim()) || /\b(왜|어떻게|무엇|어디|언제|why|how|what|where|when)\b/i.test(s)) sc += 2;
+            if (/\b(원인|이유|because|caused|→|therefore|결론|핵심)\b/i.test(s)) sc += 1.5;
+            if (s.length < 25) sc -= 2;
+            if (/^[#*-]/.test(s)) sc += 0.5;
+            return Math.max(0, sc);
+          };
+          const _keyLine = (text, n=200) => {
+            const sents = (text||'').split(/(?<=[.!?。])\s+|\n/).map(s=>s.trim()).filter(Boolean);
+            if (!sents.length) return (text||'').replace(/\n/g,' ').trim().slice(0,n);
+            const scored = sents.filter(s=>s.length>5).map(s=>[s,_scoreSentence(s)]);
+            if (!scored.length) return sents[0].slice(0,n);
+            return scored.reduce((a,b)=>b[1]>a[1]?b:a)[0].slice(0,n);
+          };
+          const _semCompress = (turns) => {
+            let uIdx=0, cIdx=0; const parts=[];
+            for (const t of turns) {
+              const txt = t.text||t.content||'';
+              if (t.role==='user')   { uIdx++; parts.push(`U${uIdx}: ${_keyLine(txt)}`); }
+              else if (t.role==='claude') { cIdx++; parts.push(`C${cIdx}: ${_keyLine(txt)}`); }
+            }
+            return parts.join(' | ') || `(${turns.length} turns)`;
+          };
+          const _TH=5,_KL=4; const _existSum=_conv.filter(c=>c.role==='summary'); const _raw=_raw0;
+          const _hasPrior=_existSum.length>0;
+          if (_hasPrior && _raw.length>_KL+_TH) {
+            const _sq=_raw.slice(0,-_KL);
+            _llmSum=[{role:'summary',text:_semCompress(_sq),ts:_sq[_sq.length-1]?.ts||'',compressed_count:_sq.length}];
+          } else if (_hasPrior && _raw.length<=_KL+_TH) {
+            _llmSum=_existSum;
+          } else if (!_hasPrior && _raw.length>_TH) {
+            const _sq=_raw.slice(0,-_KL);
+            _llmSum=[{role:'summary',text:_semCompress(_sq),ts:_sq[_sq.length-1]?.ts||'',compressed_count:_sq.length}];
           }
-          return parts.join(' | ') || `(${turns.length} turns)`;
-        };
-        const _TH=5,_KL=4; const _existSum=_conv.filter(c=>c.role==='summary'); const _raw=_conv.filter(c=>c.role!=='summary');
-        const _hasPrior=_existSum.length>0; let _llmSum=null;
-        if (_hasPrior && _raw.length>_KL+_TH) {
-          const _sq=_raw.slice(0,-_KL);
-          _llmSum=[{role:'summary',text:_semCompress(_sq),ts:_sq[_sq.length-1]?.ts||'',compressed_count:_sq.length}];
-        } else if (_hasPrior && _raw.length<=_KL+_TH) {
-          _llmSum=_existSum;
-        } else if (!_hasPrior && _raw.length>_TH) {
-          const _sq=_raw.slice(0,-_KL);
-          _llmSum=[{role:'summary',text:_semCompress(_sq),ts:_sq[_sq.length-1]?.ts||'',compressed_count:_sq.length}];
         }
+        // OVH-3: store in cache; evict oldest if over 20 entries
+        if (_llmSum !== null) {
+          _summaryBadgeCache.set(_cacheKey, _llmSum);
+          if (_summaryBadgeCache.size > 20) _summaryBadgeCache.delete(_summaryBadgeCache.keys().next().value);
+        }
+        } // end cache-miss block
         if (_llmSum && _llmSum.length) {
           const _cnt=_llmSum.reduce((a,s)=>a+(s.compressed_count||0),0);
           _badge.textContent='∑ '+(_cnt||_llmSum.length); _badge.style.display='inline';
@@ -13431,7 +13818,7 @@ async function _doCommentReply(projId, mid, inputEl, currentStatus) {
     // M465: scroll the actual scroll container (parent of threadArea), not inner threadEl
     const scrollArea = threadArea.parentElement;
     if (scrollArea) {
-      requestAnimationFrame(() => { scrollArea.scrollTop = scrollArea.scrollHeight; });
+      requestAnimationFrame(() => { _scrollToBottom(scrollArea); });
     }
   }
   // M531: indicator driven by thread state in _refreshCommentThread, not on send
@@ -13557,23 +13944,15 @@ async function killExecSession(explicitSession) {
   // project (which would take down the main claude session alongside the fork). explicitSession
   // takes priority (set by overlay/terminal kill buttons), then fall back to the watched session.
   const specificSession = (explicitSession || _tmuxWatchSession || '').trim();
-  stopTmuxWatch();
-  if (!projId) return;
-  // M1153: immediate kill — no STOPPING motion, no 2-second grace (match tmux terminal killSession behavior)
-  const output = document.getElementById('dm-tmux-output');
-  // M1749: kill ONLY the targeted session via the named endpoint (cascades to branch children
-  // of a mother only — never the main claude session). If no target resolved, kill only the
-  // project's MAIN exec session so a stray button press can never wipe every exec session.
-  const _target = specificSession || `claude-exec-${projId}`;
-  await fetch(`/api/northstar/${encodeURIComponent(projId)}/tmux-session/${encodeURIComponent(_target)}`, {method:'DELETE'}).catch(()=>{});
-  if (output) { output.style.color = ''; output.style.fontWeight = ''; output.style.textAlign = ''; output.style.fontSize = '10px'; output.style.letterSpacing = ''; output.textContent = '(session ended)'; }
-  // M1812b / M1812c: show loading overlay during kill→pane-disappear gap.
-  // Store killed session name on the modal so _refreshExecState can gate clearing until
-  // the session actually disappears from the API response (not just on first poll).
+  // M1940: set kill spinner BEFORE stopTmuxWatch() so spinner is already visible when the
+  // tmux overlay disappears. Previous order (stopTmuxWatch first, then spinner) caused the
+  // exec pane to vanish before the loading indicator appeared — a visible sequence inversion.
+  // 'kill' owner blocks stopTmuxWatch's 'tmux' self-clear guard (L13805) so this is safe.
   const _dmKillModal = document.getElementById('detail-modal');
   // M1812e: allow kill to override 'open' owner (was stuck on 'open', then cleared by openDetail's 5s timeout).
   // Never override 'dispatch' or 'tmux' — those have their own lifecycle.
   const _dmKillOwner = _dmKillModal && _dmKillModal.dataset.loadingOwner;
+  const _target = specificSession || `claude-exec-${projId}`;
   if (_dmKillModal && (!_dmKillOwner || _dmKillOwner === 'open')) {
     _dmKillModal.classList.add('loading');
     _dmKillModal.dataset.loadingOwner = 'kill';
@@ -13587,6 +13966,16 @@ async function killExecSession(explicitSession) {
       }
     }, 5000);
   }
+  // M1940: stopTmuxWatch() after spinner is set — overlay disappears with spinner already visible.
+  stopTmuxWatch();
+  if (!projId) return;
+  // M1153: immediate kill — no STOPPING motion, no 2-second grace (match tmux terminal killSession behavior)
+  const output = document.getElementById('dm-tmux-output');
+  // M1749: kill ONLY the targeted session via the named endpoint (cascades to branch children
+  // of a mother only — never the main claude session). If no target resolved, kill only the
+  // project's MAIN exec session so a stray button press can never wipe every exec session.
+  await fetch(`/api/northstar/${encodeURIComponent(projId)}/tmux-session/${encodeURIComponent(_target)}`, {method:'DELETE'}).catch(()=>{});
+  if (output) { output.style.color = ''; output.style.fontWeight = ''; output.style.textAlign = ''; output.style.fontSize = '10px'; output.style.letterSpacing = ''; output.textContent = '(session ended)'; }
   // M1118: clear assigned_session immediately in cache so sess badge disappears at once
   // M1879: also clear _lwsCache so the next render re-fetches fresh last-worked-session
   if (window._lwsCache && window._lwsCache[projId]) delete window._lwsCache[projId];
@@ -13644,8 +14033,10 @@ function startTmuxWatch(projId, tmuxSession) {
   window._tmuxWatchActive = true; // M1581: visibility handler checks this
   window._tmuxWatchPaused = false;
   // M1757: adaptive backoff — 3 fast polls (2s), then 2 medium (4s), then slow (10s) when idle
+  // M1899-R13a: mobile floor 10s — live overlay still useful but 2s polling causes excess heat on iOS.
+  // ROLLBACK: replace the ternary with the flat array literal [2000, 2000, 2000, 4000, 4000, 10000].
   let _noChangeCnt = 0;
-  const _TMUX_MS = [2000, 2000, 2000, 4000, 4000, 10000];
+  const _TMUX_MS = window._NS_IS_MOBILE ? [10000, 10000, 30000] : [2000, 2000, 2000, 4000, 4000, 10000];
   const _schedTmuxPoll = () => {
     if (_tmuxWatchInterval) clearInterval(_tmuxWatchInterval);
     _tmuxWatchInterval = setInterval(poll, _TMUX_MS[Math.min(_noChangeCnt, _TMUX_MS.length - 1)]);
@@ -13737,6 +14128,7 @@ let _taskBoardPollTimer = null;
 // the UI reflects live work without the user needing to hit the refresh button.
 function startTaskBoardPoll(projId) {
   if (_taskBoardPollTimer) clearInterval(_taskBoardPollTimer);
+  // M1899-R7: 12s→30s on mobile (modal-scoped, only runs when detail open) — ROLLBACK: change 30000 back to 12000
   _taskBoardPollTimer = setInterval(() => {
     if (document.hidden) return;
     // Stop if the detail modal has closed under us
@@ -13746,7 +14138,7 @@ function startTaskBoardPoll(projId) {
       return;
     }
     loadTaskBoard(projId);
-  }, 12000);
+  }, window._NS_IS_MOBILE ? 30000 : 12000);
 }
 function stopTaskBoardPoll() {
   if (_taskBoardPollTimer) { clearInterval(_taskBoardPollTimer); _taskBoardPollTimer = null; }
@@ -13927,7 +14319,7 @@ function renderRight(p) {
         <div class="dm-toggle-pane" id="dm-model-pane">
           <div class="dm-pane-header" onclick="toggleDmPane('dm-model-pane');_updateModelPaneSummary()">
             <span class="dm-pane-label">model</span>
-            <span id="dm-model-pane-summary" style="flex:1;font-family:var(--mono);font-size:9px;color:var(--accent);opacity:.85;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-left:6px;text-align:center;display:none"></span>
+            <span id="dm-model-pane-summary" style="flex:1;font-family:var(--mono);font-size:9px;color:#fff;opacity:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-left:6px;text-align:center;display:none"></span>
             <span class="dm-pane-caret" id="dm-model-caret">▾</span>
           </div>
           <div class="dm-pane-body" id="dm-model-pane-body" style="display:none">
@@ -14035,6 +14427,24 @@ function renderRight(p) {
               delete _dmModal.dataset.killTarget;
             }
             // else: keep spinner — session still present in API response
+          } else if (_dmOwner === 'fork') {
+            // M1960: hold spinner until the forked session appears in exec-sessions API.
+            // The fork process takes several seconds (new claude process + tmux spawn).
+            const _forkTgt = _dmModal.dataset.forkTarget || '';
+            // M1960-fix: hold spinner until real forkTarget is set (POST in flight → '__pending__').
+            // Old fallback (_forkSessions.length>0) caused premature clear because existing
+            // sessions satisfied the check before the new fork session was visible.
+            if (_forkTgt && _forkTgt !== '__pending__') {
+              const _forkSessions = [...(d.sessions||[]), ...(d.all_sessions||[])];
+              const _forkAppeared = _forkSessions.some(s => (typeof s === 'string' ? s : s.session||'') === _forkTgt);
+              if (_forkAppeared) {
+                _dmModal.classList.remove('loading');
+                delete _dmModal.dataset.loadingOwner;
+                delete _dmModal.dataset.forkTarget;
+              }
+              // else: keep spinner — fork session not yet visible in API
+            }
+            // '__pending__' or absent → POST in flight, hold spinner unconditionally
           } else {
             _dmModal.classList.remove('loading');
             delete _dmModal.dataset.loadingOwner;
@@ -14062,7 +14472,7 @@ function renderRight(p) {
             } else if (assigned) {
               // Session alive + assigned → show main/branch label
               const _isMain = _execProjPatSess.test(assigned);
-              const _label = _isMain ? 'main' : (assigned.replace(new RegExp(`.*-exec-${_projId}-`), '') || 'branch');
+              const _label = _isMain ? 'main' : (assigned.replace(new RegExp(`.*-exec-${_projId}-`), '').slice(0,4) || 'brch');
               _sb.textContent = _label;
               _sb.title = `Assigned: ${assigned} — click to view/change`;
               _sb.style.color = _isMain ? 'var(--green)' : '#7b9fd4';
@@ -14155,6 +14565,12 @@ function renderRight(p) {
               if (_open && _curSess === _targetSess) { stopTmuxWatch(); }
               else { stopTmuxWatch(); startTmuxWatch(pid, _targetSess); }
             };
+            // M1893: tmux_session_name → substar count (same ▲N badge as sess popup)
+            const _epSubCounts = {};
+            for (const _epNs of (_nsStarsCache[_projId] || [])) {
+              const _epAsgn = (_epNs.assigned_session || '').trim();
+              if (_epAsgn) _epSubCounts[_epAsgn] = (_epSubCounts[_epAsgn] || 0) + 1;
+            }
             info.innerHTML = `<div style="margin-top:6px;border-radius:7px;overflow:hidden;border:1px solid rgba(61,139,94,.22)">` + running.map((s,i) => {
               const sIdle = s.idle;
               const dotColor = sIdle ? 'var(--text-dim)' : 'var(--green)';
@@ -14191,11 +14607,11 @@ function renderRight(p) {
                   ? `<span style="${_badgeBase};color:var(--accent);opacity:.5;background:rgba(123,159,212,.05);border:1px dashed rgba(123,159,212,.35)" title="Live session ID pending capture…">→ ···</span>`
                   : '';
               const spawnBadge = sm === 'resume'
-                ? `<span style="${_badgeBase};color:var(--green);background:rgba(61,139,94,.10);border:1px solid rgba(61,139,94,.30)" title="Spawned with --resume ${esc(sfrom)} → live session: ${esc(slive)}">↻ resume${sfrom?` ${esc(sfrom.slice(0,8))}`:''}</span>${liveChip}`
+                ? `<span style="${_badgeBase};color:var(--green);background:rgba(61,139,94,.10);border:1px solid rgba(61,139,94,.30)" title="Spawned with --resume ${esc(sfrom)} → live session: ${esc(slive)}">↻ resume</span>${liveChip}`
                 : sm === 'fork'
-                ? `<span style="${_badgeBase};color:var(--accent);background:rgba(123,159,212,.10);border:1px solid rgba(123,159,212,.30)" title="Forked from mother session ${esc(sfrom)} (--fork-session) → own live session: ${esc(slive)}">⑂ fork${sfrom?` ${esc(sfrom.slice(0,8))}`:''}</span>${liveChip}`
+                ? `<span style="${_badgeBase};color:var(--accent);background:rgba(123,159,212,.10);border:1px solid rgba(123,159,212,.30)" title="Forked from mother session ${esc(sfrom)} (--fork-session) → own live session: ${esc(slive)}">⑂ fork</span>${liveChip}`
                 : sm === 'continue'
-                ? `<span style="${_badgeBase};color:var(--text-dim);background:rgba(0,0,0,.04);border:1px solid var(--panel-border)" title="Claude picked most recent session">↻ resume</span>`
+                ? `<span style="${_badgeBase};color:var(--text-dim);background:rgba(0,0,0,.04);border:1px solid var(--panel-border)" title="Claude picked most recent session">↻ resume</span>${liveChip}` // M1936: include liveChip (continue sessions now get live_session_id via presigned --session-id)
                 : sm === 'fresh'
                 ? `<span style="${_badgeBase};color:var(--yellow,#d4a574);background:rgba(212,165,116,.10);border:1px solid rgba(212,165,116,.30)" title="New session, no prior context">✦ new</span>${liveChip}`
                 : `<span style="${_badgeBase};color:var(--text-dim);opacity:.45;background:none;border:none;padding:1px 0">— unknown</span>`;
@@ -14215,11 +14631,17 @@ function renderRight(p) {
               // Same truncation contract as M1685-h: name truncates first, the moved element
               // (now "started HH:MM") never does.
               const _startedTxt = `started ${_fmtTs(s.created)}`;
+              // M1893: ▲N substar count badge for exec-pane rows
+              const _epSubCnt = s.session ? (_epSubCounts[s.session] || 0) : 0;
+              const _epSubBadge = _epSubCnt > 0
+                ? `<span style="background:rgba(255,149,0,.25);color:var(--text);font-size:8px;padding:1px 5px;border-radius:2px;font-weight:700;border:1px solid rgba(255,149,0,.4);flex-shrink:0" title="${_epSubCnt} substar(s) assigned">▲${_epSubCnt}</span>`
+                : '';
               return `<div style="display:grid;grid-template-columns:8px 1fr auto;grid-template-rows:auto auto;column-gap:8px;row-gap:1px;align-items:center;padding:6px 10px;background:${rowBg};${i<running.length-1?`border-bottom:1px solid ${borderColor}`:''}"
                 onclick="_toggleTmux('${esc(p.id)}','${esc(s.session||'')}');event.stopPropagation()">
                 <span style="grid-column:1;grid-row:1/3;width:8px;height:8px;border-radius:50%;background:${dotColor};align-self:center;${sIdle?'':'box-shadow:0 0 6px rgba(61,139,94,.5);animation:sess-pulse 3s ease-in-out infinite'}"></span>
                 <div style="grid-column:2;grid-row:1;min-width:0;cursor:pointer;display:flex;align-items:center;gap:5px" title="Click to open/close terminal overlay">
                   <span style="min-width:0;flex:1 1 auto;font-family:var(--mono);font-size:10px;color:${labelColor};overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.session||s.proj_id)}</span>
+                  ${_epSubBadge}
                   <span style="flex-shrink:0;font-family:var(--mono);font-size:8px;color:var(--text-dim);letter-spacing:.03em">${_startedTxt}</span>
                 </div>
                 <div style="grid-column:2;grid-row:2;min-width:0;cursor:pointer;font-family:var(--mono);font-size:8px;color:var(--text-dim);letter-spacing:.03em;display:flex;align-items:center;gap:6px;flex-wrap:wrap" title="Click to open/close terminal overlay">${_stoneChip} ${spawnBadge} ${modelChip}</div>
@@ -14287,7 +14709,9 @@ function renderRight(p) {
       }).catch(()=>{});
     };
     clearInterval(window._apiErrorPollTimer);
-    window._apiErrorPollTimer = setInterval(() => { if (!document.hidden) _checkApiErrors(); }, 15000);
+    window._checkApiErrors = _checkApiErrors; // M1899-R6: expose so visibilitychange can restart on foreground
+    // M1899-R5: 30s→60s mobile; M1899-R7: 60s→120s mobile (ROLLBACK: change 120000 back to 60000)
+    window._apiErrorPollTimer = setInterval(() => { if (!document.hidden) _checkApiErrors(); }, window._NS_IS_MOBILE ? 120000 : 15000);
     _startExecPollTimer();
 
     // M777: session badge removed — no longer polling substar sessions
@@ -14471,11 +14895,11 @@ function renderRight(p) {
               // grid column (M1775 regression: fresh row's label landed in the 10px dot column
               // instead of the flexible info column, clipping "new session" to invisible).
               if (isFresh) return `<span></span>`;
-              if (isExecLive) return `<span style="color:var(--green);font-size:9px" title="Process alive in tmux">●</span>`;
+              if (isExecLive) return `<span data-dot-live="1" style="color:var(--green);font-size:9px" title="Process alive in tmux">●</span>`;
               const _hasProcess = _liveExecSids.size > 0 && _liveExecSids.has(s.id);
               const _dotColor = _hasProcess ? 'var(--green)' : 'var(--text-dim)';
               const _dotTitle = _hasProcess ? 'Process alive in tmux' : 'No active process (orphaned transcript)';
-              return `<span style="color:${_dotColor};font-size:9px" title="${_dotTitle}">${_hasProcess ? '●' : '○'}</span>`;
+              return `<span${_hasProcess ? ' data-dot-live="1"' : ''} style="color:${_dotColor};font-size:9px" title="${_dotTitle}">${_hasProcess ? '●' : '○'}</span>`;
             })();
             const _labelIdHtml = (isFresh || isExecLive)
               ? `<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 0;min-width:0">${label}</span>`
@@ -14499,11 +14923,33 @@ function renderRight(p) {
           // M1453b: also include selected session_id — picked/unpicked swaps same html.length → hash collision → stale green
           const _ptyHashKey = window._ptyStatus?.[_projId] || '';
           // M1499: include _liveExecSid in hash so dot color updates when exec session changes
-          const newHash = html.length + ':' + _ptyHashKey + ':' + (_curSess.session_id || '') + ':' + (_liveExecSid || '');
+          // M1911: split hash into structural (content) vs selection parts to avoid full
+          // innerHTML rewrite when only the picked session changes — that rewrite caused
+          // a visible flicker on every row click because _selectSession already patched
+          // the picked class in-place (instant feedback) but _renderResumableSessions then
+          // nuked and rebuilt the whole DOM ~200ms later.
+          const _structHash = html.length + ':' + _ptyHashKey + ':' + (_liveExecSid || '');
+          const newHash = _structHash + ':' + (_curSess.session_id || '');
+          const _structChanged = sessBody.dataset.resumableStructHash !== _structHash || !sessBody.dataset.resumableStructHash;
           const _hashChanged = sessBody.dataset.resumableHash !== newHash || !sessBody.dataset.resumableHash;
-          if (_hashChanged) {
+          if (_structChanged) {
+            // Full rewrite only when content (not just selection) changed
             sessBody.innerHTML = html;
             sessBody.dataset.resumableHash = newHash;
+            sessBody.dataset.resumableStructHash = _structHash;
+          } else if (_hashChanged) {
+            // Only picked session changed — patch DOM in-place, no innerHTML rewrite
+            sessBody.dataset.resumableHash = newHash;
+            const newSessId = _curSess.session_id || '';
+            sessBody.querySelectorAll('.dm-sess-row').forEach(r => {
+              const isPicked = newSessId ? r.dataset.session === newSessId : false;
+              r.classList.toggle('picked', isPicked);
+              const dot = r.querySelector('span');
+              // M1911-b/c: dot color = process-alive only. live dot always green, dead dot always text-dim.
+              if (dot && !dot.dataset.dotLive) dot.style.color = 'var(--text-dim)';
+              const modelSpan = r.querySelector('span:nth-child(3) span');
+              if (modelSpan) modelSpan.style.fontWeight = isPicked ? '600' : '400';
+            });
           }
           // M1799: was clearing on every fetch .then() regardless of whether this specific
           // call actually rewrote sessBody.innerHTML — a fetch that landed with a same-hash
@@ -14540,7 +14986,8 @@ function renderRight(p) {
     };
     _renderResumableSessions();
     clearInterval(window._resumablePoll);
-    window._resumablePoll = setInterval(() => { if (!document.hidden) _renderResumableSessions(); }, 15000);
+    // M1899-R5: 30s→60s mobile; M1899-R7: 60s→120s mobile (ROLLBACK: change 120000 back to 60000)
+    window._resumablePoll = setInterval(() => { if (!document.hidden) _renderResumableSessions(); }, window._NS_IS_MOBILE ? 120000 : 15000);
     window._renderResumableSessions = _renderResumableSessions;
     // M1414: pre-load adj data so pane renders immediately on first toggle
     _sbAdjLoad().then(list => { window._dpAdjList = list; });
@@ -14851,268 +15298,297 @@ document.addEventListener('input', e => {
     // Sticky — no auto-dismiss. User must click ×.
   }
   if (_bc) { _bc.onmessage = e => _seen.add(e.data); }
+  // M1899: mobile low-power flag — defined here (before SSE + main poll) so both can reference it.
+  // Declared with var to avoid TDZ if script order ever shuffles; assignment is idempotent.
+  if (typeof _NS_IS_MOBILE === 'undefined') window._NS_IS_MOBILE = /iPhone|iPad|Android/i.test(navigator.userAgent);
+  // M1899-R16a: hide mascot on mobile — pure decoration; walk+bob animations are a compositor thread cost.
+  // ROLLBACK: remove this if-block.
+  if (window._NS_IS_MOBILE) {
+    const _mascotWrap = document.getElementById('ns-mascot-wrap');
+    if (_mascotWrap) _mascotWrap.style.display = 'none';
+  }
+  // M1899-R16c: suppress all CSS transitions on mobile — compositor interpolation runs on every
+  // render tick even when nothing visually changes. Mobile UX is tap-driven; transitions add no value.
+  // ROLLBACK: remove this if-block.
+  if (window._NS_IS_MOBILE) {
+    const _noTransStyle = document.createElement('style');
+    _noTransStyle.id = 'ns-mobile-no-transition';
+    _noTransStyle.textContent = '* { transition: none !important; }';
+    document.head.appendChild(_noTransStyle);
+  }
+  // M1899-R17: shared event handler — called by both SSE path (desktop) and long-poll path (mobile).
+  // Extracts all per-event-type logic so neither path duplicates it.
+  // ROLLBACK: inline these back into the SSE addEventListener calls and remove _handleNotifyEvent.
+  // Hoisted here so _connect() and _mobileNotifyPoll() can both reference it.
+  let _msUpdPendingProjs = new Set();
+  let _msUpdPendingData = [];
+  let _msUpdFlushScheduled = false;
+  function _flushMsUpdates() {
+    _msUpdFlushScheduled = false;
+    if (!window._isTyping) render();
+    // M1899-R8: deduplicate by proj_id — take the last event per project (most recent state).
+    // ROLLBACK: replace the _lastByProj block below with the original `for (const d of _msUpdPendingData)` loop.
+    const _lastByProj = new Map();
+    for (const d of _msUpdPendingData) _lastByProj.set(d.proj_id, d);
+    for (const d of _lastByProj.values()) {
+      if (d.proj_id === window._detailModalOpenProjId) {
+        const _pKey = (d.mid||'') + ':' + d.proj_id;
+        const _pAge = Date.now() - (_recentPatchMs.get(_pKey) || 0);
+        // M1977: if popup is open for this stone and its cached entry lacks conversation_summary,
+        // the _pAge<3000 shortcut skips re-fetch — badge stays stale. Fall through to loadMilestones.
+        const _cachedStoneForPopup = d.mid && _openCommentMid === d.mid
+          ? (_msCacheByProject[d.proj_id] || []).find(m => m.id === d.mid)
+          : null;
+        const _popupNeedsRefresh = _cachedStoneForPopup && !_cachedStoneForPopup.conversation_summary;
+        if (_pAge < 3000 && _msCacheByProject[d.proj_id] && !_popupNeedsRefresh) {
+          _renderFromCache(d.proj_id);
+          if (d.mid) _refreshCommentThread(d.mid);
+        } else {
+          loadMilestones(d.proj_id).then(() => { if (d.mid) _refreshCommentThread(d.mid); });
+        }
+      } else if (typeof _cgProjId !== 'undefined' && _cgProjId === d.proj_id) {
+        loadMilestones(d.proj_id).catch(() => {});
+      } else {
+        fetch(`/api/northstar/${encodeURIComponent(d.proj_id)}/milestones`, {cache:'no-store'})
+          .then(r => r.json()).then(data => {
+            const _ms = data.milestones || [];
+            _msCacheByProject[d.proj_id] = _ms;
+            _syncCardBadge(d.proj_id);
+            if (d.mid && _openCommentMid === d.mid) {
+              const m = _ms.find(x => x.id === d.mid);
+              if (m) { _msConversations[d.mid] = m.conversation || []; _refreshCommentThread(d.mid); }
+            }
+          }).catch(() => {});
+      }
+    }
+    _msUpdPendingProjs.clear();
+    _msUpdPendingData = [];
+    }
+  window._execStatusCorrectionInFlight = window._execStatusCorrectionInFlight || {};
+  window._execStatusCorrectionDebounce = window._execStatusCorrectionDebounce || {};
+  function _correctExecStatusFor(projId) {
+    // M1899-P0: mobile debounce — poll bursts collapse into 1 fetch per 2s.
+    if (window._NS_IS_MOBILE) {
+      if (window._execStatusCorrectionDebounce[projId]) clearTimeout(window._execStatusCorrectionDebounce[projId]);
+      window._execStatusCorrectionDebounce[projId] = setTimeout(() => {
+        delete window._execStatusCorrectionDebounce[projId];
+        _correctExecStatusForNow(projId);
+      }, 2000);
+      return;
+    }
+    _correctExecStatusForNow(projId);
+  }
+  function _correctExecStatusForNow(projId) {
+    if (window._execStatusCorrectionInFlight[projId]) return;
+    window._execStatusCorrectionInFlight[projId] = true;
+    fetch('/api/exec-sessions').then(r => r.json()).then(d => {
+      const mine = (d.sessions || []).filter(s => s.proj_id === projId);
+      if (!mine.length) return;
+      const anyRunning = mine.some(s => !s.idle);
+      const correctKey = anyRunning ? 'running' : 'idle';
+      if (!anyRunning && window._execSpawnTime) delete window._execSpawnTime[projId];
+      const _prevSnap = JSON.stringify((window._execSessionList[projId] || []).map(s => s.idle));
+      window._execSessionList[projId] = mine.map(s => ({
+        idle: s.idle, model: s.model||'', session: s.session||'',
+        live_session_id: s.live_session_id||'', isMother: false,
+        created: s.created||'', created_ts: s.created_ts||0, activity: s.activity||0
+      })).sort((a, b) => a.session < b.session ? -1 : a.session > b.session ? 1 : 0);
+      const _newSnap = JSON.stringify(window._execSessionList[projId].map(s => s.idle));
+      const _sessChanged = _newSnap !== _prevSnap;
+      if (_execStatus[projId] !== correctKey) {
+        _execStatus[projId] = correctKey;
+        const cardNode = document.querySelector(`.ns-node[data-pid="${CSS.escape(projId)}"]`);
+        if (cardNode) {
+          cardNode.classList.toggle('exec-live', anyRunning);
+          cardNode.classList.toggle('exec-idle', !anyRunning);
+        }
+        Object.keys(_swimlaneLaneFp).forEach(k => delete _swimlaneLaneFp[k]); _nodeCardCache.clear(); _swimlaneGlobalFp = ''; // M1899-R9/R18B
+        if (typeof render === 'function') render();
+      } else if (_sessChanged) {
+        Object.keys(_swimlaneLaneFp).forEach(k => delete _swimlaneLaneFp[k]); _nodeCardCache.clear(); _swimlaneGlobalFp = ''; // M1899-R9/R18B
+        if (typeof render === 'function') render();
+      }
+    }).catch(() => {}).finally(() => { delete window._execStatusCorrectionInFlight[projId]; });
+  }
+  window._execSpawnTime = window._execSpawnTime || {};
+  function _handleNotifyEvent(evType, d) {
+    // M1899-R17: unified handler for SSE (desktop) and long-poll (mobile).
+    // Called with parsed data object d; evType is the SSE event name string.
+    if (evType === 'stone_created') {
+      if (d.proj_id) {
+        fetch(`/api/northstar/${encodeURIComponent(d.proj_id)}/milestones`, {cache:'no-store'})
+          .then(r => r.json()).then(data => {
+            _msCacheByProject[d.proj_id] = data.milestones || [];
+            _syncCardBadge(d.proj_id);
+          }).catch(() => {});
+      }
+    } else if (evType === 'milestone_updated') {
+      if (d.proj_id) {
+        _msUpdPendingProjs.add(d.proj_id);
+        _msUpdPendingData.push(d);
+        if (!_msUpdFlushScheduled) {
+          _msUpdFlushScheduled = true;
+          setTimeout(_flushMsUpdates, window._NS_IS_MOBILE ? 1000 : 500);
+        }
+        if (window._blinkWindowMinByProject) delete window._blinkWindowMinByProject[d.proj_id];
+      }
+    } else if (evType === 'session_idle') {
+      if (d.proj_id) {
+        _notifyTransition(d.proj_id, d.kind || 'pty');
+        if ((d.kind || 'exec') === 'exec') {
+          _execStatus[d.proj_id] = 'idle';
+          if (window._execSpawnTime) delete window._execSpawnTime[d.proj_id];
+          const cardNode = document.querySelector(`.ns-node[data-pid="${CSS.escape(d.proj_id)}"]`);
+          if (cardNode) { cardNode.classList.remove('exec-live'); cardNode.classList.add('exec-idle'); }
+          Object.keys(_swimlaneLaneFp).forEach(k => delete _swimlaneLaneFp[k]); _nodeCardCache.clear(); _swimlaneGlobalFp = ''; // M1899-R9/R18B
+          if (typeof render === 'function') render();
+        }
+        if (d.proj_id === window._detailModalOpenProjId && typeof window._refreshExecState === 'function') {
+          window._refreshExecState();
+        }
+        _correctExecStatusFor(d.proj_id);
+        _hideTypingIndicator();
+        if (d.proj_id === window._detailModalOpenProjId && typeof window._renderResumableSessions === 'function') {
+          setTimeout(window._renderResumableSessions, 600);
+        }
+      }
+    } else if (evType === 'session_running') {
+      if (d.proj_id && d.kind === 'exec') {
+        window._execSpawnTime[d.proj_id] = Date.now();
+        _correctExecStatusFor(d.proj_id);
+        _syncCardBadge(d.proj_id);
+        if (d.proj_id === window._detailModalOpenProjId && typeof window._refreshExecState === 'function') {
+          window._refreshExecState();
+        }
+        if (_openCommentMid) {
+          const _openSt = (_msCacheByProject[d.proj_id] || []).find(m => m.id === _openCommentMid);
+          if (_openSt && _openSt.status === 'queued') _showTypingIndicator();
+        }
+      }
+    }
+    // user_commented: no-op (toasts disabled M162)
+  }
+
   // Open the SSE connection; reconnect with backoff on close.
   // M1581: pause SSE when tab hidden — iOS Safari keeps TCP alive causing JS handler CPU heat.
+  // M1899-R17: desktop only — mobile uses _mobileNotifyPoll() instead (see below).
   let _backoff = 1000;
   let _sseActive = null; // current EventSource
   let _ssePaused = false;
   function _connect() {
-    if (_ssePaused) return; // M1581: don't reconnect while hidden
+    if (_ssePaused) return;
     if (_sseActive) { try { _sseActive.close(); } catch(_) {} }
     const es = new EventSource('/api/notifications/stream');
     _sseActive = es;
-    // M1227 / M1520 v9 ⑤: reset blink cache on reconnect so next poll re-fetches.
-    // Also clear per-project effective window cache for same reason (server state may have shifted).
     es.onopen = () => {
       _backoff = 1000;
       window._blinkState = {};
       window._blinkWindowMinByProject = {};
     };
     es.addEventListener('hello', () => {});
-    // M162: stone_created/user_commented no longer render sticky toasts.
-    // Only idle→live transitions (via _notifyTransition) show sticky popups.
-    // M1643: stone_created → refresh milestones for that project so nq badge updates immediately
-    es.addEventListener('stone_created', e => {
-      try {
-        const d = JSON.parse(e.data);
-        if (d.proj_id) {
-          fetch(`/api/northstar/${encodeURIComponent(d.proj_id)}/milestones`, {cache:'no-store'})
-            .then(r => r.json()).then(data => {
-              _msCacheByProject[d.proj_id] = data.milestones || [];
-              _syncCardBadge(d.proj_id);
-            }).catch(() => {});
-        }
-      } catch(_) {}
-    });
-    es.addEventListener('user_commented', e => { try { JSON.parse(e.data); } catch(_){} });
-    // M201: server pushes session_idle when PTY/exec goes idle — triggers in-page toast + OS notification
-    // M495: instant detail card refresh when Claude patches a milestone
-    // M497: also refresh open comment popup thread
-    // M1345: milestone_updated SSE handler — immediate flush, dedup by proj_id
-    let _msUpdPendingProjs = new Set();
-    let _msUpdPendingData = [];
-    let _msUpdFlushScheduled = false;
-    function _flushMsUpdates() {
-      _msUpdFlushScheduled = false;
-      if (!window._isTyping) render();
-      for (const d of _msUpdPendingData) {
-        if (d.proj_id === window._detailModalOpenProjId) {
-          const _pKey = (d.mid||'') + ':' + d.proj_id;
-          const _pAge = Date.now() - (_recentPatchMs.get(_pKey) || 0);
-          if (_pAge < 3000 && _msCacheByProject[d.proj_id]) {
-            _renderFromCache(d.proj_id);
-            if (d.mid) _refreshCommentThread(d.mid);
-          } else {
-            loadMilestones(d.proj_id).then(() => {
-              if (d.mid) _refreshCommentThread(d.mid);
-            });
-          }
-        } else if (typeof _cgProjId !== 'undefined' && _cgProjId === d.proj_id) {
-          // M1488: CG open but detail closed — SSE drives immediate node count + blink refresh
-          loadMilestones(d.proj_id).catch(() => {});
-        } else {
-          // M1488: swimlane view — refresh flat milestones for this project so _syncCardBadge stays live
-          fetch(`/api/northstar/${encodeURIComponent(d.proj_id)}/milestones`, {cache:'no-store'})
-            .then(r => r.json()).then(data => {
-              const _ms = data.milestones || [];
-              _msCacheByProject[d.proj_id] = _ms;
-              _syncCardBadge(d.proj_id);
-              if (d.mid && _openCommentMid === d.mid) {
-                const m = _ms.find(x => x.id === d.mid);
-                if (m) { _msConversations[d.mid] = m.conversation || []; _refreshCommentThread(d.mid); }
-              }
-            }).catch(() => {});
-        }
-      }
-      _msUpdPendingProjs.clear();
-      _msUpdPendingData = [];
-    }
-    es.addEventListener('milestone_updated', e => {
-      try {
-        const d = JSON.parse(e.data);
-        if (d.proj_id) {
-          _msUpdPendingProjs.add(d.proj_id);
-          _msUpdPendingData.push(d);
-          if (!_msUpdFlushScheduled) {
-            _msUpdFlushScheduled = true;
-            setTimeout(_flushMsUpdates, 500); // M1581: 500ms debounce — batches rapid SSE bursts, reduces loadMilestones calls
-          }
-          // M1520 v9 ②: stone change may shift this project's blink cluster → invalidate
-          // cached effective window so next render fetches fresh.
-          if (window._blinkWindowMinByProject) {
-            delete window._blinkWindowMinByProject[d.proj_id];
-          }
-        }
-      } catch(_) {}
-    });
-    // M1682: session_idle/session_running SSE payloads carry only proj_id, not which specific
-    // session changed — both handlers below blindly set _execStatus[proj_id] from a SINGLE
-    // session's transition, with no check for sibling sessions of the same project. When a
-    // child goes idle while the mother is still busy, the swimlane avatar/card briefly (until
-    // the next 8s poll) shows the WHOLE project idle — visually "parent+child turn off
-    // together" even though only the child did. Self-correct immediately via the same
-    // authoritative aggregate the 8s poller already computes ("running if ANY session of
-    // this project is non-idle"), instead of waiting up to 8s for the next natural poll.
-    window._execStatusCorrectionInFlight = window._execStatusCorrectionInFlight || {};
-    function _correctExecStatusFor(projId) {
-      if (window._execStatusCorrectionInFlight[projId]) return; // coalesce bursts
-      window._execStatusCorrectionInFlight[projId] = true;
-      fetch('/api/exec-sessions').then(r => r.json()).then(d => {
-        const mine = (d.sessions || []).filter(s => s.proj_id === projId);
-        if (!mine.length) return; // no live sessions at all — leave as-is (idle is correct)
-        // M1833: any-running-wins — mirrors refreshSessionStatus (L7709, M1824).
-        // M1717-b changed this to mother-only, but M1824 already reverted the poll path to
-        // any-busy-wins after M1797 removed the distinct mother/child server concept. Keeping
-        // mother-only here created an asymmetry: a UUID-suffix child busy → SSE fires →
-        // _correctExecStatusFor found the legacy bare-name session (idle) as "mother" →
-        // anyRunning=false → card showed idle despite the child being active. Delay = up to
-        // 8s (next natural poll). Fix: revert to any-busy-wins here, consistent with poll.
-        // The original M1717-b concern (child SSE flipping idle mother to running) is already
-        // handled at the session_running handler (L14836) by calling _correctExecStatusFor
-        // instead of blindly setting _execStatus='running', so this function itself is safe
-        // to use any-busy-wins without re-introducing the M1717 regression.
-        const anyRunning = mine.some(s => !s.idle);
-        const correctKey = anyRunning ? 'running' : 'idle';
-        // M1717-b: the M388 spawn-grace period (refreshSessionStatus ~7586) force-preserves
-        // 'running' for 30s after a session_running SSE event, regardless of mother/child —
-        // only extend that grace here when the MOTHER is actually the one running (or no
-        // mother record exists yet), otherwise a child's spawn would grace-period-lock an
-        // idle mother's avatar into showing 'running' for up to 30s even after this fetch
-        // correctly identified it as idle.
-        if (!anyRunning && window._execSpawnTime) delete window._execSpawnTime[projId];
-        // M1832-b: update _execSessionList from this authoritative fetch so SSE-triggered
-        // render() uses fresh per-session idle states (not stale poll values up to 8s old).
-        // mini avatar (_sessList[1~2]) idle state was the main SSE gap identified in review.
-        const _prevSnap = JSON.stringify((window._execSessionList[projId] || []).map(s => s.idle));
-        // M1881: sort session ASC (alphabetical) — matches tmux list-sessions order = exec-pane row order.
-        window._execSessionList[projId] = mine.map(s => ({
-          idle: s.idle, model: s.model||'', session: s.session||'',
-          live_session_id: s.live_session_id||'', isMother: false,
-          created: s.created||'', created_ts: s.created_ts||0, activity: s.activity||0
-        })).sort((a, b) => a.session < b.session ? -1 : a.session > b.session ? 1 : 0);
-        const _newSnap = JSON.stringify(window._execSessionList[projId].map(s => s.idle));
-        const _sessChanged = _newSnap !== _prevSnap;
-        if (_execStatus[projId] !== correctKey) {
-          _execStatus[projId] = correctKey;
-          const cardNode = document.querySelector(`.ns-node[data-pid="${CSS.escape(projId)}"]`);
-          if (cardNode) {
-            cardNode.classList.toggle('exec-live', anyRunning);
-            cardNode.classList.toggle('exec-idle', !anyRunning);
-          }
-          Object.keys(_swimlaneLaneFp).forEach(k => delete _swimlaneLaneFp[k]);
-          if (typeof render === 'function') render();
-        } else if (_sessChanged) {
-          // _execStatus unchanged but per-session idle states shifted — re-render for mini avatars
-          Object.keys(_swimlaneLaneFp).forEach(k => delete _swimlaneLaneFp[k]);
-          if (typeof render === 'function') render();
-        }
-      }).catch(() => {}).finally(() => { delete window._execStatusCorrectionInFlight[projId]; });
-    }
-    es.addEventListener('session_idle', e => {
-      try {
-        const d = JSON.parse(e.data);
-        if (d.proj_id) {
-          _notifyTransition(d.proj_id, d.kind || 'pty');
-          // M1537: avatar opacity 즉시 반영 — exec→idle 전환을 SSE 시점에 처리 (8s poll 대기 X).
-          // session_running과 대칭. M388 grace는 spawn time 기반이라 idle 전환에는 영향 없음.
-          if ((d.kind || 'exec') === 'exec' && _execStatus[d.proj_id] !== 'idle') {
-            _execStatus[d.proj_id] = 'idle';
-            // M388 v2: idle 전환되면 spawn time 클리어 — 다음 spawn 전까지 grace 적용 안 되도록
-            if (window._execSpawnTime) delete window._execSpawnTime[d.proj_id];
-            // direct DOM update (parity with session_running L13880-84)
-            const cardNode = document.querySelector(`.ns-node[data-pid="${CSS.escape(d.proj_id)}"]`);
-            if (cardNode) {
-              cardNode.classList.remove('exec-live');
-              cardNode.classList.add('exec-idle');
-            }
-            // re-render swimlane to update avatar opacity + model label color
-            Object.keys(_swimlaneLaneFp).forEach(k => delete _swimlaneLaneFp[k]);
-            if (typeof render === 'function') render();
-          }
-          // M374: if detail card open for this proj_id, refresh exec pane immediately (<500ms vs 8s poll)
-          if (d.proj_id === window._detailModalOpenProjId && typeof window._refreshExecState === 'function') {
-            window._refreshExecState();
-          }
-          // M1682: swimlane-level self-correction — unconditional (not gated on detail card
-          // being open), since the optimistic set above can wrongly idle the whole project
-          // when a sibling session is still busy.
-          _correctExecStatusFor(d.proj_id);
-          // M497b: hide typing indicator when session goes idle (message already shown via milestone_updated)
-          _hideTypingIndicator();
-          // M1739: session went idle → transcript updated → refresh session list model labels immediately
-          if (d.proj_id === window._detailModalOpenProjId && typeof window._renderResumableSessions === 'function') {
-            setTimeout(window._renderResumableSessions, 600);
-          }
-        }
-      } catch(_) {}
-    });
-    // M366 v3: session_running SSE + 15s grace period to prevent poll overwrite during startup
-    window._execSpawnTime = window._execSpawnTime || {};
-    es.addEventListener('session_running', e => {
-      try {
-        const d = JSON.parse(e.data);
-        if (d.proj_id && d.kind === 'exec') {
-          // M1717-b: this payload carries only proj_id/kind — no session identity — so we
-          // can't tell here whether it was the MOTHER or a CHILD that just went busy. Blindly
-          // setting _execStatus[proj_id]='running' (old behavior) made a child's very first
-          // busy transition flip the whole project — including an idle mother — to running
-          // the instant this event fired, before the next 8s poll could correct it. This was
-          // the exact "처음 자녀 세션 busy 전환시 mother avatar도 busy로 보임" report (M1717).
-          // Fix: skip the optimistic blind-set entirely and go straight to the fetch-based
-          // mother-aware correction — small latency cost (one fetch) in exchange for never
-          // showing a wrong transient state.
-          window._execSpawnTime[d.proj_id] = Date.now();  // start grace period (unconditional — harmless if mother, needed if mother)
-          _correctExecStatusFor(d.proj_id);
-          _syncCardBadge(d.proj_id);  // M1649: sync q-badge on session_running
-          // M374: if detail card open for this proj_id, refresh exec pane immediately
-          if (d.proj_id === window._detailModalOpenProjId && typeof window._refreshExecState === 'function') {
-            window._refreshExecState();
-          }
-          // M519: only show typing indicator if the open stone is queued AND belongs to this exec project
-          if (_openCommentMid) {
-            const _openSt = (_msCacheByProject[d.proj_id] || []).find(m => m.id === _openCommentMid);
-            if (_openSt && _openSt.status === 'queued') _showTypingIndicator();
-          }
-        }
-      } catch(_) {}
+    // Route all event types through the shared handler.
+    ['stone_created','user_commented','milestone_updated','session_idle','session_running'].forEach(t => {
+      es.addEventListener(t, e => { try { _handleNotifyEvent(t, JSON.parse(e.data)); } catch(_) {} });
     });
     es.onerror = () => {
       es.close();
-      if (!_ssePaused) { // M1581: don't schedule reconnect when hidden
+      if (!_ssePaused) {
         setTimeout(_connect, _backoff);
         _backoff = Math.min(_backoff * 2, 30000);
       }
     };
   }
-  _connect();
-  // M1581: close SSE when tab hidden → reopen on visible (saves iOS background TCP + JS handler heat)
+
+  // M1899-R17: Mobile exponential-backoff poll — replaces SSE on mobile.
+  // Replaces always-on TCP connection with discrete fetches; cellular radio can enter
+  // low-power state in the ~10s+ idle window between fetches.
+  // Backoff ladder: 5s → 10s → 20s → 40s → 60s (cap). Resets to 5s on:
+  //   (a) received events (new activity), (b) user interaction (pointer/touch/key).
+  // ROLLBACK: remove _mobileNotifyPoll, _pollBackoffMs, _pollBackoffStep, _pollTimer,
+  //           _pollLastTs, _resetPollBackoff, and the mobile branch in visibilitychange.
+  //           Restore _connect() call unconditionally below (remove the if/else branch).
+  // M1899-R18A: raise initial poll step 5s→10s — halves LTE radio wakes during active use.
+  // Stone completion TG arrives first (hub push); poll is belt-and-suspenders.
+  // ROLLBACK: restore [5000, 10000, 20000, 40000, 60000]
+  const _POLL_BACKOFF = [20000, 40000, 60000]; // M1899-R19: min 20s (was 10s) — halves radio wake-ups
+  let _pollBackoffStep = 0;
+  let _pollTimer = null;
+  let _pollLastTs = (Date.now() / 1000) - 1; // start slightly in the past so first poll gets any buffered events
+  function _resetPollBackoff() {
+    _pollBackoffStep = 0;
+  }
+  // Reset backoff on any user gesture (same events as R13b _lastInteractionTs).
+  if (window._NS_IS_MOBILE) {
+    ['pointerdown', 'touchstart', 'click', 'keydown'].forEach(ev => {
+      document.addEventListener(ev, _resetPollBackoff, { passive: true, capture: true });
+    });
+  }
+  async function _mobileNotifyPoll() {
+    if (document.hidden) return; // visibility handler restarts on foreground
+    try {
+      const r = await fetch(`/api/notifications/poll?since=${_pollLastTs}`, {cache: 'no-store'});
+      const json = await r.json();
+      const evts = json.events || [];
+      if (evts.length) {
+        _pollLastTs = json.server_ts || (Date.now() / 1000);
+        _resetPollBackoff(); // got events → stay responsive
+        for (const ev of evts) {
+          try { _handleNotifyEvent(ev.event, ev); } catch(_) {}
+        }
+        // Blink cache invalidated by server state change (mirrors SSE onopen reset, but scoped).
+        if (evts.some(e => e.event === 'milestone_updated')) {
+          window._blinkWindowMinByProject = window._blinkWindowMinByProject || {};
+        }
+      } else {
+        // No events → back off.
+        _pollBackoffStep = Math.min(_pollBackoffStep + 1, _POLL_BACKOFF.length - 1);
+      }
+    } catch(_) {
+      // Network error — back off the same way as no-events.
+      _pollBackoffStep = Math.min(_pollBackoffStep + 1, _POLL_BACKOFF.length - 1);
+    }
+    // Schedule next poll if still foregrounded.
+    if (!document.hidden) {
+      const _nextMs = _POLL_BACKOFF[_pollBackoffStep];
+      _pollTimer = setTimeout(_mobileNotifyPoll, _nextMs);
+    }
+    }
+
+  if (window._NS_IS_MOBILE) {
+    // Mobile: start exp-backoff poll, skip SSE entirely.
+    _pollTimer = setTimeout(_mobileNotifyPoll, _POLL_BACKOFF[0]);
+  } else {
+    // Desktop: SSE as before.
+    _connect();
+  }
+
+  // Visibility handler: pause/resume the appropriate channel on hide/show.
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
-      _ssePaused = true;
-      if (_sseActive) { try { _sseActive.close(); } catch(_) {} _sseActive = null; }
-    } else {
-      _ssePaused = false;
-      _backoff = 1000;
-      _connect();
-      // M1686: SSE reconnect only resumes listening for FUTURE events — any busy/idle
-      // transition that happened while this tab was hidden (SSE closed, M1581) is
-      // silently missed, since _connect()'s onopen does no state reconciliation. The
-      // pane then sits stale until either the next natural transition or an explicit
-      // reload/detail-card-reopen (both of which force a fresh /api/exec-sessions
-      // fetch). Do that same fresh fetch here so returning to the tab is equivalent
-      // to reopening the card, instead of waiting on the next lucky event.
-      if (typeof window._refreshExecState === 'function' && window._detailModalOpenProjId) {
-        window._refreshExecState();
+      if (window._NS_IS_MOBILE) {
+        // M1899-R17: cancel pending poll while hidden — no point polling in background.
+        if (_pollTimer) { clearTimeout(_pollTimer); _pollTimer = null; }
+      } else {
+        _ssePaused = true;
+        if (_sseActive) { try { _sseActive.close(); } catch(_) {} _sseActive = null; }
       }
-      // M1778: M1686 only covered the detail-modal session pane (gated on
-      // _detailModalOpenProjId) — the swimlane ns-card avatars have the exact same gap
-      // (SSE closed while hidden → any busy/idle transition during that window is
-      // missed → avatar sits stale until a manual reload), just via a different render
-      // path (refreshSessionStatus → _execStatus → render(), not _refreshExecState).
-      // Reported: "session busy 전환후 avatar가 새로고침을 해야 busy로 보인다" — reconcile
-      // the swimlane state the same way on regaining visibility.
-      if (typeof refreshSessionStatus === 'function') {
-        refreshSessionStatus().then(() => { if (typeof render === 'function') render(); }).catch(() => {});
+    } else {
+      if (window._NS_IS_MOBILE) {
+        // Resume poll immediately — fetch latest events since we were hidden.
+        _resetPollBackoff();
+        if (!_pollTimer) _pollTimer = setTimeout(_mobileNotifyPoll, 0);
+      } else {
+        _ssePaused = false;
+        _backoff = 1000;
+        _connect();
+        // M1686: reconcile state missed while hidden.
+        if (typeof window._refreshExecState === 'function' && window._detailModalOpenProjId) {
+          window._refreshExecState();
+        }
+        // M1778: swimlane avatar reconciliation on tab-regain.
+        if (typeof refreshSessionStatus === 'function') {
+          refreshSessionStatus().then(() => { if (typeof render === 'function') render(); }).catch(() => {});
+        }
       }
     }
   });
@@ -15125,8 +15601,31 @@ loadData();
 // SwiftShader CPU load that causes video lag on GPU-less WSL environments.
 // M1418: Page Visibility guard — skip poll+render when tab is hidden
 // M1581: 5s→8s — aligns with hub-refresh postMessage cycle, reduces radio wakeups ~38%
-setInterval(async () => {
+// M1899: mobile low-power mode — longer intervals on iPhone/Android to reduce radio wakeup + DOM churn
+// _NS_IS_MOBILE set at L~14872 (before SSE init); reuse window global here to avoid re-declaration.
+const _swimlaneTickMs = window._NS_IS_MOBILE ? 60000 : 8000; // M1581: 5s→8s; M1899: mobile→12s; M1899-R1: 20s; M1899-R1b: mobile→30s; M1899-R7: mobile→60s (ROLLBACK: change 60000 back to 30000)
+// M1899-R13b: adaptive tick — track last user interaction; on mobile >10min idle → escalate to 120s.
+// ROLLBACK: remove _lastInteractionTs, _getAdaptiveTickMs, and the event listeners below + reset block in _swimlaneTick.
+let _lastInteractionTs = Date.now();
+function _getAdaptiveTickMs() {
+  if (!window._NS_IS_MOBILE) return _swimlaneTickMs;
+  const idleMs = Date.now() - _lastInteractionTs;
+  return idleMs > 600000 ? 120000 : _swimlaneTickMs; // >10min idle → 120s; else 60s
+}
+['pointerdown', 'touchstart', 'click', 'keydown'].forEach(ev => {
+  document.addEventListener(ev, () => {
+    const _wasIdle = window._NS_IS_MOBILE && (Date.now() - _lastInteractionTs) > 600000;
+    _lastInteractionTs = Date.now();
+    // M1899-R13b: restore 60s interval when user becomes active after idle escalation.
+    if (_wasIdle && window._swimlaneInterval) {
+      clearInterval(window._swimlaneInterval);
+      window._swimlaneInterval = setInterval(_swimlaneTick, _swimlaneTickMs);
+    }
+  }, { passive: true, capture: true });
+});
+async function _swimlaneTick() {
   if (document.hidden) return; // M1418: tab not visible — skip to avoid CPU/GPU pressure
+  window._rssDidRender = false; // M1899-R12a: reset before fetch (ROLLBACK: remove this line)
   await refreshSessionStatus();
   // M178: always render — swimlane button/badge must reflect realtime state
   // even when the detail overlay is open. Render is cheap (~10 dom updates).
@@ -15136,11 +15635,25 @@ setInterval(async () => {
   const _ae = document.activeElement;
   const _editingCard = _ae && _ae.classList && _ae.classList.contains('ns-node-name') && _ae.isContentEditable;
   // M1418: defer render to idle callback — prevents blocking compositor thread (SwiftShader)
-  if (!_editingCard && !window._isTyping) {
+  // M1899-R12a: on mobile, skip this render() if refreshSessionStatus() already rendered due to status change.
+  // ROLLBACK: remove `window._NS_IS_MOBILE && window._rssDidRender ||` condition; always render.
+  if (!_editingCard && !window._isTyping && !(window._NS_IS_MOBILE && window._rssDidRender)) {
     if (typeof requestIdleCallback !== 'undefined') requestIdleCallback(() => render(), { timeout: 4000 });
     else setTimeout(() => render(), 200); // M1581: avoid sync blocking on iOS Chrome (no requestIdleCallback fallback)
   }
-}, 8000); // M1581: 5s→8s — aligns with hub-refresh cycle, ~38% fewer radio wakeups on mobile
+  // M1899-R13b: reschedule with adaptive interval if it changed (mobile idle escalation).
+  // ROLLBACK: remove this block.
+  if (window._NS_IS_MOBILE && window._swimlaneInterval) {
+    const _nextMs = _getAdaptiveTickMs();
+    if (_nextMs !== _swimlaneTickMs) {
+      clearInterval(window._swimlaneInterval);
+      window._swimlaneInterval = setInterval(_swimlaneTick, _nextMs);
+    }
+  }
+}
+// M1899-R6: capture interval ID so visibilitychange can clearInterval on mobile background
+// ROLLBACK: revert to anonymous setInterval(..., _swimlaneTickMs) without window._swimlaneInterval
+window._swimlaneInterval = setInterval(_swimlaneTick, _swimlaneTickMs);
 
 // Auto-refresh: swimlane every 30s, detail card every 15s
 // Paused while any input/textarea is focused (user is typing)
@@ -15440,15 +15953,15 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
         const _isMain = _execProjPattern.test(_assignedSess);
         // M1762: show live_session_id (UUID prefix) instead of tmux suffix so user sees the actual session transcript ID
         const _sessEntry = ((window._execSessionList||{})[_proj]||[]).find(x => x.session === _assignedSess);
-        const _liveSuffix = (_sessEntry && _sessEntry.live_session_id) ? _sessEntry.live_session_id.slice(0,8) : '';
-        _btnLabel = _isMain ? 'main' : (_liveSuffix || _assignedSess.replace(new RegExp(`.*-exec-${_proj}-`), '') || 'branch');
+        const _liveSuffix = (_sessEntry && _sessEntry.live_session_id) ? _sessEntry.live_session_id.slice(0,4) : '';
+        _btnLabel = _isMain ? 'main' : (_liveSuffix || _assignedSess.replace(new RegExp(`.*-exec-${_proj}-`), '').slice(0,4) || 'brch');
         _btnColor = _isMain ? 'var(--green)' : '#7b9fd4';
         _btnBorder = _isMain ? 'rgba(61,139,94,.4)' : 'rgba(123,159,212,.4)';
         _btnBg = _isMain ? 'rgba(61,139,94,.12)' : 'rgba(123,159,212,.12)';
       }
       sessBtn.textContent = _btnLabel;
       sessBtn.title = _hasSess ? `Assigned: ${ns.assigned_session} — click to view/change` : 'View / branch to a session';
-      sessBtn.style.cssText = `font-family:var(--mono);font-size:9px;padding:1px 6px;border-radius:3px;border:1px solid ${_btnBorder};background:${_btnBg};color:${_btnColor};cursor:pointer`;
+      sessBtn.style.cssText = `font-family:var(--mono);font-size:9px;padding:1px 4px;border-radius:3px;border:1px solid ${_btnBorder};background:${_btnBg};color:${_btnColor};cursor:pointer;max-width:32px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;vertical-align:middle`;
       if (ns) sessBtn.dataset.nsSessBtn = ns.id;  // M811-modal: for immediate DOM update after assign
       const _sessBtnProj = _proj;
       sessBtn.onclick = async e => {
@@ -15561,13 +16074,21 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
         // tagged pick instead of the server silently auto-assigning/auto-spawning it (M1780).
         // isLastWorked marks the row for a separate visual badge below; unshifted so it's
         // the first thing the user sees, same as the M814 "assigned" placeholder above.
-        if (!_assignedSess && _lastWorked && !_sortedSessions.some(s => s.name === _lastWorked.session_name)) {
-          _sortedSessions.unshift({
-            name: _lastWorked.session_name,
-            activity: null,
-            summary: _lastWorked.is_live ? '(last session — live)' : '(last session — not yet spawned)',
-            isLastWorked: true,
-          });
+        // M1931: if the last-worked session is already in the live tmux list, mark it
+        // isLastWorked in-place (don't inject a duplicate). Previously the guard skipped
+        // injection entirely when the session was alive, causing the badge to disappear.
+        if (!_assignedSess && _lastWorked) {
+          const _lwExisting = _sortedSessions.find(s => s.name === _lastWorked.session_name);
+          if (_lwExisting) {
+            _lwExisting.isLastWorked = true;
+          } else {
+            _sortedSessions.unshift({
+              name: _lastWorked.session_name,
+              activity: null,
+              summary: _lastWorked.is_live ? '(last session — live)' : '(last session — not yet spawned)',
+              isLastWorked: true,
+            });
+          }
         }
         // M826: inject placeholders for ALL other substars' assigned sessions not in live list
         // so each substar's sess picker shows sibling substars' sessions even when dead
@@ -15677,6 +16198,26 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
                 // before the next loadMilestones poll completes (which can take 1-2s on slow networks).
                 delete _groupingFingerprint[_sessBtnProj];
                 if (typeof _fastReapplyGrouping === 'function') try { _fastReapplyGrouping(_sessBtnProj); } catch(_) {}
+                // M1935: immediately patch stone-row sess badges for all stones in this substar.
+                // _ssScoreBadgeHtml reads _nsStarsCache[pid].assigned_session — that's already updated
+                // above (L15819), so re-running the function produces the correct new label/color.
+                // _fastReapplyGrouping only reorders tbody blocks; it does NOT re-render cell content,
+                // so without this patch the per-stone sess badge stays stale until loadMilestones.
+                try {
+                  const _stoneBtns = document.querySelectorAll(`[data-stone-sess-substar="${ns.id}"]`);
+                  _stoneBtns.forEach(_sb2 => {
+                    const _mid2 = _sb2.dataset.stoneSessBtn;
+                    const _mObj2 = (_msCacheByProject[_sessBtnProj] || []).find(x => String(x.id) === String(_mid2));
+                    if (_mObj2) {
+                      const _newHtml = _ssScoreBadgeHtml(_mObj2, _sessBtnProj);
+                      if (_newHtml) {
+                        const _tmp = document.createElement('span');
+                        _tmp.innerHTML = _newHtml;
+                        if (_tmp.firstElementChild) _sb2.replaceWith(_tmp.firstElementChild);
+                      }
+                    }
+                  });
+                } catch(_) {}
                 // M811-modal: immediate sess button DOM update (no waiting for loadMilestones)
                 { const _sb = document.querySelector(`[data-ns-sess-btn="${ns.id}"]`);
                   if (_sb) {
@@ -15685,7 +16226,7 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
                     const _assignedS = (s.name||'').trim();
                     const _execPat = new RegExp(`-exec-${_sessBtnProj}$`);
                     const _isMain = _execPat.test(_assignedS);
-                    const _suffixLabel = _isMain ? 'main' : (_assignedS.replace(new RegExp(`.*-exec-${_sessBtnProj}-`),'') || 'branch');
+                    const _suffixLabel = _isMain ? 'main' : (_assignedS.replace(new RegExp(`.*-exec-${_sessBtnProj}-`),'').slice(0,4) || 'brch');
                     _sb.textContent = _suffixLabel;
                     const _btnColor = _isMain ? 'var(--green)' : '#7b9fd4';
                     const _btnBorder = _isMain ? 'rgba(61,139,94,.4)' : 'rgba(123,159,212,.4)';
@@ -15715,6 +16256,18 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
             }
             // Copy session name to clipboard for easy tmux attach
             navigator.clipboard?.writeText(`tmux attach -t ${s.name}`).catch(()=>{});
+            // M1950: show loading spinner on detail-modal while exec pane catches up
+            // Only fires when the detail-modal is currently open for this project.
+            // Uses 'sess-assign' owner — cleared by _refreshExecState's else branch
+            // (same as 'open' owner) once exec-sessions data arrives, with 5s safety fallback.
+            { const _dmSess = document.getElementById('detail-modal');
+              if (_dmSess && window._detailModalOpenProjId === _sessBtnProj) {
+                _dmSess.classList.add('loading');
+                _dmSess.dataset.loadingOwner = 'sess-assign';
+                [200, 600, 1500, 3000].forEach(d => setTimeout(() => { if (typeof window._refreshExecState === 'function') window._refreshExecState(); }, d));
+                setTimeout(() => { if (_dmSess.classList.contains('loading') && _dmSess.dataset.loadingOwner === 'sess-assign') { _dmSess.classList.remove('loading'); delete _dmSess.dataset.loadingOwner; } }, 5000);
+              }
+            }
             _closeSessionModal();
           };
           // M810: rename button handler
@@ -15896,11 +16449,17 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
             // itself can return a stale (browser-cached) response — no-store matches the
             // established convention used by every other correctness-sensitive fetch in
             // this file (milestones, blink_state, etc.), not a stylistic choice here.
+            // M1931: skip if a sess popup is already visible — double render pass causes
+            // two auto-open clicks, second one hits the L15593 toggle and closes the first.
+            if (document.getElementById('_sess-ctx-popup')) return;
             fetch(`/api/northstar/${encodeURIComponent(_autoProj)}/north-stars`, {cache: 'no-store'})
               .then(r => r.json())
               .then(d => {
                 const _freshNs = (d.north_stars || []).find(n => n.id === _autoNsId);
-                if (_freshNs && !(_freshNs.assigned_session || '').trim()) sessBtn.click();
+                if (_freshNs && !(_freshNs.assigned_session || '').trim()) {
+                  // M1931: re-check after fetch too — another render may have opened it during fetch
+                  if (!document.getElementById('_sess-ctx-popup')) sessBtn.click();
+                }
               })
               .catch(() => {});
           }, 0);
@@ -16380,8 +16939,82 @@ function _applySubstarGrouping(container, projId, l0, doneList = []) {
       .catch(() => { window._lwsCache[projId][ns.id] = {}; });
   });
 
+  // M1952: re-init scroll context observer after grouping DOM is rebuilt
+  const _ssScrollEl = container.closest('#dm-left') || container.closest('[overflow-y]');
+  if (_ssScrollEl) requestAnimationFrame(() => _initSsScrollCtx(_ssScrollEl));
+
 }
 
+
+// M1952: show active substar name+count in dm-header — ONLY when substar filter is active
+// (window._cgActiveNodeFilter !== null) and the section header scrolls above the fold.
+// When no filter is set, the strip stays hidden unconditionally.
+let _ssScrollCtxObserver = null;
+let _ssScrollCtxScrollHandler = null;
+function _initSsScrollCtx(scrollEl) {
+  const ctx = document.getElementById('dm-scroll-ctx');
+  if (!ctx || !scrollEl) return;
+  // Teardown any existing observer + scroll listener
+  if (_ssScrollCtxObserver) { _ssScrollCtxObserver.disconnect(); _ssScrollCtxObserver = null; }
+  if (_ssScrollCtxScrollHandler) { scrollEl.removeEventListener('scroll', _ssScrollCtxScrollHandler); _ssScrollCtxScrollHandler = null; }
+  ctx.classList.remove('active');
+
+  // Collect all visible section headers — supports multi-substar scroll (no CG filter required)
+  const allHeaders = Array.from(scrollEl.querySelectorAll('.ss-mg-header-tbody'))
+    .filter(h => h.style.display !== 'none');
+  if (!allHeaders.length) return;
+
+  // Build action buttons from a given header's btnWrap (cloned, handlers re-dispatched)
+  function _buildCtxBtns(hTd) {
+    const btnsWrap = document.createElement('span');
+    btnsWrap.style.cssText = 'display:inline-flex;gap:4px;align-items:center;margin-left:auto;flex-shrink:0';
+    // Browser normalises "float:right" → "float: right" (with space)
+    const srcBtns = hTd ? Array.from(hTd.querySelectorAll('span')).find(s => s.style.float === 'right') : null;
+    if (srcBtns) {
+      Array.from(srcBtns.children).forEach(origBtn => {
+        const btn = origBtn.cloneNode(true);
+        btn.onclick = e => { e.stopPropagation(); origBtn.click(); };
+        btnsWrap.appendChild(btn);
+      });
+    }
+    return btnsWrap;
+  }
+
+  // Evaluate: find topmost header above fold, show its name+count+buttons in strip.
+  // Runs on both IO crossing events and scroll for continuous tracking.
+  function _evalCtx() {
+    const rootTop = scrollEl.getBoundingClientRect().top;
+    // Find the last header that has scrolled above the fold (hTop < 2)
+    let activeHeader = null;
+    for (const h of allHeaders) {
+      if (h.getBoundingClientRect().top - rootTop < 2) activeHeader = h;
+      else break;
+    }
+    if (!activeHeader) { ctx.classList.remove('active'); return; }
+
+    const hTd = activeHeader.querySelector('td.ss-mg-header-td');
+    const caretSrc = hTd ? hTd.querySelector('.ss-mg-caret') : null;
+    const nameSpanSrc = caretSrc ? caretSrc.nextElementSibling : null;
+    const nameHTML = nameSpanSrc ? `<span style="font-family:var(--mono);font-size:10px;font-weight:600;color:var(--accent);margin-left:6px">${nameSpanSrc.textContent.trim()}</span>` : '';
+    const countSpanSrc = hTd ? hTd.querySelector('span[style*="font-weight:700"],span[style*="font-weight: 700"]') : null;
+    const countHTML = countSpanSrc ? countSpanSrc.outerHTML : '';
+
+    ctx.innerHTML = '';
+    const leftSpan = document.createElement('span');
+    leftSpan.style.cssText = 'display:inline-flex;align-items:center;gap:4px;flex:1;min-width:0;overflow:hidden;white-space:nowrap';
+    leftSpan.innerHTML = '▸ ' + countHTML + nameHTML;
+    ctx.appendChild(leftSpan);
+    ctx.appendChild(_buildCtxBtns(hTd));
+    ctx.classList.add('active');
+  }
+
+  // Dual signal: IntersectionObserver (all headers) + scroll for continuous tracking
+  _ssScrollCtxObserver = new IntersectionObserver(() => { _evalCtx(); }, { root: scrollEl, threshold: 0 });
+  allHeaders.forEach(h => _ssScrollCtxObserver.observe(h));
+  _ssScrollCtxScrollHandler = _evalCtx;
+  scrollEl.addEventListener('scroll', _ssScrollCtxScrollHandler, { passive: true });
+  _evalCtx();
+}
 
 function _computeAutoMoscow(stoneText, projId) {
   const nsList = _nsStarsCache[projId] || [];
@@ -16410,14 +17043,231 @@ function _computeAutoMoscow(stoneText, projId) {
 }
 
 // M658: Semantic proximity score badge (M674: show — placeholder for unscored substar stones)
-function _ssScoreBadgeHtml(m) {
+function _ssScoreBadgeHtml(m, _projId) {
   const score = m.semantic_score;
   if (score == null) {
-    // Only show placeholder if stone is assigned to a substar (otherwise nothing to score against)
-    return m.substar_id ? `<span class="ss-score-badge ss-score-pending" title="Score pending — click score button to compute">—</span>` : '';
+    if (!m.substar_id) return '';
+    const _pid = _projId || m.proj_id || '';
+    // Effective session: stone override first, then substar's assigned_session as default
+    const _ov = (m.session_override || '').trim();
+    const _subNs = (_nsStarsCache[_pid] || []).find(n => n.id === m.substar_id);
+    const _subSess = (_subNs && _subNs.assigned_session) ? _subNs.assigned_session.trim() : '';
+    const _effectiveSess = _ov || _subSess; // what the badge shows
+    const _isStoneOverride = !!_ov; // true = pinned to this stone; false = inherited from substar
+
+    let _btnLabel, _btnColor, _btnBorder, _btnBg;
+    if (_effectiveSess) {
+      const _execPat = new RegExp(`-exec-${_pid}$`);
+      const _isMain = _execPat.test(_effectiveSess);
+      _btnLabel = _isMain ? 'main' : _effectiveSess.replace(new RegExp(`.*-exec-${_pid}-`), '').slice(0, 4) || 'brch';
+      _btnColor = _isMain ? 'var(--green)' : '#7b9fd4';
+      _btnBorder = _isMain ? 'rgba(61,139,94,.4)' : 'rgba(123,159,212,.4)';
+      // Stone override = solid bg (matches sessBtn assigned state); substar inherited = dimmer bg
+      _btnBg = _isStoneOverride
+        ? (_isMain ? 'rgba(61,139,94,.12)' : 'rgba(123,159,212,.12)')
+        : (_isMain ? 'rgba(61,139,94,.06)' : 'rgba(123,159,212,.06)');
+    } else {
+      _btnLabel = 'sess';
+      _btnColor = 'var(--text-dim)';
+      _btnBorder = 'var(--panel-border)';
+      _btnBg = 'none';
+    }
+    const _title = _ov
+      ? `Stone override: ${_ov} — 클릭 시 변경/해제`
+      : (_subSess ? `Substar default: ${_subSess} — 클릭 시 이 스톤에 직접 할당` : '이 스톤에 세션 직접 할당');
+    return `<button title="${esc(_title)}"
+      data-stone-sess-btn="${esc(String(m.id||''))}" data-stone-sess-substar="${esc(String(m.substar_id||''))}"
+      style="font-family:var(--mono);font-size:9px;padding:1px 4px;border-radius:3px;border:1px solid ${_btnBorder};background:${_btnBg};color:${_btnColor};cursor:pointer;max-width:32px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;vertical-align:middle"
+      onclick="event.stopPropagation();_showStoneSessionPicker(event,'${esc(_pid)}','${esc(String(m.id||''))}',this)">${esc(_btnLabel)}</button>`;
   }
   const cls = score >= 70 ? 'ss-score-hi' : score >= 40 ? 'ss-score-mid' : 'ss-score-lo';
   return `<span class="ss-score-badge ${cls}" title="Semantic proximity to substar: ${score}/100">${score}</span>`;
+}
+
+// M1916: per-stone session picker — modal style identical to _sess-ctx-popup
+async function _showStoneSessionPicker(evt, projId, mid, anchorEl) {
+  // Toggle: if same popup already open, close it
+  const _existingBd = document.getElementById('_stone-sess-bdrop');
+  if (_existingBd) { _existingBd.remove(); document.getElementById('_stone-sess-popup')?.remove(); return; }
+
+  const _bd = document.createElement('div');
+  _bd.id = '_stone-sess-bdrop';
+  _bd.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:9998';
+  const popup = document.createElement('div');
+  popup.id = '_stone-sess-popup';
+  const _popW = Math.min(480, window.innerWidth - 32);
+  popup.style.cssText = `position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:${_popW}px;max-height:80vh;overflow-y:auto;background:var(--panel);border:1px solid var(--panel-border);border-radius:8px;box-shadow:0 8px 32px rgba(0,0,0,.5);z-index:9999;font-family:var(--mono);font-size:10px`;
+  const _close = () => { _bd.remove(); popup.remove(); };
+  _bd.onclick = _close;
+  popup.onclick = e => e.stopPropagation();
+
+  // Header — matches _sess-ctx-popup format "Sessions (N)"
+  const _hdr = document.createElement('div');
+  _hdr.style.cssText = 'padding:6px 10px;border-bottom:1px solid var(--panel-border);color:var(--text-dim);font-size:9px;display:flex;justify-content:space-between;align-items:center';
+  _hdr.innerHTML = `<span>Sessions (…)</span>`;
+  const _closeBtn = document.createElement('button');
+  _closeBtn.textContent = '✕';
+  _closeBtn.style.cssText = 'background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:11px';
+  _closeBtn.onclick = _close;
+  _hdr.appendChild(_closeBtn);
+  popup.appendChild(_hdr);
+
+  const _body = document.createElement('div');
+  _body.innerHTML = '<div style="padding:10px;color:var(--text-dim);">Loading sessions…</div>';
+  popup.appendChild(_body);
+
+  document.body.appendChild(_bd);
+  document.body.appendChild(popup);
+
+  try {
+    const [execData, sessCtxData] = await Promise.all([
+      fetch('/api/exec-sessions').then(r => r.ok ? r.json() : {}),
+      fetch(`/api/northstar/${encodeURIComponent(projId)}/session-contexts`).then(r => r.ok ? r.json() : {}).catch(() => ({})),
+    ]);
+
+    if (!document.getElementById('_stone-sess-popup')) return;
+
+    const currentM = (_msCacheByProject && _msCacheByProject[projId] || []).find(x => String(x.id) === String(mid));
+    const curOv = (currentM && currentM.session_override) || null;
+
+    // Substar's assigned_session = the default route for this stone (used as baseline indicator)
+    const _nsid = currentM && currentM.substar_id;
+    const _subNs = _nsid && (_nsStarsCache[projId] || []).find(n => n.id === _nsid);
+    const _substarSess = (_subNs && _subNs.assigned_session) || null;
+
+    const _mainSessRe = new RegExp(`^(claude|codex|openrouter|dsk)-exec-${projId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`);
+    const _isMain = sn => _mainSessRe.test(sn);
+
+    // Build session list: exec-sessions filtered to this project
+    const allExec = (execData.sessions || []).filter(s => s.proj_id === projId);
+    const ctxSessions = sessCtxData.sessions || [];
+    const _ctxMap = Object.fromEntries(ctxSessions.map(s => [s.name, s]));
+
+    const sessions = allExec.map(s => {
+      const ctx = _ctxMap[s.session] || {};
+      return { name: s.session || '', activity: ctx.activity || s.last_activity, summary: ctx.summary || s.summary };
+    }).filter(s => s.name);
+
+    // Count per-session substar assignments (for ▲N tag) — same logic as sessBtn
+    const _sessSubstarCounts = {};
+    (_nsStarsCache[projId] || []).forEach(n => {
+      if (n.assigned_session) _sessSubstarCounts[n.assigned_session] = (_sessSubstarCounts[n.assigned_session] || 0) + 1;
+    });
+
+    // Sort: stone override first, then substar-default, then main, then rest
+    const _sorted = [...sessions].sort((a, b) => {
+      const score = s => (curOv && s.name === curOv ? 4 : 0) + (_substarSess && s.name === _substarSess ? 2 : 0) + (_isMain(s.name) ? 1 : 0);
+      return score(b) - score(a);
+    });
+
+    // Inject substar-default placeholder if not in live list
+    if (_substarSess && !_sorted.some(s => s.name === _substarSess)) {
+      _sorted.unshift({ name: _substarSess, activity: null, summary: '(substar default — not yet spawned)' });
+    }
+    // Inject current override placeholder if not in live list
+    if (curOv && !_sorted.some(s => s.name === curOv)) {
+      _sorted.unshift({ name: curOv, activity: null, summary: '(override — not yet spawned)' });
+    }
+
+    // Update header count
+    _hdr.querySelector('span').textContent = `Sessions (${_sorted.length})`;
+
+    _body.innerHTML = '';
+
+    if (!_sorted.length) {
+      const empty = document.createElement('div');
+      empty.style.cssText = 'padding:10px;color:var(--text-dim);text-align:center;font-size:10px';
+      empty.textContent = 'No active sessions for this project';
+      _body.appendChild(empty);
+    } else {
+      _sorted.forEach((s, idx) => {
+        const isOverride = curOv && s.name === curOv;
+        const isSubstarDefault = _substarSess && s.name === _substarSess && !isOverride;
+        const isMainSess = _isMain(s.name);
+        const row = document.createElement('div');
+        const _leftBorder = isOverride
+          ? ';border-left:3px solid var(--accent);background:rgba(var(--accent-rgb,255,149,0),.15)'
+          : (isSubstarDefault ? ';border-left:3px solid #7b9fd4;background:rgba(123,159,212,.12)' : (isMainSess ? ';border-left:3px solid var(--text-dim)' : ''));
+        row.style.cssText = `padding:7px 10px;border-bottom:1px solid var(--panel-border);cursor:pointer${_leftBorder}`;
+        row.onmouseenter = () => row.style.background = isOverride ? 'rgba(var(--accent-rgb,255,149,0),.25)' : (isSubstarDefault ? 'rgba(123,159,212,.2)' : 'var(--panel-soft)');
+        row.onmouseleave = () => row.style.background = isOverride ? 'rgba(var(--accent-rgb,255,149,0),.15)' : (isSubstarDefault ? 'rgba(123,159,212,.12)' : '');
+
+        const ago = s.activity ? Math.round((Date.now() / 1000 - s.activity) / 60) : null;
+        const agoTxt = ago !== null ? (ago < 60 ? `${ago}m ago` : `${Math.round(ago/60)}h ago`) : '';
+
+        // Tags — same visual style as _sess-ctx-popup
+        const overrideTag = isOverride ? `<span style="background:var(--accent);color:#000;font-size:8px;padding:1px 4px;border-radius:2px;margin-left:5px;font-weight:700">assigned</span>` : '';
+        const substarTag = isSubstarDefault ? `<span style="background:#7b9fd4;color:#000;font-size:8px;padding:1px 4px;border-radius:2px;margin-left:5px;font-weight:700" title="Substar default session">substar</span>` : '';
+        const mainTag = isMainSess ? `<span style="background:var(--text-dim);color:var(--bg);font-size:8px;padding:1px 4px;border-radius:2px;margin-left:5px;font-weight:700">main</span>` : '';
+        const _subCount = _sessSubstarCounts[s.name] || 0;
+        const subCountTag = _subCount > 0
+          ? `<span style="background:rgba(255,149,0,.25);color:var(--text);font-size:8px;padding:1px 5px;border-radius:2px;margin-left:5px;font-weight:700;border:1px solid rgba(255,149,0,.4)" title="${_subCount} substar(s) assigned">▲${_subCount}</span>`
+          : '';
+
+        row.innerHTML = `<div style="display:flex;align-items:center;justify-content:space-between;gap:4px">
+          <div style="color:${isOverride ? 'var(--accent)' : 'var(--text)'};font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;display:flex;align-items:center;gap:0"><span style="color:var(--text-dim);font-size:9px;font-weight:400;margin-right:5px">#${idx+1}</span>${esc(s.name)}${overrideTag}${substarTag}${mainTag}${subCountTag}</div>
+        </div>
+        <div style="color:var(--text-dim);font-size:9px;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${agoTxt ? agoTxt + ' · ' : ''}${esc(s.summary || '—')}</div>`;
+
+        row.title = isOverride ? 'Stone override (click to reassign)' : (isSubstarDefault ? 'Substar default — click to pin to this stone' : 'Click to assign to this stone');
+        row.onclick = () => { _close(); _applyStoneSessionOverride(projId, mid, s.name, null); };
+        _body.appendChild(row);
+      });
+    }
+
+    // Footer: show current stone state + Unassign button (mirrors sess popup footer)
+    const _footerSess = curOv || _substarSess;
+    if (_footerSess) {
+      const _foot = document.createElement('div');
+      _foot.style.cssText = 'padding:8px 10px;border-top:1px solid var(--panel-border);display:flex;align-items:center;justify-content:space-between;gap:8px';
+      const _footLabel = curOv
+        ? `Override: <span style="color:var(--accent);font-weight:600">${esc(curOv)}</span>`
+        : `Substar default: <span style="color:#7b9fd4;font-weight:600">${esc(_substarSess)}</span>`;
+      _foot.innerHTML = `<span style="color:var(--text-dim);font-size:9px">${_footLabel}</span>`;
+      if (curOv) {
+        const _unBtn = document.createElement('button');
+        _unBtn.textContent = 'Unassign';
+        _unBtn.title = 'Remove stone-level override — fall back to substar default';
+        _unBtn.style.cssText = 'font-family:var(--mono);font-size:9px;padding:2px 8px;border-radius:3px;border:1px solid rgba(192,57,43,.5);background:none;color:var(--red,#c0392b);cursor:pointer;flex-shrink:0';
+        _unBtn.onclick = (ev) => { ev.stopPropagation(); _close(); _applyStoneSessionOverride(projId, mid, null, null); };
+        _foot.appendChild(_unBtn);
+      }
+      popup.appendChild(_foot);
+    }
+  } catch(e) {
+    _body.innerHTML = `<div style="padding:10px;color:var(--red,#f87171)">로드 실패: ${esc(String(e))}</div>`;
+  }
+}
+
+async function _applyStoneSessionOverride(projId, mid, sessionName, popup) {
+  if (popup) popup.remove();
+  try {
+    const body = JSON.stringify({ session_override: sessionName });
+    const r = await fetch(`/api/northstar/${projId}/milestones/${mid}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body
+    });
+    if (!r.ok) { console.error('session_override PATCH failed', r.status); return; }
+    // Optimistic update in cache
+    if (_msCacheByProject && _msCacheByProject[projId]) {
+      const m = _msCacheByProject[projId].find(x => String(x.id) === String(mid));
+      if (m) {
+        if (sessionName === null) delete m.session_override;
+        else m.session_override = sessionName;
+      }
+    }
+    // Re-render the badge in DOM without full reload
+    // TR uses data-mid (not data-ms-id which is on .nt-text divs)
+    const _row = document.querySelector(`tr[data-mid="${CSS.escape(String(mid))}"]`);
+    const badgeEl = _row && (_row.querySelector('button[onclick*="_showStoneSessionPicker"]') || _row.querySelector('.ss-score-badge'));
+    if (badgeEl) {
+      const mObj = (_msCacheByProject && _msCacheByProject[projId] || []).find(x => String(x.id) === String(mid));
+      if (mObj) badgeEl.outerHTML = _ssScoreBadgeHtml(mObj, projId);
+    }
+  } catch(e) {
+    console.error('_applyStoneSessionOverride error', e);
+  }
 }
 
 // M658: Trigger score computation from button
@@ -16677,11 +17527,10 @@ function _showForkPicker(triggerEl, projId, sourceSid) {
   _forkBtn.style.cssText = 'font-family:var(--mono);font-size:9px;padding:3px 8px;border-radius:3px;border:1px solid rgba(123,159,212,.5);background:rgba(123,159,212,.1);color:#7b9fd4;cursor:pointer;align-self:flex-end;font-weight:500';
   _forkBtn.onclick = async () => {
     _forkBtn.disabled = true;
-    _forkBtn.textContent = 'forking…';
     // M1845: show loading overlay on detail-modal while fork spawns (same pattern as executeProject)
     const _forkDm = document.getElementById('detail-modal');
-    if (_forkDm) { _forkDm.classList.add('loading'); _forkDm.dataset.loadingOwner = 'fork'; }
-    const _forkClearLoading = () => { if (_forkDm && _forkDm.dataset.loadingOwner === 'fork') { _forkDm.classList.remove('loading'); delete _forkDm.dataset.loadingOwner; } };
+    if (_forkDm) { _forkDm.classList.add('loading'); _forkDm.dataset.loadingOwner = 'fork'; _forkDm.dataset.forkTarget = '__pending__'; }
+    const _forkClearLoading = () => { if (_forkDm && _forkDm.dataset.loadingOwner === 'fork') { _forkDm.classList.remove('loading'); delete _forkDm.dataset.loadingOwner; delete _forkDm.dataset.forkTarget; } };
     try {
       const r = await fetch(`/api/northstar/${encodeURIComponent(projId)}/fork-session`, {
         method: 'POST', headers: {'Content-Type':'application/json'},
@@ -16690,10 +17539,14 @@ function _showForkPicker(triggerEl, projId, sourceSid) {
       const d = await r.json().catch(() => ({}));
       if (r.ok && d.ok) {
         pop.remove();
-        // Burst-refresh session pane + exec state so new fork appears immediately
-        if (window._refreshExecState) [0, 600, 1800].forEach(t => setTimeout(window._refreshExecState, t));
-        // M1845: clear loading once first refresh fires (new session row visible)
-        setTimeout(_forkClearLoading, 600);
+        // M1960: store expected fork session name so _refreshExecState can hold
+        // the loading overlay until the new session actually appears in exec-sessions API.
+        if (_forkDm && d.session) _forkDm.dataset.forkTarget = d.session;
+        // Burst-refresh session pane + exec state so new fork appears quickly
+        if (window._refreshExecState) [200, 800, 2000, 4000].forEach(t => setTimeout(window._refreshExecState, t));
+        // M1960: loading cleared by _refreshExecState when fork session appears (not by timeout).
+        // Safety fallback: clear after 15s regardless.
+        setTimeout(_forkClearLoading, 15000);
         // Toast
         try {
           let _t = document.getElementById('ns-push-toasts');
@@ -16738,7 +17591,7 @@ async function _nsModelAvatarsHydrate() {
       localStorage.setItem('ns-avatar-cache', JSON.stringify(d.value));
       if (prev !== JSON.stringify(d.value) && typeof render === 'function') {
         // M1052: avatar data changed — clear lane fingerprint to force DOM rebuild (same fix as save path)
-        if (typeof _swimlaneLaneFp !== 'undefined') Object.keys(_swimlaneLaneFp).forEach(k => delete _swimlaneLaneFp[k]);
+        if (typeof _swimlaneLaneFp !== 'undefined') Object.keys(_swimlaneLaneFp).forEach(k => delete _swimlaneLaneFp[k]); _nodeCardCache.clear(); _swimlaneGlobalFp = ''; // M1899-R9/R18B
         render();
       }
     }
@@ -17042,12 +17895,12 @@ async function _saveModelAvatarSettings() {
   _nsAvatarCache = map;
   try { localStorage.setItem('ns-avatar-cache', JSON.stringify(map)); } catch(_) {}
   // M1046: avatar change not in lane fingerprint → clear it to force full DOM rebuild
-  if (typeof _swimlaneLaneFp !== 'undefined') Object.keys(_swimlaneLaneFp).forEach(k => delete _swimlaneLaneFp[k]);
+  if (typeof _swimlaneLaneFp !== 'undefined') Object.keys(_swimlaneLaneFp).forEach(k => delete _swimlaneLaneFp[k]); _nodeCardCache.clear(); _swimlaneGlobalFp = ''; // M1899-R9/R18B
   if (typeof render === 'function') render();
   // M1061: re-fetch exec sessions so _execModel is fresh → avatar shows immediately (exec-only constraint)
   if (typeof refreshSessionStatus === 'function') {
     refreshSessionStatus().then(() => {
-      if (typeof _swimlaneLaneFp !== 'undefined') Object.keys(_swimlaneLaneFp).forEach(k => delete _swimlaneLaneFp[k]);
+      if (typeof _swimlaneLaneFp !== 'undefined') Object.keys(_swimlaneLaneFp).forEach(k => delete _swimlaneLaneFp[k]); _nodeCardCache.clear(); _swimlaneGlobalFp = ''; // M1899-R9/R18B
       if (typeof render === 'function') render();
     });
   }
@@ -17358,6 +18211,10 @@ async function _showHubConfigModal() {
 .cg-card.cg-blink-active {
   animation: cg-blink-pulse 1.1s ease-in-out infinite alternate;
 }
+/* M1954: link-src wins over blink-active when both classes present — higher specificity overrides cascade order */
+.cg-card.cg-blink-active.cg-link-src {
+  animation: cg-link-src-pulse 0.9s ease-in-out infinite alternate;
+}
 .cg-card.cg-blink-active .cg-ring {
   border-color: var(--green,#5a9572) !important;
   /* M1755: M1742 dropped this to a static box-shadow (no pulse) while chasing filter/drop-shadow's
@@ -17422,7 +18279,7 @@ async function _showHubConfigModal() {
 }
 /* M1880: idle elapsed timer badge — top-left of ring, shows Ns since last queue work */
 .cg-idle-elapsed {
-  position:absolute;top:-9px;left:-9px;
+  position:absolute;top:-9px;left:-18px;
   font-family:var(--mono,monospace);font-size:11px;font-weight:600;
   color:#e05555;background:var(--bg-deep,#111009);
   border:1px solid rgba(224,85,85,.45);border-radius:4px;
@@ -17888,12 +18745,24 @@ function _cgRenderBoard() {
       _edgePairs.push([pid, n.id]);
     }
   }
-  // M1885: pre-pass — collect lastBlinkTs per node for rank-based font sizing.
-  // Rank 1 = most idle (oldest ts = longest wait) → largest badge.
-  // Only non-spinning nodes (no queued blinks) get a badge, matching the render condition below.
+  // M1885/M1888: pre-pass — collect lastBlinkTs per node for rank-based font sizing.
+  // Rank 1 = most recently worked idle node = largest font. Excludes nodes with active
+  // queued stones (cg-blink-q) — those are "in progress" and should not compete for idle rank.
   const _cgIdleRankMap = (() => {
+    // Build set of substar_ids that currently have queued (in-progress) stones.
+    // Uses _msCacheByProject (flat, all-layer cache) to match the node-loop blink logic.
+    const _cgAllMsRank = (window._msCacheByProject && window._msCacheByProject[_cgProjId]) || [];
+    const _cgQueuedNsIds = new Set();
+    for (const _s of _cgAllMsRank) {
+      if (_s.status === 'queued' && !_s.done) {
+        // substar_id format is 'cg_<nodeId>'; node id = suffix after 'cg_'
+        const _sid = (_s.substar_id || '');
+        if (_sid.startsWith('cg_')) _cgQueuedNsIds.add(_sid.slice(3));
+      }
+    }
     const _entries = [];
     for (const _nn of _cgNodes) {
+      if (_cgQueuedNsIds.has(_nn.id)) continue; // M1888: skip in-progress nodes
       const _nnsId = 'cg_' + _nn.id;
       const _nsBE = window._blinkState && window._blinkState[_cgProjId] && window._blinkState[_cgProjId][_nnsId];
       const _nnMids = (_nsBE && typeof _nsBE.mids === 'object' && !Array.isArray(_nsBE.mids)) ? _nsBE.mids : {};
@@ -17903,9 +18772,9 @@ function _cgRenderBoard() {
     }
     // Sort descending by ts (newest = most recently worked = rank 1 = largest font)
     _entries.sort((a, b) => b.ts - a.ts);
-    const _sizes = [12, 10, 8]; // rank 1=12px, rank 2=10px, rank 3+=8px(floor); 2px step
+    const _sizes = [12, 11, 10]; // rank 1=12px, rank 2=11px, rank 3+=10px(floor); 1px step
     const _map = {};
-    const _floor = _sizes[_sizes.length - 1]; // last entry = floor size for all lower ranks
+    const _floor = _sizes[_sizes.length - 1];
     _entries.forEach((e, i) => { _map[e.id] = (_sizes[i] ?? _floor) + 'px'; });
     return _map;
   })();
@@ -18069,7 +18938,10 @@ function _cgRenderBoard() {
       const _bc = (k) => _blink[k] ? ' ss-cnt-blink' : '';
       // M1454: pulse the whole card if any blink slot is active (link-mode-style brightness animation)
       if (Object.values(_blink).some(Boolean)) card.classList.add('cg-blink-active');
-      if (_blink.q) card.classList.add('cg-blink-q');
+      // M1889: only spin when a session is actually assigned — unassigned nodes have no
+      // executor running, so the spinning ring is misleading. cg-blink-active still pulses.
+      const _hasAssignedSess = !!(_ns && (_ns.assigned_session || '').trim());
+      if (_blink.q && _hasAssignedSess) card.classList.add('cg-blink-q');
 
       // M1880: idle elapsed badge — top-left of ring, shows Ns since last queue work completed.
       // Only on non-spinning nodes (no cg-blink-q). Source: most recent blink timestamp for this ns.
@@ -18120,6 +18992,7 @@ function _cgRenderBoard() {
   // Uses module-scope interval ID so only one timer runs at a time regardless of re-renders.
   if (window._cgIdleTickInterval) clearInterval(window._cgIdleTickInterval);
   window._cgIdleTickInterval = setInterval(() => {
+    if (document.hidden) return; // M1899-P1: skip DOM walk when tab hidden
     const board2 = document.getElementById('cg-board');
     if (!board2) { clearInterval(window._cgIdleTickInterval); return; }
     board2.querySelectorAll('.cg-idle-elapsed[data-ts]').forEach(el => {
@@ -18131,7 +19004,8 @@ function _cgRenderBoard() {
       // M1885: rank font size is static (rank doesn't change within a tick cycle); restore from dataset
       if (el.dataset.rankFs) el.style.fontSize = el.dataset.rankFs;
     });
-  }, 1000);
+  // M1899-P0: 10s→30s on mobile — CG idle badge is minute-granularity, 30s is imperceptible (ROLLBACK: change 30000 back to 10000)
+  }, window._NS_IS_MOBILE ? 30000 : 5000); // M1899: 1000→5000; M1899-P0: mobile 10s→30s
 
   // M1380: initial open → center graph; re-renders (link/unlink/edit) → restore scroll position
   // Then redraw SVG edges in a nested rAF so scroll is settled before reading card positions
@@ -18290,6 +19164,13 @@ function _cgBindCardEvents(card, n) {
             const banner = document.getElementById('cg-link-banner');
             if (banner) { banner.textContent = `Same layer — can't link "${parent.name||parent.id}" → "${child.name||child.id}"`; }
             setTimeout(_cgCancelLink, 2000);
+            return;
+          }
+          // M1954: cycle detection
+          if (_cgWouldCreateCycle(parent.id, child.id)) {
+            const banner = document.getElementById('cg-link-banner');
+            if (banner) { banner.textContent = `Cycle — "${child.name||child.id}" is already an ancestor of "${parent.name||parent.id}"`; }
+            setTimeout(_cgCancelLink, 2500);
             return;
           }
           _cgCancelLink();
@@ -18572,11 +19453,22 @@ async function _cgLinkModeClick(node) {
     return;
   }
 
-  const alreadyLinked = (child.parents||[]).includes(parent.id);
-  if (alreadyLinked) {
-    // M1416: toggle — re-link = unlink
+  // M1954 flat 4-branch: fwd-unlink → rev-unlink → indirect-cycle block → link
+  const fwd = (child.parents||[]).includes(parent.id);   // A→B exists
+  const rev = (parent.parents||[]).includes(child.id);   // B→A exists (direct reverse, O(1))
+  if (fwd) {
     await _cgUnlinkParent(child, parent.id, null);
     if (bar) bar.textContent = `Disconnected "${parent.name||parent.id}" → "${child.name||child.id}" — click next pair`;
+    return;
+  }
+  if (rev) {
+    await _cgUnlinkParent(parent, child.id, null);
+    if (bar) bar.textContent = `Removed reverse link "${child.name||child.id}" → "${parent.name||parent.id}" — click next pair`;
+    return;
+  }
+  if (_cgWouldCreateCycle(parent.id, child.id)) {
+    if (bar) bar.textContent = `Cycle detected — "${child.name||child.id}" is already an ancestor of "${parent.name||parent.id}"`;
+    setTimeout(() => { if (bar) bar.textContent = 'Link mode ON — click node A (parent), then node B (child) to connect'; }, 2500);
     return;
   }
   const newParents = [...new Set([...(child.parents||[]), parent.id])];
@@ -18614,6 +19506,23 @@ function _cgCancelLink() {
   const banner = document.getElementById('cg-link-banner');
   if (banner) banner.style.display = 'none';
   document.querySelectorAll('.cg-card.cg-link-target').forEach(el => el.classList.remove('cg-link-target'));
+}
+
+// M1954: returns true if making parentId→childId would create a cycle
+// (i.e. childId is already an ancestor of parentId in the current graph)
+function _cgWouldCreateCycle(parentId, childId) {
+  // BFS/DFS upward from parentId through parents chain; if we reach childId, it's a cycle
+  const visited = new Set();
+  const queue = [parentId];
+  while (queue.length) {
+    const cur = queue.shift();
+    if (cur === childId) return true;
+    if (visited.has(cur)) continue;
+    visited.add(cur);
+    const node = _cgNodes.find(n => n.id === cur);
+    if (node) for (const p of (node.parents||[])) queue.push(p);
+  }
+  return false;
 }
 
 async function _cgUnlinkParent(node, parentId, reopenNode) {

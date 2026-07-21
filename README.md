@@ -139,15 +139,15 @@ hub
 
 # Step 3 — Register hooks + MCP into Claude Code (run once per machine)
 hub install-global
-# → Writes lifecycle protocol to ~/.claude/CLAUDE.md
 # → Registers mcp__ns-hub server + 5 hooks in ~/.claude/settings.json
+# → Does NOT modify any CLAUDE.md — hub is fully MCP-driven
 
 # Step 4 — Verify everything is wired up
 hub doctor
 # → Checks: Python / tmux / claude CLI / env / MCP / hooks / server
 # Expected output: all green ✓
 
-# Step 5 — Register your project
+# Step 5 — Register your project (registers in hub DB; no CLAUDE.md changes)
 hub init MyProject --dir ~/Projects/MyProject
 
 # Step 6 — Restart Claude Code so hooks + MCP are loaded
@@ -330,6 +330,14 @@ curl http://localhost:9001/api/metrics?proj_id=MOAT
 ---
 
 ## Changelog
+
+### v0.3.13 (2026-07-21)
+
+**`hub init` rewrite — CLAUDE.md removed (M1925)**
+- `hub init` no longer writes a NS Hub block to the project `CLAUDE.md` — MCP tool descriptions carry all protocol context that the old raw-REST block provided
+- `hub init` now registers the project directly in the hub SQLite DB (idempotent)
+- If a legacy NS Hub block (`<!-- NS_HUB_PROJECT_START -->`) exists in a project `CLAUDE.md`, `hub init` automatically removes it
+- `hub install-global` has never modified any `CLAUDE.md`; README comment corrected
 
 ### v0.3.12 (2026-07-21)
 

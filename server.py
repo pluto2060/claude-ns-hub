@@ -69,7 +69,7 @@ _DEFAULT_PROJECTS_DIR = _HUB_DATA_DIR / "projects"
 PROJECTS_DIR = Path(os.environ.get("HUB_PROJECTS_DIR", str(_DEFAULT_PROJECTS_DIR)))
 
 HOST = os.environ.get("HUB_HOST", "")  # resolved below after _tailscale_interface_ip is defined
-PORT = int(os.environ.get("HUB_PORT", "9000"))
+PORT = int(os.environ.get("HUB_PORT", "9001"))
 
 # M705: Per-user config — agent/model defaults that survive hub reinstalls
 _HUB_CONFIG_FILE = _HUB_DATA_DIR / "config.yaml"
@@ -163,13 +163,22 @@ def _turso_sync_project(proj_id: str, milestones: list):
                 pass
 
 
+_tailscale_ip_cache: str = ""  # M1940: cached at first call; Tailscale IP never changes at runtime
+
+
 def _tailscale_interface_ip() -> str:
-    """Get the IP assigned to the Tailscale interface (100.x.x.x/32)."""
+    """Get the IP assigned to the Tailscale interface (100.x.x.x/32).
+    M1940: result cached in _tailscale_ip_cache — avoids repeated `ip addr show` subprocess
+    on every spawn/wake call (was called 15+ times per spawn, ~2ms each = ~30ms overhead)."""
+    global _tailscale_ip_cache
+    if _tailscale_ip_cache:
+        return _tailscale_ip_cache
     try:
         r = subprocess.run(["ip", "addr", "show"], capture_output=True, text=True, timeout=2)
         m = re.search(r"(100\.\d+\.\d+\.\d+)/32", r.stdout)
         if m:
-            return m.group(1)
+            _tailscale_ip_cache = m.group(1)
+            return _tailscale_ip_cache
     except Exception:
         pass
     # Windows / psutil fallback
@@ -178,10 +187,12 @@ def _tailscale_interface_ip() -> str:
         for iface, addrs in psutil.net_if_addrs().items():
             for addr in addrs:
                 if addr.family == 2 and re.match(r"100\.\d+\.\d+\.\d+", addr.address):
-                    return addr.address
+                    _tailscale_ip_cache = addr.address
+                    return _tailscale_ip_cache
     except Exception:
         pass
-    return "127.0.0.1"
+    _tailscale_ip_cache = "127.0.0.1"
+    return _tailscale_ip_cache
 
 
 def _bound_ip(port: int) -> str:
@@ -1048,6 +1059,17 @@ async def agent_busy(request: Request):
         _eff_stone = _stone_id or (_prev_rec.get("stone_id") if _prev_rec.get("busy") else None)
     else:
         _eff_stone = None
+    # M1919: tool_start has a 1h hold and must not be overwritten by compacting.
+    # Sequence: PreToolUse → tool_start (1h), then PreCompact fires for a long Bash
+    # that hits context limit mid-run → compacting overwrites tool_start → compaction
+    # ends → Stop posts idle → poller wakes the session while Bash is still running.
+    # Guard: if the current record is tool_start+busy and the incoming reason is
+    # compacting, preserve the tool_start record (don't overwrite). Any other
+    # transition (including idle/agent_stopped) still proceeds normally.
+    _prev_reason = _prev_rec.get("reason", "")
+    if (_reason == "compacting" and new_busy
+            and _prev_reason == "tool_start" and _prev_rec.get("busy")):
+        return JSONResponse({"ok": True, "scope": "session", "guarded": "tool_start_preserved"})
     _agent_busy_sessions[_rec_key] = {
         "proj_id": proj_id, "busy": new_busy, "reason": _reason[:200],
         "ts": time.time(),
@@ -2114,6 +2136,7 @@ def _ensure_repo_path_exists(repo_path: str) -> tuple[bool, str]:
 
 _NS_EVENTS_DB = Path(os.environ.get("HUB_DB_PATH", str(_HUB_DATA_DIR / "ns-events.db")))
 _M1434_backfill_done: bool = False  # M1434: JSONL skill backfill runs once per server process
+_M190_DISABLED: bool = True  # M1961: temporary disable — allow claude→claude consecutive appends for long-running tasks
 
 def _exec_idle_file(proj_id: str) -> Path:
     """M536: Path to the .exec-idle sentinel file for a project.
@@ -3038,9 +3061,9 @@ async def northstar_page():
 
 @app.get("/landing")
 async def landing_page():
-    """M231: ns-system landing page (DISABLED M1026 — no separate landing yet).
-    Returns 404 until a real landing/marketing page is shipped."""
-    return JSONResponse({"ok": False, "detail": "landing page not available"}, status_code=404)
+    """BUG-03 fix: redirect /landing → /northstar dashboard (no separate landing page)."""
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/northstar", status_code=302)
 
 
 @app.get("/corpus-hub")
@@ -3138,14 +3161,22 @@ async def tmux_send_key(request: Request):
 
 @app.post("/api/northstar")
 async def northstar_save(request: Request):
+    """BUG-04 fix: single-dict POST intended for project creation must use /api/northstar/create.
+    Bulk list save (internal UI sync) is still supported."""
     data = await request.json()
     if isinstance(data, list):
-        # Bulk save — write each project to its file
+        # Bulk save — write each project to its file (internal UI sync path)
         for p in data:
             proj_id = p.get("id", p.get("name", "").lower().replace(" ", "-"))
             if proj_id:
                 _save_project(proj_id, {k: v for k, v in p.items() if k not in ("stale","last_updated","file_path")})
-    return JSONResponse({"ok": True})
+        return JSONResponse({"ok": True})
+    # Single-dict: user likely tried to create a project via wrong endpoint
+    return JSONResponse(
+        {"ok": False, "error": "Use POST /api/northstar/create to create a project",
+         "hint": "Body: {\"id\": \"MyProj\", \"name\": \"My Project\", \"repo_path\": \"/path\"}"},
+        status_code=400
+    )
 
 
 @app.get("/api/northstar/{proj_id}/okrs")
@@ -4305,8 +4336,15 @@ async def _start_milestone_watcher():
                         # M131-b-followup: resolve via the owning substar's assigned_session
                         # instead of always targeting the main session first.
                         session_name = _owning_exec_session_name(proj_id, _pending_reply_owner_m or {}, proj)
-                        check = subprocess.run(["tmux", "has-session", "-t", f"={session_name}"], capture_output=True, timeout=2)
-                        if check.returncode == 0:
+                        # M1940: use bg poller cache instead of subprocess fork per dispatch cycle
+                        _cached_ls = _bg_tmux_state.get("ls", "")
+                        if _cached_ls:
+                            _live_set = {l.split(":")[0] if ":" in l else l for l in _cached_ls.splitlines() if l.strip()}
+                            _session_alive = session_name in _live_set
+                        else:
+                            _chk = subprocess.run(["tmux", "has-session", "-t", f"={session_name}"], capture_output=True, timeout=2)
+                            _session_alive = _chk.returncode == 0
+                        if _session_alive:
                             # M149: append-only queue (one entry per write)
                             # M172: enforce comment-reply protocol (3-line max, details to doc)
                             _qf = PROJECTS_DIR / proj_id / "pending-execute-queue.jsonl"
@@ -4718,7 +4756,9 @@ def _session_claimable_queued_count(proj_id: str, session_name: str) -> int:
             if cb and cb != session_name and (_now_e - (m.get("claimed_at") or 0)) < _CLAIM_TTL_SECS:
                 continue  # in-flight on another session
             sid = (m.get("substar_id") or "").strip()
-            owner = sub_sess.get(sid, "") if sid else ""
+            # M1916: per-stone session_override takes priority over substar assignment
+            _ov = (m.get("session_override") or "").strip()
+            owner = _ov if _ov else (sub_sess.get(sid, "") if sid else "")
             # M1860: free-pool removed — unassigned substar stones are NOT claimable.
             # Only count stones whose substar is explicitly assigned to this session.
             if owner == session_name:
@@ -5037,7 +5077,10 @@ def _get_resume_args(proj_id: str, proj_dir: str, explicit_session_id: str = Non
         except Exception:
             pass
 
-    return ["--continue"]
+    # M1896: no prior session ID found — return [] so the caller's presigned --session-id
+    # path takes over (fresh new conversation with deterministic UUID). --continue is removed:
+    # it lets Claude CLI pick its own UUID internally, making live_session_id untrackable.
+    return []
 
 
 _ALLOWED_MODELS = {
@@ -5371,13 +5414,8 @@ _HUB_EXEC_SYS_PROMPT = (
     "LINE 3+ = context or next step if needed (omit if simple Q). "
     "NEVER start with 'I', summary, or restatement. "
     "If you cannot answer, write '[NEED INFO]: <what is missing>' on line 1. "
-    "Server-side Q-anchor compression preserves line 1 with high priority (bias=8). "
-    "SKILL INVOCATION PROTOCOL: after calling mcp__ns-hub__get_pending_task, "
-    "if the response contains skill_refs (non-empty list), your VERY NEXT action "
-    "MUST be Skill(skill=skill_refs[0]) — before reading task text or any other tool. "
-    "M1565 SEQUENTIAL CHAIN: if skill_refs_remaining is present (non-empty), "
-    "after skill_refs[0] completes call each skill in skill_refs_remaining in order. "
-    "Skipping any skill = silent failure. "
+    # M1869-P3-D: removed SKILL INVOCATION PROTOCOL — already in get_pending_task MCP tool desc.
+    # Removed "Q-anchor bias=8" internal detail — not actionable for model.
     "GDRIVE UPLOAD RULE (M1772): mcp__claude_ai_Google_Drive__* tools are hard-blocked at exec-session level. "
     "When spawning subagents (Agent tool), ALWAYS include in the subagent prompt: "
     "'evidence upload: ONLY use mcp__ns-hub__upload_evidence or rclone Bash — "
@@ -5685,12 +5723,25 @@ def _record_spawn_info(proj_id: str, resume_args: list, agent: str = "claude", s
         except Exception:
             from_id = ""
         _mode = "fork" if "--fork-session" in resume_args else "resume"
-        # M1774-correction: --fork-session allocates a NEW session id / .jsonl — leave
-        # live_session_id unset so _capture_live_session_id_bg is the single source of truth.
         # M1806-fix: resume reuses the SAME session id as from_id (no new .jsonl created),
-        # so live_session_id == from_id deterministically. Set it now so _spawn_sid_to_model
-        # can index by live_session_id alone without needing from_id as a separate key.
-        _live = from_id if _mode == "resume" else ""
+        # so live_session_id == from_id deterministically.
+        # M1896-fix: fork+presigned — when --session-id is also in resume_args (M1775 path),
+        # the presigned sid IS the live session id at write time; set it here so spawn-info is
+        # complete from first write, eliminating the race window between _record_spawn_info
+        # (live_session_id="") and the subsequent _write_sid_direct call.
+        # M1774-correction (original): fork without --session-id → leave "" so
+        # _capture_live_session_id_bg remains the single source of truth (still applies when
+        # _br_presigned_sid path is absent, e.g. --continue fallback).
+        if _mode == "resume":
+            _live = from_id
+        elif "--session-id" in resume_args:
+            try:
+                _sid_idx = resume_args.index("--session-id")
+                _live = resume_args[_sid_idx + 1] if _sid_idx + 1 < len(resume_args) else ""
+            except Exception:
+                _live = ""
+        else:
+            _live = ""  # fork without presigned -- _capture_live_session_id_bg will fill
         info = {"agent": agent, "mode": _mode, "from_id": from_id, "live_session_id": _live, "at": _dt.now().isoformat(timespec="seconds")}
     elif "--continue" in resume_args:
         info = {"agent": agent, "mode": "continue", "from_id": "", "at": _dt.now().isoformat(timespec="seconds")}
@@ -6124,6 +6175,57 @@ def _truncate_transcript_before_last_user_turn(transcript_path: Path) -> "str | 
         return None
 
 
+_HUB_WAKE_NEEDLE = "mcp__ns-hub__get_pending_task"
+
+def _truncate_transcript_before_last_hub_wake(transcript_path: Path) -> "str | None":
+    """M1980: cut point for fork on an IDLE session whose transcript ends with a
+    completed hub-task exchange. The mother finished her last stone, and the transcript
+    tail looks like:
+        user:  "Tasks ready. Call mcp__ns-hub__get_pending_task() now."
+        assistant: <called get_pending_task, did the work, replied>
+        user:  <tool_result chains>  ← subsequent turns completing the task
+        ...
+    When the child inherits this verbatim, Claude 'sees' the hub-wake injection and
+    re-executes the last task instead of waiting for its own fresh wake. Fix: scan
+    backwards for the LAST user turn that contains the hub wake text, and cut before it.
+    If no such turn exists (conversation is pure interactive, not hub-driven), return None
+    so the caller falls back to a raw fork (preserving full context is correct there)."""
+    import uuid as _uuid_trunc3
+    try:
+        lines = transcript_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        cut_idx = None
+        for i in range(len(lines) - 1, -1, -1):
+            try:
+                entry = json.loads(lines[i])
+            except Exception:
+                continue
+            if not (isinstance(entry, dict) and entry.get("type") == "user"):
+                continue
+            msg = entry.get("message", {})
+            content = msg.get("content", "") if isinstance(msg, dict) else ""
+            if isinstance(content, str) and _HUB_WAKE_NEEDLE in content:
+                cut_idx = i
+                break
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and isinstance(item.get("text"), str) and _HUB_WAKE_NEEDLE in item["text"]:
+                        cut_idx = i
+                        break
+                if cut_idx is not None:
+                    break
+        if cut_idx is None:
+            return None  # no hub-wake turn found — raw fork is safe
+        kept = lines[:cut_idx]
+        if not kept:
+            return None
+        new_sid = str(_uuid_trunc3.uuid4())
+        new_path = transcript_path.parent / f"{new_sid}.jsonl"
+        new_path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+        return new_sid
+    except Exception:
+        return None
+
+
 def _mother_fork_args(proj_id: str, proj_dir: str) -> list:
     """M1656-fork: return ['--resume', <mother_sid>, '--fork-session'] so a branched child
     session inherits the mother conversation's full context while writing to its OWN new
@@ -6170,7 +6272,10 @@ def _mother_fork_args(proj_id: str, proj_dir: str) -> list:
                         return ["--resume", sid, "--fork-session"]
     except Exception:
         pass
-    return ["--continue"]
+    # M1896: fork fallback — no mother transcript found. Return [] so the caller's presigned
+    # --session-id path creates a fresh session with known UUID. --continue removed (same
+    # reason as _get_resume_args L5053: live_session_id would be untrackable).
+    return []
 
 
 
@@ -6242,12 +6347,19 @@ def _exec_session_names(proj_id: str) -> list:
         if n not in names:
             names.append(n)
     # M858: also enumerate live tmux sessions matching *-exec-{proj_id}-* (branched sessions)
+    # M1940: use bg poller cache (_bg_tmux_state["ls"]) instead of forking tmux per call (~15ms saved)
     try:
-        _tmux_ls = subprocess.run(
-            ["tmux", "list-sessions", "-F", "#{session_name}"],
-            capture_output=True, text=True, timeout=2,
-        ).stdout.splitlines()
+        _cached_ls = _bg_tmux_state.get("ls", "")
+        if _cached_ls:
+            _tmux_ls = _cached_ls.splitlines()
+        else:
+            _tmux_ls = subprocess.run(
+                ["tmux", "list-sessions", "-F", "#{session_name}"],
+                capture_output=True, text=True, timeout=2,
+            ).stdout.splitlines()
         for sname in _tmux_ls:
+            # Extract session_name from "name:created:windows" format used by bg poller
+            sname = sname.split(":")[0] if ":" in sname else sname
             # Match branched pattern: <agent>-exec-<proj_id>-<suffix>
             if f"-exec-{proj_id}-" in sname and sname not in names:
                 names.append(sname)
@@ -6259,7 +6371,20 @@ def _exec_session_names(proj_id: str) -> list:
 def _live_exec_session_name(proj_id: str) -> str:
     """Return the first running exec session name for a project, if any.
     M1796: sessions now have UUID suffix — no predictable fallback name exists when none are
-    running. Returns empty string in that case; callers must handle the no-session state."""
+    running. Returns empty string in that case; callers must handle the no-session state.
+    M1940: use bg poller cache for membership check to avoid tmux has-session fork per candidate."""
+    # Build live session set from bg cache (avoids per-candidate subprocess fork)
+    _cached_ls = _bg_tmux_state.get("ls", "")
+    if _cached_ls:
+        _live_sessions = {
+            line.split(":")[0] if ":" in line else line
+            for line in _cached_ls.splitlines() if line.strip()
+        }
+        for candidate in _exec_session_names(proj_id):
+            if candidate in _live_sessions:
+                return candidate
+        return ""
+    # Fallback: bg poller not yet populated (startup race) — use subprocess
     for candidate in _exec_session_names(proj_id):
         check = subprocess.run(["tmux", "has-session", "-t", f"={candidate}"], capture_output=True, timeout=2)
         if check.returncode == 0:
@@ -6316,16 +6441,20 @@ def _kill_all_exec_sessions(proj_id: str, spare: set = None) -> list:
     for s in extra_sessions:
         if s not in all_candidates:
             all_candidates.append(s)
-    for candidate in all_candidates:
-        if candidate in _spare:
-            continue
-        # =name → exact target match only (no prefix fallback)
-        r = subprocess.run(["tmux", "kill-session", "-t", f"={candidate}"], capture_output=True, timeout=5)
-        if r.returncode == 0:
-            killed.append(candidate)
-        # M355: clear idle tracking for killed sessions
-        _exec_idle_count.pop(candidate, None)
-        _exec_was_running.pop(candidate, None)
+    targets = [c for c in all_candidates if c not in _spare]
+    # M1940: parallel kill — tmux kill-session is I/O-bound; firing all at once cuts wall time
+    # from O(n×5s-timeout) sequential to O(1×5s) parallel for n sessions.
+    import concurrent.futures as _cf_kill
+    def _kill_one(candidate):
+        return candidate, subprocess.run(
+            ["tmux", "kill-session", "-t", f"={candidate}"], capture_output=True, timeout=5)
+    with _cf_kill.ThreadPoolExecutor(max_workers=min(len(targets), 8)) as _ex:
+        for candidate, r in _ex.map(_kill_one, targets):
+            if r.returncode == 0:
+                killed.append(candidate)
+            # M355: clear idle tracking for killed sessions
+            _exec_idle_count.pop(candidate, None)
+            _exec_was_running.pop(candidate, None)
     if killed:
         _server_log_action(proj_id, "", "exec:kill", f"sessions:{','.join(killed)}{f' (spared {len(_spare)})' if _spare else ''}")
     # M985/M1656-R3: clear assigned_session ONLY for substars whose session was actually
@@ -7419,7 +7548,10 @@ async def claim_task_for_session(proj_id: str, request: Request):
                 _substar_session[_ns["id"]] = (_ns.get("assigned_session") or "").strip()
 
         def _stone_session(m: dict) -> str:
-            """Resolve which session a stone belongs to via its substar."""
+            """Resolve which session a stone belongs to: per-stone override first, then substar."""
+            _ov = (m.get("session_override") or "").strip()
+            if _ov:
+                return _ov
             _sid = (m.get("substar_id") or "").strip()
             return _substar_session.get(_sid, "") if _sid else ""
 
@@ -7909,7 +8041,24 @@ async def create_milestone(proj_id: str, request: Request, background_tasks: Bac
     milestones = proj.get("milestones", [])
     # Auto-assign ID
     existing_ids = {m.get("id","") for m in milestones if isinstance(m, dict)}
-    layer = int(data.get("layer", 0))
+    # BUG-06 fix: layer must be int; string aliases ("root"→0, "substar"→1) accepted for UX
+    _raw_layer = data.get("layer", 0)
+    _LAYER_ALIASES = {"root": 0, "top": 0, "substar": 1, "child": 1, "sub": 1}
+    if isinstance(_raw_layer, str):
+        _raw_layer = _LAYER_ALIASES.get(_raw_layer.lower())
+        if _raw_layer is None:
+            return JSONResponse(
+                {"ok": False, "error": "layer must be an integer (0=root, 1=substar/child). "
+                 "Accepted aliases: 'root'→0, 'substar'→1."},
+                status_code=422
+            )
+    try:
+        layer = int(_raw_layer)
+    except (TypeError, ValueError):
+        return JSONResponse(
+            {"ok": False, "error": f"layer must be an integer, got: {_raw_layer!r}"},
+            status_code=422
+        )
     parent_id = data.get("parent_id") or None
     # M603: auto-promote to layer=1 when parent_id is set but layer was not sent
     if parent_id and layer == 0:
@@ -7932,6 +8081,12 @@ async def create_milestone(proj_id: str, request: Request, background_tasks: Bac
             new_id = new_id + "x"
     from datetime import datetime as _dt
     _now_create = _dt.now().strftime("%Y-%m-%dT%H:%M")
+    # M1935: inherit parent's substar_id when not explicitly set — child stones created via
+    # create_child_stone MCP don't include substar_id, leaving them in the free-pool (unclaimable).
+    _explicit_substar = data.get("substar_id") or None
+    if not _explicit_substar and parent_id:
+        _par_ms = next((m for m in milestones if isinstance(m, dict) and m.get("id") == parent_id), None)
+        _explicit_substar = (_par_ms.get("substar_id") or None) if _par_ms else None
     new_ms = {
         "id": new_id, "text": data.get("text", "New milestone"),
         "layer": layer, "parent_id": parent_id,
@@ -7939,8 +8094,14 @@ async def create_milestone(proj_id: str, request: Request, background_tasks: Bac
         "status": data.get("status", "pending"),
         "claude_ack": None,
         "user_added_at": _now_create,
-        "substar_id": data.get("substar_id") or None,
+        "substar_id": _explicit_substar,
+        # M1907: is_progress=True marks mid-flight M190-bypass progress children.
+        # These are auto-collapsed in UI and never dispatched to the free-pool queue.
+        # Enforce pc status server-side so direct API callers can't accidentally set queued.
+        "is_progress": bool(data.get("is_progress", False)),
     }
+    if new_ms["is_progress"] and new_ms.get("status") not in ("pending_confirmation", "done"):
+        new_ms["status"] = "pending_confirmation"
     milestones.insert(0, new_ms)  # M86: prepend so newest always appears first in UI
     proj["milestones"] = milestones
     # Write to SQLite synchronously (primary store) — no MD dependency
@@ -8166,7 +8327,8 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                       "counterfactual_pair_id",  # peer child stone ID at branch points
                       "conversation_summary",     # M1253: LLM-generated stone-conversation summary
                       "summary_state",           # M1253: {last_compressed_len, last_compressed_at, version}
-                      "evidence_filename"):       # M1304: local filename hint — avoids GDrive API lookup
+                      "evidence_filename",         # M1304: local filename hint — avoids GDrive API lookup
+                      "session_override"):         # M1916: per-stone session assignment (overrides substar)
                 if k in data:
                     # M1316 fix: capture old evidence_url BEFORE overwriting m[k].
                     # Previously _old_ev was read after m[k] = data[k] so it always
@@ -8215,6 +8377,18 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                             "last_compressed_at": now_iso,
                             "version": (m.get("summary_state", {}) or {}).get("version", 0) + 1,
                         }
+                    # M1916: when session_override is set/changed, evict any stale claim from
+                    # the OLD session (substar-assigned or previous override). Without this,
+                    # the old session's claim (within 120s TTL) causes it to pick up and
+                    # execute the stone despite the explicit override — same bug pattern as
+                    # substar reassignment (fixed at exec:assign path L6930).
+                    if k == "session_override":
+                        _new_ov = (data[k] or "").strip()
+                        _old_cb = (m.get("claimed_by_session") or "").strip()
+                        _old_ca = m.get("claimed_at") or 0
+                        if _old_cb and _old_cb != _new_ov and (time.time() - _old_ca) < _CLAIM_TTL_SECS:
+                            m["claimed_by_session"] = None
+                            m["claimed_at"] = None
                     # M1059: verify_flag child creation moved to queued-time (not flag-set-time)
                     # Previously: M990 created [검수] child immediately when flag toggled ON
                     # Now: flag just marks the stone; child created only when stone is queued
@@ -8267,7 +8441,8 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                     # M190: forbid claude→claude consecutive appends. Claude can only post when
                     # (a) conversation is empty (initial comment), or (b) last entry is from user.
                     # Prevents self-reply chains that violate ns-comment-reply-protocol.md Rule 1+2.
-                    if msg.get("role") == "claude":
+                    # M1961: _M190_DISABLED=True bypasses this gate temporarily.
+                    if msg.get("role") == "claude" and not _M190_DISABLED:
                         _conv_so_far = m.get("conversation") or []
                         if _conv_so_far and _conv_so_far[-1].get("role") == "claude":
                             return JSONResponse({
@@ -8529,11 +8704,47 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                         # ≤MAX_LINES — keep as-is but strip pure-blank lines for cleanliness
                         if len(_all_lines) != len(_non_empty):
                             msg["text"] = "\n".join(_non_empty)
-                    # M1257: force server time on every append_message so user (browser TZ/UTC ISO) and claude (server local) timestamps line up in the chatbox.
+                    # M1257: force server time on every append_message so user (browser TZ/CT ISO) and claude (server local) timestamps line up in the chatbox.
                     msg["ts"] = _dt.datetime.now().isoformat()
-                    conv = m.get("conversation") or []
-                    conv.append(msg)
-                    m["conversation"] = conv
+                    _m1981_skipped_append = False  # set True when Layer A blocks the append
+                    # M1981: Layer A pre-flight — do NOT write the comment when this PATCH will be
+                    # blocked for missing evidence_url. Without this guard, every LAYER_A_BLOCKED
+                    # retry appends a new duplicate comment (observed: FromScratch M181 × 5 dupes).
+                    # Condition: completion PATCH (status=pending_confirmation, role=claude) + Layer A
+                    # keyword in stone text + no evidence_url in data or current stone.
+                    _m1981_is_completion_patch = (
+                        data.get("status") == "pending_confirmation"
+                        and msg.get("role") == "claude"
+                    )
+                    if _m1981_is_completion_patch:
+                        import re as _re_m1981
+                        _m1981_ev = data.get("evidence_url") or m.get("evidence_url") or ""
+                        _m1981_txt = _re_m1981.sub(
+                            r'\S?PASTE\S?.*?\S?/PASTE\S?', '',
+                            (m.get("text") or ""), flags=_re_m1981.S
+                        ).lower()
+                        _m1981_layer_a_kws = (
+                            "스크린샷", "screenshot", "excel", "엑셀", "pdf", "docx",
+                            "보고서", "report", "chart", "이미지", "image", "분석결과",
+                        )
+                        _m1981_will_block = (
+                            any(kw in _m1981_txt for kw in _m1981_layer_a_kws)
+                            and not _m1981_ev
+                        )
+                        if _m1981_will_block:
+                            # Skip conv append — the comment will be written on the successful
+                            # retry that includes evidence_url. Signal to downstream skip-blocks via
+                            # _m1981_skipped_append so log/blink side effects are also suppressed.
+                            msg.pop("ts", None)  # discard the timestamped version
+                            _m1981_skipped_append = True
+                        else:
+                            conv = m.get("conversation") or []
+                            conv.append(msg)
+                            m["conversation"] = conv
+                    else:
+                        conv = m.get("conversation") or []
+                        conv.append(msg)
+                        m["conversation"] = conv
                     # M1154 v4: auto-compression DISABLED — user requested full conversation
                     # history in the chatbox. The destructive squash was losing original turns
                     # which violated UI contract. LLM context grows accordingly (acceptable
@@ -8587,16 +8798,17 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                     # M1050/M1060: verify_flag resets on every chat message (user or claude)
                     if m.get("verify_flag"):
                         m["verify_flag"] = False
-                    # M535: log server-side comment event
-                    _server_log_action(proj_id, mid, f"comment:{msg.get('role','?')}",
-                                       (msg.get("text",""))[:120])
-                    # M1227: any comment (user or claude) on a stone → blink so participant sees new reply
-                    if msg.get("role") in ("user", "claude"):
-                        try:
-                            _comment_skey = m.get("substar_id") or "__ungrouped__"
-                            _mark_blink_server(proj_id, _comment_skey, m.get("id") or mid)
-                        except Exception:
-                            pass
+                    # M535: log server-side comment event (M1981: skip when Layer A pre-flight blocked)
+                    if not _m1981_skipped_append:
+                        _server_log_action(proj_id, mid, f"comment:{msg.get('role','?')}",
+                                           (msg.get("text",""))[:120])
+                        # M1227: any comment (user or claude) on a stone → blink so participant sees new reply
+                        if msg.get("role") in ("user", "claude"):
+                            try:
+                                _comment_skey = m.get("substar_id") or "__ungrouped__"
+                                _mark_blink_server(proj_id, _comment_skey, m.get("id") or mid)
+                            except Exception:
+                                pass
                     # M222: claude completing work on a queued stone → pending_confirmation.
                     # M247 fix: only promote from queued→pending_confirmation, NOT pending→pending_confirmation.
                     # Promoting pending (review) stones caused auto-queue chain:
@@ -8658,7 +8870,8 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                                         "status": "queued",
                                         "claude_ack": None,
                                         "user_added_at": _dt.datetime.now().strftime("%Y-%m-%dT%H:%M"),
-                                        "skill_refs": ["code-review"],  # M996
+                                        "skill_refs": ["e2e"],  # M996
+                                        "substar_id": m.get("substar_id") or None,  # M1945: inherit parent substar
                                     })
                                     _server_log_action(
                                         proj_id, _m722_rev_id,
@@ -8701,7 +8914,16 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                                 if isinstance(_ns_own, dict) and _ns_own.get("id") == _sid_own:
                                     _owner_sess = (_ns_own.get("assigned_session") or "").strip()
                                     break
-                        session_name = _owner_sess or _live_exec_session_name(proj_id)
+                        # M1912-b: _sid_own set but _owner_sess empty = substar explicitly unassigned
+                        # (same M1860 principle: don't wake arbitrary sessions for unassigned substar stones).
+                        # Only fall back to _live_exec_session_name for ungrouped stones (no substar_id),
+                        # which are main-session domain regardless of which session happens to be alive.
+                        if _owner_sess:
+                            session_name = _owner_sess
+                        elif not _sid_own:
+                            session_name = _live_exec_session_name(proj_id)
+                        else:
+                            session_name = ""  # unassigned substar — no wake target
                         check = await asyncio.to_thread(  # M1345
                             subprocess.run, ["tmux", "has-session", "-t", f"={session_name}"], capture_output=True, timeout=2)
                         # M523: always write REPLY SYNC queue entry regardless of session state.
@@ -8721,33 +8943,10 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                         _entry = json.dumps({
                             "ts": _dt.datetime.now().isoformat(),
                             "body": (
-                                f"[REPLY SYNC — Q&A MODE] User commented on stone {mid}:\n"
-                                f"  \"{msg.get('text','')}\"{_skill_annotation}\n"
-                                f"⚠️  THIS IS A REPLY TASK, NOT A COMPLETION TASK.\n"
-                                f"  DO NOT re-implement the stone. DO NOT change status to pending_confirmation.\n"
-                                f"  Your ONLY job: read the comment and reply (STRUCTURED: no limit; prose: ≤3 lines).\n"
-                                f"(If the message is long or references context, call\n"
-                                f" GET /api/northstar/{proj_id}/milestones to read conversation[] first.)\n\n"
-                                f"PROTOCOL:\n"
-                                f"  1. Read the user comment above carefully.\n"
-                                f"  1b. M246: If [skill:/name] or [agent:name] annotated: invoke it, then reply with 1-line result.\n"
-                                f"  2. ANSWER via PATCH http://127.0.0.1:{PORT}/api/northstar/{proj_id}/milestones/{mid} "
-                                f"with body append_message {{role:'claude', text:'<STRUCTURED: no limit | prose: ≤3 lines>'}}.\n"
-                                f"  3. ONLY if user explicitly says 're-do', 'fix', 'redo', '다시', '수정해' → also re-implement.\n"
-                                f"  4. DO NOT change status — this reply does NOT advance the stone lifecycle.\n"
-                                f"  5. Prose overflow (>3 lines prose): write docs/ns-replies/<DATE>-{mid}.md and reference path.\n"
-                                f"  6. M270: No follow-up questions unless genuinely missing critical info.\n"
-                                f"  7. M1781: Do NOT post a 'working on this now / will update soon' progress-narration "
-                                f"reply — ns-comment-reply-protocol.md Rule 2/anti-patterns forbids it. If the work "
-                                f"genuinely isn't done yet, either answer what's answerable now or stay silent until "
-                                f"it's truly done; posting a premature status reply consumes the ONE reply slot "
-                                f"(M190 blocks claude→claude — you cannot post a second reply until the user responds "
-                                f"again) and leaves the real completion report with nowhere to go.\n"
-                                f"  8. M1781: If M190 (claude_self_reply_blocked) rejects your append_message because "
-                                f"you already replied, that ONLY blocks the reply text — attach_evidence_url(task_id, "
-                                f"evidence_url) is a separate call with no M190 gate and still works. Never skip "
-                                f"attaching evidence just because the reply itself is blocked.\n"
-                                f"Mandatory — do this BEFORE any other queued work."
+                                # M1869-P2: quiet-mode REPLY SYNC — stripped static 8-rule protocol
+                                # (_qa_instruction in get_pending_task covers M687/M190/M1781 rules)
+                                f"[REPLY SYNC] Stone {mid} has a user comment. Call mcp__ns-hub__get_pending_task() now."
+                                + (f"\n{_skill_annotation.strip()}" if _skill_parts else "")
                             ),
                         }, ensure_ascii=False)
                         with _qf.open("a", encoding="utf-8") as _qh:
@@ -8812,7 +9011,8 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                                 "status": "queued",
                                 "claude_ack": None,
                                 "user_added_at": now_iso,
-                                "skill_refs": ["code-review"],
+                                "skill_refs": ["e2e"],
+                                "substar_id": m.get("substar_id") or None,  # M1945: inherit parent substar
                             })
                 else:
                     m.pop("queued_at", None)
@@ -9210,7 +9410,8 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                 "layer": _m_layer + 1, "parent_id": mid, "done": False,
                 "status": "queued", "claude_ack": None,
                 "user_added_at": _dt.datetime.now().strftime("%Y-%m-%dT%H:%M"),
-                "skill_refs": ["code-review"],  # M996
+                "skill_refs": ["e2e"],  # M996
+                "substar_id": updated_m.get("substar_id") or None,  # M1945: inherit parent substar
             })
             _server_log_action(proj_id, _rev_id, "auto_review_created", f"review sub-stone for {mid}")
         # M749: e2e auto-creation removed — was creating pairs ([검수]+[e2e]) per completion
@@ -9249,8 +9450,13 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
         # reply that reopens a CHILD-owned stone always woke the MOTHER instead, regardless
         # of ownership. Mirrors /execute's _owner_session resolution.
         _sid_qd = (updated_m.get("substar_id") or "").strip() if updated_m else ""
-        _owner_sess_qd = ""
-        if _sid_qd:
+        # M1916-b: session_override on the stone takes priority over substar.assigned_session —
+        # same chain as _stone_session() and _session_claimable_queued_count(). Without this,
+        # the instant wake here targeted the SUBSTAR session (ignoring override), waking the
+        # wrong session immediately; the poller's _session_claimable_queued_count (which DOES
+        # check override) then also woke the OVERRIDE session next cycle → both sessions woken.
+        _owner_sess_qd = (updated_m.get("session_override") or "").strip() if updated_m else ""
+        if not _owner_sess_qd and _sid_qd:
             for _ns_qd in (proj.get("north_stars") or []):
                 if isinstance(_ns_qd, dict) and _ns_qd.get("id") == _sid_qd:
                     _owner_sess_qd = (_ns_qd.get("assigned_session") or "").strip()
@@ -10268,86 +10474,33 @@ async def execute_project(proj_id: str, request: Request):
                                 f"  link in append_message (e.g. GDrive link). Take a Playwright screenshot,\n"
                                 f"  upload via rclone to gdrive:claude-shared/Moat/outbox/, share link.\n"
                                 f"  Non-visual work (logic fixes, CSS): describe before/after instead.\n\n"
-                                f"TOKEN DISCIPLINE (M270) — after completing a stone, post ≤3-line\n"
-                                f"  past-tense summary including the key result/finding. Do NOT add follow-up\n"
-                                f"  questions, suggestions, or clarifications unless the user asked.\n"
-                                f"  Text/analysis results → include the key conclusion in the comment (not just 'done').\n\n"
                                 f"LANGUAGE RULE (M693) — append_message text must match the stone's language.\n"
                                 f"  Korean stone text → Korean comment. English stone text → English comment.\n"
                                 f"  Mixed: use the dominant language (usually Korean for this project).\n\n"
                             )
                             if _mcp_cfg_exists:
+                                # M1869-P2: quiet-mode EXECUTE SYNC (MCP path).
+                                # Static protocol removed — covered by _HUB_EXEC_SYS_PROMPT + get_pending_task().
+                                # Dynamic sections retained: reflections, memory, waves, stone snapshot.
                                 _dispatch_body = (
-                                    f"[EXECUTE SYNC] New milestones need processing — process ALL queued milestones now.\n\n"
+                                    f"[EXECUTE SYNC] {len(_main_owned_q + new_pending)} stone(s) queued. "
+                                    f"Call mcp__ns-hub__get_pending_task() now.\n\n"
                                     + _reflection_section
                                     + _mem_section
-                                    + f"TASK RETRIEVAL — NS Hub MCP server (ns-hub) is active for this session.\n"
-                                    f"  Call mcp__ns-hub__get_pending_task() to get the next queued stone (full text + conversation[]).\n"
-                                    f"  For sub-agent lookup: mcp__ns-hub__get_task_details(task_id='<MID>')\n\n"
-                                    f"ANSWER vs IMPLEMENT CHECK (M687) — for EACH stone, inspect conversation[]:\n"
-                                    f"  • If conversation[-1].role == 'user'  → FOLLOW-UP QUESTION. Answer only.\n"
-                                    f"    Call: mcp__ns-hub__reply_to_stone(task_id='<MID>', message='<STRUCTURED: no limit | prose: ≤3 lines>')\n"
-                                    f"    Do NOT change status or re-implement.\n"
-                                    f"  • If conversation is empty OR conversation[-1].role == 'claude' → normal task.\n"
-                                    f"    Implement, then call mcp__ns-hub__report_task_complete(...).\n"
-                                    f"  This check prevents the repeat-completion bug (M687).\n\n"
-                                    f"Then TaskCreate per queued milestone, implement using DISPATCH WAVES below.\n"
-                                    f"Wave [PARALLEL] = emit ALL stones in that wave as multiple Agent calls in ONE message.\n"
-                                    f"Wave [single] = implement sequentially after prior wave completes.\n\n"
-                                    + _common_guidance
-                                    + f"PARALLEL SUB-AGENT STEPS — each sub-agent:\n"
-                                    f"  1) mcp__ns-hub__get_task_details(task_id='<MID>') for full stone\n"
-                                    f"  2) implement (Edit/Bash/Skill/Agent as needed)\n"
-                                    f"  3) mcp__ns-hub__report_task_complete(task_id, summary[, evidence_url if artifact produced])\n\n"
-                                    f"COMPLETION — when each stone is done:\n"
-                                    f"  mcp__ns-hub__report_task_complete(\n"
-                                    f"    task_id='<MID>',\n"
-                                    f"    summary='<STRUCTURED: no limit | prose: ≤3 lines, past-tense>',\n"
-                                    f"    evidence_url='<GDrive link>'  # REQUIRED if stone produced a file/image/doc/Excel/screenshot\n"
-                                    f"  )\n"
-                                    f"  RESULT UPLOAD (if artifact produced):\n"
-                                    f"    rclone copy <file> 'gdrive:claude-shared/{proj_id}/outbox/'\n"
-                                    f"    FILE_ID=$(rclone lsjson 'gdrive:claude-shared/{proj_id}/outbox/' --include '<filename>' | python3 -c \"import sys,json; d=json.load(sys.stdin); items=[x for x in d if not x.get('IsDir',False)]; print(items[0]['ID'] if items else '')\")\n"
-                                    f"    RESULT_URL=\"https://drive.google.com/file/d/$FILE_ID/view?usp=sharing\"\n"
-                                    f"    → pass RESULT_URL as evidence_url above\n"
-                                    f"  Q&A reply: mcp__ns-hub__reply_to_stone(task_id='<MID>', message='<STRUCTURED: no limit | prose: ≤3 lines>')\n"
-                                    f"  No-op: mcp__ns-hub__reply_to_stone(task_id='<MID>', message='<1-line reason>') — silent skip forbidden.\n\n"
                                     + _waves_section
-                                    + f"Newly queued:\n{_ms_snap}"
+                                    + (f"Newly queued:\n{_ms_snap}" if _ms_snap else "")
                                 )
                             else:
+                                # M1869-P2: quiet-mode EXECUTE SYNC (non-MCP/curl path).
+                                # Static protocol (MANDATORY FIRST STEP, M687 check, completion protocol) removed.
+                                # Retained: reflections, memory, waves, snapshot + the mandatory fetch reminder.
                                 _dispatch_body = (
-                                    f"[EXECUTE SYNC] New milestones need processing — process ALL queued milestones now.\n\n"
+                                    f"[EXECUTE SYNC] {len(_main_owned_q + new_pending)} stone(s) queued.\n"
+                                    f"GET {hub_api}/api/northstar/{proj_id}/milestones — read full text + conversation[] before acting.\n\n"
                                     + _reflection_section
                                     + _mem_section
-                                    + f"MANDATORY FIRST STEP — fetch the FULL stone body via\n"
-                                    f"  GET {hub_api}/api/northstar/{proj_id}/milestones\n"
-                                    f"and read the target stone's full `text` and `conversation[]`.\n"
-                                    f"The previews under 'Newly queued:' below are routing hints, NOT\n"
-                                    f"the source of truth — they are 1500-char capped and may carry a\n"
-                                    f"truncation marker. Acting on the preview alone risks dropping\n"
-                                    f"pasted content, image/file refs, or conversation context.\n\n"
-                                    f"ANSWER vs IMPLEMENT CHECK (M687) — for EACH stone, inspect conversation[]:\n"
-                                    f"  • If conversation[-1].role == 'user'  → FOLLOW-UP QUESTION. Answer only.\n"
-                                    f"    PATCH with append_message{{role:'claude', text:'<STRUCTURED: no limit | prose: ≤3 lines>'}} only.\n"
-                                    f"    Do NOT change status.\n"
-                                    f"  • If conversation is empty OR conversation[-1].role == 'claude' → normal task.\n"
-                                    f"    Implement and PATCH status=pending_confirmation + append_message.\n"
-                                    f"  This check prevents the repeat-completion bug (M687).\n\n"
-                                    f"Then TaskCreate per queued milestone, implement using DISPATCH WAVES below.\n"
-                                    f"Wave [PARALLEL] = emit ALL stones in that wave as multiple Agent calls in ONE message.\n"
-                                    f"Wave [single] = implement sequentially after prior wave completes.\n\n"
-                                    + _common_guidance
-                                    + f"PARALLEL SUB-AGENT STEPS — each sub-agent:\n"
-                                    f"  1) GET {hub_api}/api/northstar/{proj_id}/milestones for full stone\n"
-                                    f"  2) implement (Edit/Bash/Skill/Agent as needed)\n"
-                                    f"  3) PATCH status=pending_confirmation + append_message + model_used + exec_start + exec_end\n\n"
-                                    f"COMPLETION PROTOCOL — PATCH status=pending_confirmation with ALL of:\n"
-                                    f"  append_message: {{\"role\":\"claude\",\"text\":\"<STRUCTURED(bullets/table/numbered): no limit | prose: ≤3 lines, PAST TENSE — include key result/finding>\"}}\n"
-                                    f"  model_used, exec_start, exec_end\n"
-                                    f"  NO-OP: POST 1-line append_message with reason — silent skip forbidden.\n\n"
                                     + _waves_section
-                                    + f"Newly queued:\n{_ms_snap}"
+                                    + (f"Newly queued:\n{_ms_snap}" if _ms_snap else "")
                                 )
                             _entry = json.dumps({
                                 "ts": _dt_exec.now().isoformat(),
@@ -10486,18 +10639,30 @@ async def execute_project(proj_id: str, request: Request):
                                         # M1656-fork: fork from MOTHER conversation (--resume <sid> --fork-session)
                                         # so the child inherits mother context; falls back to --continue (M837-safe)
                                         _br_resume_args = _mother_fork_args(proj_id, _br_spawn_cwd)
-                                        # M1775: pre-assign session id when actually forking — see assign-spawn twin fix
-                                        _br_presigned_sid = ""
-                                        if "--fork-session" in _br_resume_args:
-                                            import uuid as _uuid_br
+                                        # M1775/M1896: pre-assign --session-id unconditionally (fork OR continue)
+                                        # so suffix(_br_sess) == live_session_id at all times.
+                                        # M1809 already set _br_sess suffix from a fresh uuid8; we derive
+                                        # _br_presigned_sid from that same suffix so the two are in sync
+                                        # without regenerating a second random uuid.
+                                        import uuid as _uuid_br
+                                        import re as _re_br_sid
+                                        _br_suffix_m = _re_br_sid.search(r'-([0-9a-f]{8})$', _br_sess)
+                                        if _br_suffix_m:
+                                            # Expand the 8-hex suffix back to a full UUID via uuid5 deterministic
+                                            # mapping is lossy — generate fresh and align suffix instead:
+                                            # suffix is already baked into _br_sess; generate presigned with
+                                            # matching prefix so [:8] == suffix.
+                                            _br_sfx = _br_suffix_m.group(1)
+                                            _br_presigned_sid = f"{_br_sfx[:8]}-{str(_uuid_br.uuid4())[9:]}"
+                                        else:
                                             _br_presigned_sid = str(_uuid_br.uuid4())
-                                            _br_resume_args = [*_br_resume_args, "--session-id", _br_presigned_sid]
+                                        _br_resume_args = [*_br_resume_args, "--session-id", _br_presigned_sid]
                                         # M1656-R9: session-scoped spawn-info record (see assign-spawn twin fix)
                                         _record_spawn_info(proj_id, _br_resume_args, agent="claude", session_name=_br_sess)
                                         _br_tdir = Path.home() / ".claude" / "projects" / _encode_cwd_for_claude(str(_br_spawn_cwd))
                                         _br_pre_files: set = set()
                                         _br_marker = None
-                                        if not _br_presigned_sid:
+                                        if False:  # M1896: presigned_sid always set now — _capture_live path retired
                                             try:
                                                 _br_pre_files = {f.name for f in _br_tdir.glob("*.jsonl")}
                                             except Exception:
@@ -10800,53 +10965,33 @@ async def execute_project(proj_id: str, request: Request):
             # Spawn tmux session — use TaskCreate/TaskUpdate (Claude Code built-in) for task tracking
             _cron_mem_section = _load_stone_memory(proj_id)
             # M472: build per-stone implementation steps (shared by both parallel and sequential sections)
+            # M1869-P1: _stone_impl_steps compressed — removed verbose duplication with
+            # _HUB_EXEC_SYS_PROMPT (skill protocol, gdrive rule) and collapsed rclone macro.
+            # Before: ~1381 tok. After: ~580 tok. Savings: ~800 tok/wake.
+            _rclone_evd = (
+                f"     rclone copy <file> 'gdrive:claude-shared/{proj_id}/outbox/' && "
+                f"FILE_ID=$(rclone lsjson 'gdrive:claude-shared/{proj_id}/outbox/' --include '<file>' | python3 -c \"import sys,json;d=json.load(sys.stdin);print(next((x['ID'] for x in d if not x.get('IsDir')),'' ))\") && "
+                f"RESULT_URL=\"https://drive.google.com/file/d/$FILE_ID/view?usp=sharing\"\n"
+            )
+            # M1869-P3-A: _stone_impl_steps — removed steps already covered by MCP tool descriptions:
+            # step 1b (skill_refs) → get_pending_task tool desc; step 5 PATCH format + 5a rclone evd
+            # → report_task_complete tool desc; step 5b [검수] child → report_task_complete CHILD STONE PRE-CHECK.
+            # Retained: silent-work rule, task status updates, milestones GET URL, implement, completion-log,
+            # 5c [검수] screenshot (Playwright-specific context not in tool desc).
             _stone_impl_steps = (
-                f"  Per-stone implementation steps:\n"
-                f"  ❌ NO reply_to_stone before completing — do NOT post 'starting...', '분석 중', or any in-progress status. Work silently; report ONLY on completion.\n"
-                f"  1. TaskUpdate(<id>, status='in_progress')\n"
-                f"  1b. SKILL/AGENT INVOCATION (M770 strengthened — current invoke rate is only ~4% vs annotations):\n"
-                f"      • If stone text or USER MSG carries [skill:/name] or [agent:name] OR `skill_refs`/`agent_refs` array → MANDATORY: invoke Skill(skill='name') / Agent(subagent_type='name') as the FIRST tool call BEFORE GET/Edit/anything.\n"
-                f"      • This applies even in REPLY MODE and even when delegating to sub-agents (orchestrator must invoke skill itself, NOT skip because it's reply-only).\n"
-                f"      • M1565 SEQUENTIAL CHAIN: if get_pending_task response has `skill_refs_remaining` (non-empty), after the first Skill() completes call each skill in skill_refs_remaining in ORDER — never skip.\n"
-                f"      • Skipping any skill = silent failure. The skill_refs field on user msgs (visible in conversation[]) is the source of truth — re-check every PATCH cycle.\n"
-                f"      • M1121 TOKEN GUARDRAIL: NEVER autonomously invoke deep-research, live, live-inf, or any skill that uses the Workflow tool — these consume millions of tokens. Only invoke skills explicitly listed in skill_refs/agent_refs. If a stone seems research-related but has NO skill_refs, use direct WebSearch tool calls instead.\n"
+                f"  Per-stone steps:\n"
+                f"  ❌ Silent work — NO reply_to_stone before completion.\n"
+                f"  1. TaskUpdate(<id>, 'in_progress')\n"
                 f"  2. GET {hub_api}/api/northstar/{proj_id}/milestones — read full text + conversation[].\n"
-                f"  3. Edit/write files to implement the milestone.\n"
-                f"  4. Append completion-log:\n"
-                f'     echo \'{{\"session_id\":\"exec\",\"milestone_id\":\"<MID>\",\"evidence\":\"<one-line summary>\",\"timestamp\":\"\'$(date -Iseconds)\'\"}}\' >> ~/.hub/projects/{proj_id}/completion-log.jsonl\n'
-                f"  5. PATCH {hub_api}/api/northstar/{proj_id}/milestones/<MID> body:\n"
-                f'     {{"status":"pending_confirmation","model_used":"claude-sonnet-4-6","session_id":"$CLAUDE_CODE_SESSION_ID","exec_start":"<ISO start>","exec_end":"$(date -Iseconds)","append_message":{{"role":"claude","text":"<STRUCTURED(bullets/table): no limit | prose: ≤3 lines PAST TENSE — what was done + key result/finding>"}}}}\n'
-                f"     append_message = MANDATORY — ALWAYS include. Omitting it leaves the stone with no reply\n"
-                f"       visible to the user (server inserts '완료.' as emergency fallback but it is generic).\n"
-                f"       RULE: append_message in the SAME PATCH as status=pending_confirmation. Past tense only.\n"
-                f"  5 RESULT DELIVERY (M1133): if the stone produced a shareable artifact (image, document, code file,\n"
-                f"     Excel, PDF, analysis, screenshot), you MUST include it in the completion PATCH as evidence_url.\n"
-                f"     This populates the 'result' badge the user clicks to see the output.\n"
-                f"     ① Upload to GDrive: rclone copy <local-file> 'gdrive:claude-shared/{proj_id}/outbox/'\n"
-                f"     ② Get link (M1239 fast):  FILE_ID=$(rclone lsjson 'gdrive:claude-shared/{proj_id}/outbox/' --include '<filename>' | python3 -c \"import sys,json; d=json.load(sys.stdin); items=[x for x in d if not x.get('IsDir',False)]; print(items[0]['ID'] if items else '')\")\n"
-                f"                               RESULT_URL=\"https://drive.google.com/file/d/$FILE_ID/view?usp=sharing\"\n"
-                f"     ③ Add to PATCH:     \"evidence_url\": \"$RESULT_URL\"\n"
-                f"     If result is text/analysis only (no file): include the key summary in append_message instead.\n"
-                f"     evidence_url is shown to the user as the 'result' badge on the stone — always provide it\n"
-                f"     when the user explicitly asked for a document, image, file, or code output.\n"
-                f"  5b. [검수] AUTO-REVIEW (M767/M1137): if the stone you just completed involved writing or modifying code,\n"
-                f"      immediately CREATE a [검수] child stone using the MCP tool (NOT curl/bash):\n"
-                f"      mcp__ns-hub__create_child_stone(parent_id=\"<MID>\", text=\"[검수] <MID>: <1-line change summary>\\n적용내용: <what you actually changed>\\n→ 위 변경이 화면에서 잘 동작하는지만 확인: ①무엇이 바뀌었나 1줄+변경파일 ②화면 실측(의도대로 동작? UI면 스크린샷 1장) ③깨짐/빈값 빠르게 점검 ④판정: 동작 OK / 수정 필요+이유 1줄\", status=\"queued\")\n"
-                f"      QUALITY RULE: <change summary> and 적용내용 must name the SPECIFIC functions/files changed (e.g. '_db_save_single_milestone in server.py') so the reviewer understands the real change.\n"
-                f"                   This is a SCREEN VERIFICATION (does the applied update work?), not a full code audit — keep it concrete and lightweight.\n"
-                f"      Skip if: stone is research/reply/question only, no files edited, or [검수] child already exists.\n"
-                f"  5c. [검수] RESULT SCREENSHOT (M817/M1133): if THIS stone IS a [검수] stone (text starts with '[검수]'),\n"
-                f"      after completing the review, capture a Playwright screenshot of the affected UI feature\n"
-                f"      and attach it as the 'result' badge:\n"
-                f"      ① Take screenshot: mcp__playwright-session-1__browser_navigate to http://127.0.0.1:{PORT}/northstar,\n"
-                f"         then mcp__playwright-session-1__browser_take_screenshot with\n"
-                f"         filename='${{HOME}}/.playwright-mcp/review-<MID>-result.png'\n"
-                f"      ② Upload: rclone copy ${{HOME}}/.playwright-mcp/review-<MID>-result.png 'gdrive:claude-shared/{proj_id}/outbox/'\n"
-                f"         FILE_ID=$(rclone lsjson 'gdrive:claude-shared/{proj_id}/outbox/' --include 'review-<MID>-result.png' | python3 -c \"import sys,json; d=json.load(sys.stdin); items=[x for x in d if not x.get('IsDir',False)]; print(items[0]['ID'] if items else '')\")\n"
-                f"         RESULT_URL=\"https://drive.google.com/file/d/$FILE_ID/view?usp=sharing\"\n"
-                f"      ③ Include in completion PATCH: add \"evidence_url\":\"$RESULT_URL\" to the PATCH body.\n"
-                f"      Skip if: reviewed stone was research/docs only (no UI to screenshot).\n"
-                f"  6. TaskUpdate(<id>, status='completed')\n\n"
+                f"  3. Implement (Edit/Write files).\n"
+                f"  4. completion-log: echo '{{\"session_id\":\"exec\",\"milestone_id\":\"<MID>\",\"evidence\":\"<summary>\",\"timestamp\":\"'$(date -Iseconds)'\"}}' >> ~/.hub/projects/{proj_id}/completion-log.jsonl\n"
+                f"  5. report_task_complete(task_id='<MID>', summary='...') — see MCP tool desc for PATCH format, rclone upload, [검수] child stone rules.\n"
+                f"  5d. M190 blocked (parent already has claude comment + follow-up work done) → create_child_stone(parent_id='<MID>', text='[진행 N/M] <MID>: <1-line result>', status='pending_confirmation', is_progress=True) + reply_to_stone(child_id, detail). Do NOT use status=queued (free-pool claim risk).\n"
+                f"  5c. [검수] stone (text starts '[검수]') → screenshot result badge:\n"
+                f"      mcp__playwright-session-1__browser_navigate http://127.0.0.1:{PORT}/northstar → browser_take_screenshot filename='${{HOME}}/.playwright-mcp/review-<MID>-result.png'\n"
+                + _rclone_evd.replace("<file>", "review-<MID>-result.png") +
+                f"      Add evidence_url to report_task_complete. Skip if research/docs only.\n"
+                f"  6. TaskUpdate(<id>, 'completed')\n\n"
             )
             cron_prompt = _cron_mem_section + (
                 f"[EXECUTE SYNC] Project {proj_id} — Execute clicked. PRIMARY GOAL: implement ALL queued milestones.\n\n"
@@ -10867,7 +11012,6 @@ async def execute_project(proj_id: str, request: Request):
                 + _stone_impl_steps
                 + f"ORCHESTRATOR — after all waves complete:\n"
                 f"  Post ONE consolidated summary listing completed MIDs (STRUCTURED: no limit; prose: ≤3 lines).\n\n"
-                f"TOKEN DISCIPLINE: NO progress comments during work. ONE past-tense summary at completion.\n\n"
                 f"CAVEMAN LITE MODE (M582): Terse output — drop filler/politeness, keep technical precision. ~60% fewer output tokens.\n\n"
                 + (
                     f"BRANCHED SESSIONS: substar-assigned queued stones are handled by their per-substar tmux sessions "
@@ -11040,6 +11184,9 @@ async def execute_project(proj_id: str, request: Request):
             if not _was_true_resume and agent in (None, "claude", "openrouter") and not resume_args:
                 resume_args = ["--session-id", _presigned_main_sid]
             _record_spawn_info(proj_id, resume_args, agent=agent, session_name=session_name, is_mother=True)
+            # M1896: clear stale live_session_id cache so the poller reads fresh spawn-info
+            # instead of returning a previous session's UUID under the same session_name.
+            _live_sid_cache.pop(session_name, None)
             _tmux_env = [
                 "-e", f"CLAUDE_CODE_TASK_LIST_ID=hub-exec-{proj_id}",
                 "-e", f"NS_HUB_URL=http://{_tailscale_interface_ip()}:{PORT}",
@@ -11155,7 +11302,15 @@ async def execute_project(proj_id: str, request: Request):
             # M1795: force_dedup_reset=True — if user killed a session and re-spawned, the new
             # session shares the same session_name; _wake_last_sent[session_name] may hold a
             # timestamp <90s old, silently suppressing the post-spawn wake injection.
-            if new_queued_top or _substar_queued_top:
+            # M1912: session-scoped wake gate — replace project-wide _substar_queued_top with
+            # stones actually claimable by THIS session: ungrouped (no substar_id) go to main,
+            # assigned substars only wake their own session. Prevents non-main sessions being
+            # woken for other sessions' substar stones (_substar_queued_top was project-wide).
+            _this_session_has_work = bool(
+                _main_qs  # ungrouped stones → always this session's
+                or _session_qs.get(session_name)  # substar stones explicitly assigned here
+            )
+            if _this_session_has_work:
                 _send_exec_wake(session_name, proj_id, force_dedup_reset=True)
 
             # M747/M792: spawn per-session sessions after main session is live
@@ -11205,10 +11360,16 @@ async def execute_project(proj_id: str, request: Request):
                     # reaching this point either already spawned via that path (and lands in
                     # _alive_branch_keys, skipping this loop entirely) or has no known prior
                     # transcript to target — --continue is the correct fallback either way.
-                    _ss_resume_args: list = ["--continue"]
+                    # M1936: presign a UUID so live_session_id is known at spawn time — same
+                    # pattern as M1803/M1775 for the main session. Without this, --continue
+                    # sub-sessions left live_session_id="" forever (mtime scan ran immediately
+                    # after Popen, before Claude had written any .jsonl, so no candidate found).
+                    import uuid as _uuid_ss
+                    _ss_presigned_sid = str(_uuid_ss.uuid4())
+                    _ss_resume_args: list = ["--session-id", _ss_presigned_sid]
                     _encoded_cwd = _encode_cwd_for_claude(spawn_cwd)
                     _transcripts_dir = Path.home() / ".claude" / "projects" / _encoded_cwd
-                    # M837: --resume blocks removed; --continue is stable. Priority 2 block removed.
+                    # M1944: presigned --session-id path (M1896 removed --continue entirely).
                     subprocess.Popen([
                         "tmux", "new-session", "-d", "-s", _ss_sname,
                         "-c", spawn_cwd,
@@ -11217,6 +11378,28 @@ async def execute_project(proj_id: str, request: Request):
                         *_ss_resume_args,
                     ])
                     subprocess.run(["tmux", "set-option", "-t", _ss_sname, "history-limit", "5000"], capture_output=True, timeout=2)
+                    # M1936: write spawn-info + live_session_id immediately — same as M1803 main path.
+                    # Pass None for model so _record_spawn_info reads the project default (same as
+                    # it would for a main session when no explicit model is provided).
+                    _record_spawn_info(proj_id, _ss_resume_args, agent="claude", session_name=_ss_sname)
+                    _write_sid_direct(proj_id, _ss_sname, _ss_presigned_sid)
+                    # M1944: align assigned_session suffix with presigned UUID so tmux name and
+                    # live_session_id are consistent — mirrors update_north_star's L7054 logic.
+                    _ss_aligned_suffix = _ss_presigned_sid.replace("-", "")[:8]
+                    _ss_aligned_name = f"claude-exec-{proj_id}-{_ss_aligned_suffix}"
+                    if _ss_aligned_name != _skey:
+                        try:
+                            _proj_data = _db_load_project(proj_id)
+                            _ns_list2 = _proj_data.get("north_stars", []) if _proj_data else []
+                            for _ns2 in _ns_list2:
+                                if _ns2.get("assigned_session") == _skey:
+                                    _ns2["assigned_session"] = _ss_aligned_name
+                                    _save_project(proj_id, _proj_data)
+                                    _server_log_action(proj_id, "", "exec:substar_suffix_aligned",
+                                                       f"{_skey} → {_ss_aligned_name}")
+                                    break
+                        except Exception:
+                            pass
                     _newly_spawned.append((_ss_sname, time.time()))
                 _server_log_action(proj_id, "", "exec:substar_branch",
                                    f"spawned {len(_newly_spawned)} new + {len(_alive_branch_keys)} reused sessions: "
@@ -11417,6 +11600,24 @@ async def fork_session(proj_id: str, request: Request):
                     _server_log_action(proj_id, _src_stone or "", "exec:fork_truncated",
                                        f"source:{_src_sess_name} orig_sid:{source_sid} cut_sid:{_cut_sid}")
                     _fork_source_sid = _cut_sid
+            else:
+                # M1980: idle-session fork — source session is done but transcript ends with
+                # a hub-wake exchange. If not truncated, the child inherits "Tasks ready. Call
+                # get_pending_task()..." and re-executes the last stone on startup (observed:
+                # FRWP capital-flow roadmap rebuilt twice). Cut before the last hub-wake turn.
+                _cut_sid = _truncate_transcript_before_last_hub_wake(src_t)
+                if _cut_sid:
+                    _server_log_action(proj_id, "", "exec:fork_truncated",
+                                       f"source:{_src_sess_name} orig_sid:{source_sid} cut_sid:{_cut_sid} reason:idle-hub-wake")
+                    _fork_source_sid = _cut_sid
+        else:
+            # M1980: source session not in agent_busy_sessions (e.g. very old session, hub
+            # restarted). Still apply hub-wake truncation by scanning transcript directly.
+            _cut_sid = _truncate_transcript_before_last_hub_wake(src_t)
+            if _cut_sid:
+                _server_log_action(proj_id, "", "exec:fork_truncated",
+                                   f"source:(unknown) orig_sid:{source_sid} cut_sid:{_cut_sid} reason:idle-hub-wake-fallback")
+                _fork_source_sid = _cut_sid
     except Exception:
         pass  # any failure — fall back to raw fork below (M1679 has the same fallback contract)
     resume_args = ["--resume", _fork_source_sid, "--fork-session", "--session-id", presigned_sid]
@@ -12013,6 +12214,9 @@ async def update_layout(proj_id: str, request: Request):
 # Only USER-originated events emit here — claude-originated mutations (autonomous PATCH,
 # M222 auto-flip, append_message role:claude) MUST NOT call _ns_push().
 _NS_PUSH_SUBSCRIBERS: list[asyncio.Queue] = []
+# M1899-R17: ring buffer for mobile long-poll. Max 60 events; older entries dropped.
+import collections as _collections
+_NS_PUSH_BUF: _collections.deque = _collections.deque(maxlen=60)
 
 # M389: Telegram-only push notifications (ntfy removed)
 _TG_TOKEN_FILE = _HUB_DATA_DIR / ".telegram-token"
@@ -12138,6 +12342,7 @@ def _ns_push(event_type: str, **payload):
     """Broadcast a user-originated event to every connected SSE subscriber.
     Non-blocking — queues full are dropped so a slow tab can't stall the server."""
     data = {"event": event_type, "ts": time.time(), **payload}
+    _NS_PUSH_BUF.append(data)  # M1899-R17: also buffer for mobile long-poll
     for q in list(_NS_PUSH_SUBSCRIBERS):
         try:
             q.put_nowait(data)
@@ -12159,7 +12364,7 @@ async def notifications_stream(request: Request):
                 if await request.is_disconnected():
                     break
                 try:
-                    data = await asyncio.wait_for(q.get(), timeout=25.0)
+                    data = await asyncio.wait_for(q.get(), timeout=180.0)  # M1899-R5: 45s→90s; M1899-R7: 90s→180s (ROLLBACK: change 180.0 back to 90.0) — halves radio wakeup on mobile
                     yield f"event: {data['event']}\ndata: {json.dumps(data)}\n\n"
                 except asyncio.TimeoutError:
                     # heartbeat — comment line, ignored by EventSource
@@ -12169,6 +12374,15 @@ async def notifications_stream(request: Request):
             except ValueError: pass
     return StreamingResponse(gen(), media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/notifications/poll")
+async def notifications_poll(since: float = 0):
+    """M1899-R17: Mobile long-poll endpoint. Returns events from _NS_PUSH_BUF newer than
+    `since` (Unix epoch seconds, float). Client passes last received event ts as since.
+    Max 60 events buffered; events older than buffer window are silently dropped."""
+    events = [e for e in list(_NS_PUSH_BUF) if e["ts"] > since]
+    return JSONResponse({"ok": True, "events": events, "server_ts": time.time()})
 
 
 # M238: server-backed swimlane memo (survives hub restarts; localStorage was per-browser only).
@@ -12295,6 +12509,7 @@ async def kill_exec_session(proj_id: str):
     except Exception:
         pass
     _exec_sessions_cache["ts"] = 0.0  # M1557: invalidate cache so next poll reflects kill immediately
+    _bg_tmux_state["ts"] = 0.0  # M1963: force on-demand tmux query (bg cache may be up to 3s stale)
     # M1613: push SSE so client clears exec-pane immediately (no 8s poll wait)
     if killed_sessions:
         _ns_push("session_idle", proj_id=proj_id, kind="exec")
@@ -12339,6 +12554,7 @@ async def kill_named_tmux_session(proj_id: str, session_name: str):
         pass
 
     _exec_sessions_cache["ts"] = 0.0  # M1557: invalidate cache so next poll reflects kill immediately
+    _bg_tmux_state["ts"] = 0.0  # M1963: force on-demand tmux query (bg cache may be up to 3s stale)
     # M1663: push SSE so client clears exec-pane immediately (no poll-wait) — this endpoint
     # was missing the push that _kill_all_exec_sessions' sibling (/exec-session DELETE) already had,
     # so single/branched-session kills relied purely on client-side burst-poll and lagged visibly.
@@ -13748,6 +13964,20 @@ async def ns_sessions():
     return JSONResponse(result)
 
 
+@app.get("/api/northstar/mobile-status")
+async def ns_mobile_status():
+    """M1899-R20: Mobile batch endpoint — sessions + exec-sessions in one HTTP round trip.
+    Halves TCP connections vs Promise.all([fetch(sessions), fetch(exec-sessions)]).
+    ROLLBACK: remove this endpoint; revert client to Promise.all of 2 fetches."""
+    sess_resp = await ns_sessions()
+    exec_resp = await get_exec_sessions()
+    import json as _json
+    return JSONResponse({
+        "sessions": _json.loads(sess_resp.body),
+        "exec": _json.loads(exec_resp.body),
+    })
+
+
 @app.get("/api/northstar/resume-info")
 async def ns_resume_info():
     """Per-project resume-data inventory for the swimlane badge.
@@ -14360,31 +14590,14 @@ def _spawn_entity_corpus() -> "subprocess.Popen | None":
         return None
 
 
-_HUB_GLOBAL_BLOCK = (
-    "## NS Hub Protocol (auto-injected by hub install-global)\n"
-    "<!-- NS_HUB_GLOBAL_START -->\n"
-    "Stone lifecycle: queued → pending_confirmation → done.\n"
-    "COMPLETION PROTOCOL: PATCH status=pending_confirmation + append_message.role=claude + exec_start + exec_end + model_used (all in one PATCH).\n"
-    "PARALLEL DISPATCH: 2+ independent queued stones → emit multiple Agent calls in ONE message.\n"
-    "NO-OP PROTOCOL: if skipping a stone, post 1-line reason via append_message. Silent skip forbidden.\n"
-    "TOKEN DISCIPLINE: after completion post structured or ≤3-line prose summary including key result/finding. No follow-up questions.\n"
-    "<!-- NS_HUB_GLOBAL_END -->\n"
-)
-
-_HUB_PROJECT_BLOCK_TEMPLATE = """\
-## NS Hub — Project Config (auto-injected by hub init)
-<!-- NS_HUB_PROJECT_START -->
-Hub URL: {hub_url}
-Project ID: {proj_id}
-API base: {hub_url}/api/northstar/{proj_id}
-Exec: GET /milestones  →  implement  →  PATCH /{{mid}} {{status,append_message,exec_start,exec_end,model_used}}
-Log completion: append to {proj_dir}/completion-log.jsonl {{"mid":..., "summary":..., "ts":...}}
-<!-- NS_HUB_PROJECT_END -->
-"""
-
-
 def _hub_init(proj_id=None, proj_dir=None):
-    """Write NS Hub project config block to CLAUDE.md in current directory."""
+    """Register a project with NS Hub (DB + optional CLAUDE.md cleanup).
+
+    M1925: CLAUDE.md block removed — MCP tool descriptions carry all protocol
+    context that the old raw-REST block provided. project CLAUDE.md is now
+    hub-agnostic (M1347 policy enforced).
+    """
+    import re as _re
     cwd = Path(proj_dir) if proj_dir else Path.cwd()
     pid = proj_id or cwd.name
     _h = os.environ.get("HUB_HOST", HOST)
@@ -14395,22 +14608,38 @@ def _hub_init(proj_id=None, proj_dir=None):
         except Exception:
             _h = "127.0.0.1"
     hub_url = f"http://{_h}:{PORT}"
+
+    # -- 1. Register project in DB (idempotent) --
+    existing = _db_load_project(pid)
+    if existing is None:
+        project_data = {
+            "name": pid, "metric": "", "current": "", "target": "",
+            "status": "paused", "deadline": "", "note": "",
+            "connections": [], "north_stars": [], "layer": 0, "x": None, "y": None,
+            "repo_path": str(cwd),
+        }
+        _db_save_project(pid, project_data)
+        print(f"Registered project '{pid}' in hub DB")
+    else:
+        print(f"Project '{pid}' already registered")
+
+    # -- 2. Clean up legacy NS Hub block from CLAUDE.md if present --
     claude_md = cwd / "CLAUDE.md"
-    block = _HUB_PROJECT_BLOCK_TEMPLATE.format(hub_url=hub_url, proj_id=pid, proj_dir=str(cwd))
     if claude_md.exists():
         text = claude_md.read_text(encoding="utf-8")
         if "<!-- NS_HUB_PROJECT_START -->" in text:
-            import re as _re
-            text = _re.sub(r"## NS Hub — Project Config.*?<!-- NS_HUB_PROJECT_END -->", block.strip(), text, flags=_re.DOTALL)
-        else:
-            text = text.rstrip() + "\n\n" + block
-        claude_md.write_text(text, encoding="utf-8")
-        print(f"Updated {claude_md}")
-    else:
-        claude_md.write_text(f"# {pid} — Claude Instructions\n\n" + block, encoding="utf-8")
-        print(f"Created {claude_md}")
+            cleaned = _re.sub(
+                r"\n*## NS Hub — Project Config.*?<!-- NS_HUB_PROJECT_END -->\n*",
+                "\n", text, flags=_re.DOTALL
+            ).strip()
+            claude_md.write_text(cleaned + "\n", encoding="utf-8")
+            print(f"Removed legacy NS Hub block from {claude_md}")
+
     print(f"  Hub URL : {hub_url}")
     print(f"  Project : {pid}")
+    print(f"  Dashboard: {hub_url}/northstar")
+    print()
+    print("Next: restart Claude Code so hooks + MCP are active, then open the dashboard.")
 
 
 _HUB_HOOKS_DIR = Path(__file__).parent / "static" / "hooks"
@@ -14429,6 +14658,16 @@ _HUB_SETTINGS_HOOKS = {
     "Stop": [
         # F2: idle signal when claude session ends
         {"type": "command", "command": "python3 $HOME/.hub/static/hooks/northstar-stop-idle.py", "async": True},
+    ],
+    # M1951: compact + subagent busy coverage — previously missing from install-global
+    "PreCompact": [
+        {"type": "command", "command": "python3 $HOME/.hub/static/hooks/northstar-precompact-busy.py", "async": False},
+    ],
+    "SubagentStart": [
+        {"type": "command", "command": "python3 $HOME/.hub/static/hooks/northstar-subagent-busy.py", "async": False},
+    ],
+    "SubagentStop": [
+        {"type": "command", "command": "python3 $HOME/.hub/static/hooks/northstar-subagent-busy.py", "async": False},
     ],
 }
 
@@ -14523,7 +14762,10 @@ def _hub_generate_systemd_unit():
     Idempotent: skips if a unit already exists with the correct uvicorn path (avoids
     clobbering hand-tuned units on existing installs); does NOT reload/restart the service —
     that's the operator's call (`systemctl --user daemon-reload && systemctl --user restart hub`)."""
-    import shutil as _shutil_su
+    import shutil as _shutil_su, platform as _plat
+    if _plat.system() == "Darwin":
+        print("macOS detected — systemd is not available. Start hub manually with `hub` or add it to your shell login profile (e.g. ~/.zprofile). A launchd plist is not generated automatically.")
+        return
     uvicorn_bin = _shutil_su.which("uvicorn")
     if not uvicorn_bin:
         print("uvicorn not found on PATH — skipping systemd unit generation.")
@@ -14597,7 +14839,8 @@ def _hub_doctor(exit_code: bool = False):
 
     # core hooks (stone-ctx-hook.py excluded — CTX-feature-specific, not auto-deployed)
     _core_hooks = ["northstar-pretool-busy.py", "northstar-stop-idle.py",
-                   "northstar-action-log.py"]
+                   "northstar-action-log.py", "northstar-precompact-busy.py",
+                   "northstar-subagent-busy.py"]
     _all_hook_cmds = " ".join(
         h.get("command", "")
         for ev in _sd.get("hooks", {}).values()
@@ -14638,30 +14881,21 @@ def _hub_ensure_env_file():
 
 
 def _hub_install_global():
-    """Write NS Hub global protocol block to ~/.claude/CLAUDE.md (once) and deploy hooks.
+    """Deploy hub hooks and systemd unit. Does NOT touch user CLAUDE.md.
     M1694b: CTX (bm25-memory, chat-memory, vec-daemon, etc.) is a fully independent,
     separately-installed project — hub does NOT own, bundle, or deploy CTX hooks. The only
     hub-owned hooks auto-deployed here are: northstar-pretool-busy.py, northstar-stop-idle.py,
     northstar-action-log.py (tool_trace causality dataset collection, see _HUB_SETTINGS_HOOKS).
     stone-ctx-hook.py lives in static/hooks/ but is CTX-feature-specific — NOT auto-deployed
-    by install-global. Users who enable CTX must register it manually."""
+    by install-global. Users who enable CTX must register it manually.
+    M1869: CLAUDE.md injection removed — _HUB_GLOBAL_BLOCK was 100% duplicate of
+    _HUB_EXEC_SYS_PROMPT (injected via --append-system-prompt on every exec session spawn).
+    Writing to user's ~/.claude/CLAUDE.md is user-environment pollution; exec sessions already
+    receive all hub protocol rules through the MCP spawn path."""
     _hub_ensure_env_file()  # F5: must precede systemd unit gen (unit references this file)
     _hub_deploy_hooks()
     _hub_generate_systemd_unit()
-    global_md = Path.home() / ".claude" / "CLAUDE.md"
-    if not global_md.parent.exists():
-        global_md.parent.mkdir(parents=True, exist_ok=True)
-    if global_md.exists():
-        text = global_md.read_text(encoding="utf-8")
-        if "<!-- NS_HUB_GLOBAL_START -->" in text:
-            print(f"Global hub protocol already present in {global_md} — skipping.")
-            return
-        text = text.rstrip() + "\n\n" + _HUB_GLOBAL_BLOCK
-        global_md.write_text(text, encoding="utf-8")
-        print(f"Appended global hub protocol to {global_md}")
-    else:
-        global_md.write_text(_HUB_GLOBAL_BLOCK, encoding="utf-8")
-        print(f"Created {global_md} with global hub protocol")
+    print("\n⚠  Restart Claude Code now to activate MCP + hooks: close all Claude Code windows and reopen.\n")
 
 
 # ── M561: Data collection consent ─────────────────────────────────────────────
@@ -14708,16 +14942,16 @@ def _compress_trigger_reason(parent: dict) -> str | None:
             v = (parent.get(k) or "")
             if "[compress]" in str(v).lower():
                 return "explicit"
-        # Trigger 1: length-based (lowered from 25/10 → 10/5 per M1253 user feedback)
-        if conv_len >= 10 and (conv_len - last_len) >= 5:
+        # Trigger 1: length-based (M1253: 25/10→10/5; M1869-P2: delta 5→3 for more frequent compression)
+        if conv_len >= 10 and (conv_len - last_len) >= 3:
             return "length"
         # Trigger 2: token-based (API-key env only — subscription users have no token fields,
         # so tok=0 always and this branch never fires; effectively a no-op in that case)
         tok = int(parent.get("input_tokens") or 0) + int(parent.get("output_tokens") or 0)
-        if tok >= 50_000 and (conv_len - last_len) >= 5:
+        if tok >= 50_000 and (conv_len - last_len) >= 3:
             return "tokens"
         # Trigger 3: time-based — stagnant >= 7 days
-        if conv_len > 10 and (conv_len - last_len) >= 5:
+        if conv_len > 10 and (conv_len - last_len) >= 3:
             last_ts = conv[-1].get("ts") or ""
             if last_ts:
                 try:
@@ -14784,6 +15018,8 @@ def _maybe_queue_compress(proj_id: str, parent: dict, milestones: list, reason_o
             "text": (
                 f"[compress] (trigger: {reason}) Read stone {parent_id}'s full conversation, write a 3-8 line summary "
                 f"of key decisions/constraints/open items, then call compress_summary(task_id='{parent_id}', summary='<your-summary>'). "
+                f"If the stone already has a conversation_summary field, your summary should cover the FULL arc (old context + new turns) — "
+                f"compress_summary will auto-merge old ‖ new so do NOT duplicate the old text verbatim. "
                 f"Do NOT touch other status fields. This is a meta task — keep it brief."
             ),
             "status": "queued",
@@ -15544,6 +15780,38 @@ def _hub_configure(args: list[str]) -> None:
 def main():
     import sys
     args = sys.argv[1:]
+
+    # BUG-01/02: --help and --version must not start the server
+    if args and args[0] in ("--help", "-h", "help"):
+        print(
+            "claude-ns-hub — Personal AI project hub for Claude Code users.\n\n"
+            "Usage: hub [COMMAND] [OPTIONS]\n\n"
+            "Commands:\n"
+            "  (no command)       Start the hub server\n"
+            "  install-global     Register MCP + hooks in ~/.claude/settings.json\n"
+            "  init <proj> --dir  Register a project directory\n"
+            "  doctor             Run system health checks\n"
+            "  configure          Set default agent/model/hub_url\n\n"
+            "Options:\n"
+            "  --port PORT        Bind to specific port (default: 9001)\n"
+            "  --db PATH          Use custom SQLite DB path\n"
+            "  --help             Show this help message\n"
+            "  --version          Show version and exit\n\n"
+            "Quick start:\n"
+            "  hub                      # start server at http://localhost:9001\n"
+            "  hub install-global       # one-time setup (run after install)\n"
+            "  hub doctor               # verify all components are working\n"
+        )
+        return
+
+    if args and args[0] in ("--version", "-V", "version"):
+        from importlib.metadata import version as _pkg_version
+        try:
+            _v = _pkg_version("claude-ns-hub")
+        except Exception:
+            _v = "unknown"
+        print(f"claude-ns-hub {_v}")
+        return
 
     if args and args[0] == "init":
         pid = None

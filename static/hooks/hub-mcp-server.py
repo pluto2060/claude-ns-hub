@@ -158,13 +158,23 @@ TOOLS = [
             "Use ONLY for [compress] meta-tasks — read parent stone's full conversation, write a concise summary, "
             "call with the PARENT stone's task_id (not the meta-task id). "
             "evidence_url belongs in report_task_complete, not here. "
-            "Updates summary_state.last_compressed_len so compress won't re-fire until conversation grows further."
+            "Updates summary_state.last_compressed_len so compress won't re-fire until conversation grows further. "
+            "CHAR BUDGET: write the summary field at ≤1500 chars. The server merges it with the prior summary "
+            "(‖ chain); combined must stay under 8000 chars. Write dense facts/decisions/blockers only — "
+            "no boilerplate, no preamble. This is the primary guard against unbounded summary growth. "
+            "M168 FACTS RULE: The summary field must NEVER re-state, paraphrase, or re-summarize key=value lines "
+            "from the ## FACTS section of MEMORY.md. Those entries use overwrite semantics and are injected "
+            "automatically by the server — omit them entirely from your summary text. "
+            "RE-COMPRESS FALLBACK: If the tool returns ok=False with 'previous_summary' in the response, "
+            "the ‖ chain already exceeded 8000 chars (likely from old sessions before this rule). "
+            "Re-compress: merge 'previous_summary' + your new summary into a single coherent text under 7500 chars, "
+            "then call compress_summary again. Do NOT drop content arbitrarily — synthesize intelligently."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "task_id": {"type": "string"},
-                "summary": {"type": "string", "description": "Concise 3-8 line summary of the conversation's key decisions, constraints, and open items. Required."},
+                "summary": {"type": "string", "description": "Concise summary of key decisions, constraints, and open items. HARD LIMIT: ≤1500 chars — the server merges your new summary with the prior accumulated summary (‖ chain), and the combined result must stay under 8000 chars. Write dense, information-rich prose: drop boilerplate, keep facts, decisions, and blockers only. NEVER include MEMORY.md ## FACTS key=value lines — server auto-prepends them. Required."},
             },
             "required": ["task_id", "summary"],
         },
@@ -237,8 +247,9 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "parent_id": {"type": "string"},
-                "text": {"type": "string", "description": "Full text of the child stone"},
-                "status": {"type": "string", "enum": ["queued", "pending", "needs_clarification"], "description": "queued=ready to execute (default), pending=blocked/waiting, needs_clarification=missing info"},
+                "text": {"type": "string", "description": "Full text of the child stone. For M190-bypass progress updates use '[진행 N/M] parentMID: step name' convention."},
+                "status": {"type": "string", "enum": ["queued", "pending", "needs_clarification", "pending_confirmation"], "description": "queued=ready to execute (default), pending=blocked/waiting, needs_clarification=missing info, pending_confirmation=M190 bypass progress update (auto-collapsed in UI, not dispatched to other sessions)"},
+                "is_progress": {"type": "boolean", "description": "True = this is a mid-flight progress-update child (M190 bypass pattern). UI auto-collapses these under the parent; they are NOT dispatched to the free-pool queue."},
             },
             "required": ["parent_id", "text"],
         },
@@ -748,6 +759,23 @@ def handle_report_task_complete(
     except HubHTTPError as e:
         # M1709: same fix as handle_reply_to_stone — surface the server's structured
         # error body (e.g. reply_line_limit_blocked detail) instead of a bare HTTP status.
+        # M1941: if M190 blocked the append_message (claude→claude consecutive write),
+        # the evidence_url was bundled in the same PATCH and silently discarded with the 409.
+        # Fallback: attach evidence_url-only via a separate PATCH so the evd badge is not lost
+        # even when the completion summary cannot be written (e.g. subagent posted interim comment).
+        if e.code == 409 and (e.body or {}).get("error") == "claude_self_reply_blocked" and evidence_url:
+            evd_result = handle_attach_evidence_url(proj_id, hub_url, task_id, evidence_url, evidence_filename)
+            return {
+                "ok": evd_result.get("ok", False),
+                "task_id": task_id,
+                "m190_blocked": True,
+                "evidence_attached": evd_result.get("ok", False),
+                "note": (
+                    "M190: conv[-1] is already claude — append_message blocked. "
+                    "evidence_url was saved via separate PATCH. "
+                    "Stone stays in current status; user must re-queue or the next turn will complete it."
+                ),
+            }
         return {"ok": False, **(e.body or {})}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -947,6 +975,42 @@ def handle_reply_to_stone(proj_id: str, hub_url: str, task_id: str, message: str
         return {"ok": False, "error": str(e)}
 
 
+def _extract_facts_preamble(proj_id: str) -> str:
+    """M168: Extract ## FACTS key=value lines from project MEMORY.md and return as read-only preamble."""
+    try:
+        # Resolve project memory path: ~/.claude/projects/<cwd-as-dashes>/memory/MEMORY.md
+        # proj_id is e.g. "FromScratch" — map to cwd via HOME
+        home = Path.home()
+        # Try direct path derivation from common project layout
+        candidates = [
+            home / ".claude" / "projects" / f"-home-{home.name}-Project-{proj_id}" / "memory" / "MEMORY.md",
+        ]
+        memory_path = next((p for p in candidates if p.exists()), None)
+        if not memory_path:
+            return ""
+        text = memory_path.read_text(encoding="utf-8")
+        # Extract lines between ## FACTS header and next ## header
+        in_facts = False
+        fact_lines = []
+        for line in text.splitlines():
+            if re.match(r"^## FACTS", line):
+                in_facts = True
+                continue
+            if in_facts:
+                if line.startswith("## "):
+                    break
+                stripped = line.strip()
+                # Only keep key=value lines (no markdown comments, no blank lines)
+                if stripped and not stripped.startswith("<!--") and "=" in stripped and not stripped.startswith("-"):
+                    fact_lines.append(stripped)
+        if not fact_lines:
+            return ""
+        facts_block = "\n".join(fact_lines)
+        return f"<!-- FACT STORE (M168 — READ-ONLY, do not re-state in next compaction) -->\n{facts_block}\n<!-- END FACT STORE -->\n\n"
+    except Exception:
+        return ""
+
+
 def handle_attach_artifact(
     proj_id: str, hub_url: str, task_id: str,
     summary: str = ""
@@ -960,8 +1024,16 @@ def handle_attach_artifact(
         return {"ok": False, "error": f"summary too short ({s_len} chars) — minimum 100 chars required"}
     if s_len > 8000:
         return {"ok": False, "error": f"summary too long ({s_len} chars) — maximum 8000 chars; condense further"}
+    # M1957: fetch stone via list endpoint (single-item /milestones/{id} returns 405).
+    # Used for: (a) proportional-length check, (b) old ‖ new summary merge.
+    stone_data: dict = {}
     try:
-        stone_data = _hub_request(f"{hub_url}/api/northstar/{proj_id}/milestones/{task_id}")
+        _all = _hub_request(f"{hub_url}/api/northstar/{proj_id}/milestones")
+        _all_items = _all if isinstance(_all, list) else _all.get("milestones", [])
+        stone_data = next((m for m in _all_items if m.get("id") == task_id), {})
+    except Exception:
+        pass
+    try:
         conv = stone_data.get("conversation") or []
         conv_text = " ".join((m.get("text") or "") for m in conv if isinstance(m, dict))
         if conv_text:
@@ -973,7 +1045,44 @@ def handle_attach_artifact(
                 )}
     except Exception:
         pass
-    patch["conversation_summary"] = summary
+    # M168: prepend FACTS block from project MEMORY.md as read-only preamble.
+    # This ensures key=value env facts survive future compaction cycles unchanged.
+    facts_preamble = _extract_facts_preamble(proj_id)
+    # M1957: merge with previous conversation_summary so early-cycle decisions aren't lost.
+    # Pattern mirrors M819 server-side compress (old ‖ new). Without this, each compress
+    # cycle completely overwrites the prior AI summary — context from summary_A is gone
+    # once summary_B is written, even though the raw conv entries it described are also gone.
+    # M1979-fix: when merged chain exceeds cap, return error instructing Claude to re-compress
+    # the full merged text down to the target size. This preserves semantic content via LLM
+    # compression rather than dropping oldest segments (lossy context loss).
+    _MERGE_CAP = 8000
+    try:
+        _prev_summary = (stone_data.get("conversation_summary") or "").strip()
+        # Strip leading FACT STORE preamble from prev summary before merging (will be re-prepended)
+        if _prev_summary.startswith("<!-- FACT STORE"):
+            _end_marker = "<!-- END FACT STORE -->"
+            _end_idx = _prev_summary.find(_end_marker)
+            if _end_idx != -1:
+                _prev_summary = _prev_summary[_end_idx + len(_end_marker):].strip()
+        if _prev_summary and _prev_summary != summary.strip():
+            _merged = _prev_summary + " ‖ " + summary.strip()
+            if len(_merged) > _MERGE_CAP:
+                # Do NOT drop segments — instruct Claude to re-compress intelligently.
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Merged summary ({len(_merged)} chars) exceeds {_MERGE_CAP} char cap. "
+                        f"Re-compress the following combined history into a single coherent summary "
+                        f"under {_MERGE_CAP - 500} chars, preserving key decisions and context. "
+                        f"Then call compress_summary again with your re-compressed text."
+                    ),
+                    "previous_summary": _merged,
+                }
+            summary = _merged
+    except Exception:
+        pass
+    stored_summary = (facts_preamble + summary) if facts_preamble else summary
+    patch["conversation_summary"] = stored_summary
     patch["summary_state_bump"] = True
     try:
         result = _hub_request(
@@ -1025,9 +1134,13 @@ def handle_attach_artifact(
                         pass
         except Exception:
             pass
-        # M1633-fix: signal idle so _dispatch_blocking can fire for next queued stone.
-        # compress_summary has no report_task_complete call, so busy state was never cleared.
-        _post_busy(proj_id, hub_url, False, "task_complete")
+        # M1919-fix: _post_busy(False) removed. It fired BEFORE the session's turn ended,
+        # making the poller see idle + claimable stones and dispatch a second session to
+        # claim the same parent stone while the compress session was still processing
+        # get_pending_task(should_exit). Stop hook (northstar-stop-idle.py) already sends
+        # busy=false/agent_stopped when the turn truly ends — no duplicate idle signal needed.
+        # M1633 concern (compress_summary never calls report_task_complete → busy never cleared):
+        # moot because Stop always fires after any MCP call returns.
         return {"ok": result.get("ok", False), "task_id": task_id}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -1052,17 +1165,23 @@ def handle_get_task_details(proj_id: str, hub_url: str, task_id: str) -> dict:
 
 def handle_create_child_stone(
     proj_id: str, hub_url: str,
-    parent_id: str, text: str, status: str = "queued"
+    parent_id: str, text: str, status: str = "queued",
+    is_progress: bool = False,
 ) -> dict:
-    """M1137: Create a child stone via the hub POST /milestones API."""
+    """M1137: Create a child stone via the hub POST /milestones API.
+    M1907: is_progress=True marks mid-flight M190-bypass progress updates — status forced to
+    pending_confirmation so free-pool sessions don't claim it."""
     try:
-        valid_statuses = {"queued", "pending", "needs_clarification"}
-        if status not in valid_statuses:
+        valid_statuses = {"queued", "pending", "needs_clarification", "pending_confirmation"}
+        if is_progress:
+            status = "pending_confirmation"  # M1907: progress children must not enter free-pool queue
+        elif status not in valid_statuses:
             status = "queued"
         body = {
             "parent_id": parent_id,
             "text": text,
             "status": status,
+            "is_progress": is_progress,
         }
         result = _hub_request(
             f"{hub_url}/api/northstar/{proj_id}/milestones",
@@ -1227,6 +1346,7 @@ def main():
                         parent_id=tool_args.get("parent_id", ""),
                         text=tool_args.get("text", ""),
                         status=tool_args.get("status", "queued"),
+                        is_progress=bool(tool_args.get("is_progress", False)),
                     )
                 elif tool_name == "report_busy_state":
                     result = handle_report_busy_state(
