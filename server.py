@@ -15020,38 +15020,74 @@ def _hub_install_global():
     _hub_generate_litellm_config()  # M1925: generate ~/.hub-litellm.yaml if absent
     _hub_deploy_hooks()
     _hub_generate_systemd_unit()
-    # M1925: OpenRouter setup guidance
-    env_file = Path.home() / ".config" / "hub" / "env"
-    or_key_set = False
-    try:
-        or_key_set = bool(
-            next((l for l in env_file.read_text().splitlines()
-                  if l.startswith("OPENROUTER_API_KEY=") and not l.startswith("#")), None)
-        )
-    except Exception:
-        pass
-    if not or_key_set:
-        print(
-            "\n── OpenRouter setup (optional) ─────────────────────────────────────────────\n"
-            "  To enable or-* models (or-kimi-k2, or-grok-3, or-gemini-flash, …):\n\n"
-            f"  1. Add your key to {env_file}:\n"
-            "       OPENROUTER_API_KEY=sk-or-v1-...\n\n"
-            "  2. Install LiteLLM proxy:\n"
-            "       pip install litellm\n\n"
-            "  3. Hub auto-starts the proxy on port 4100 using ~/.hub-litellm.yaml\n"
-            "     (generated above). No manual proxy management needed.\n"
-            "─────────────────────────────────────────────────────────────────────────────\n"
-        )
-    else:
-        import shutil as _shutil
-        litellm_ok = bool(_shutil.which("litellm"))
-        print(
-            "\n── OpenRouter ──────────────────────────────────────────────────────────────\n"
-            f"  OPENROUTER_API_KEY: ✅ set in {env_file}\n"
-            f"  litellm CLI:        {'✅ found' if litellm_ok else '❌ not found — run: pip install litellm'}\n"
-            "─────────────────────────────────────────────────────────────────────────────\n"
-        )
+    # M1925: OpenRouter interactive setup
+    _hub_setup_openrouter_key()
     print("\n⚠  Restart Claude Code now to activate MCP + hooks: close all Claude Code windows and reopen.\n")
+
+
+def _hub_setup_openrouter_key():
+    """M1925-b: Prompt for OPENROUTER_API_KEY interactively during install-global.
+    - Reads current ~/.config/hub/env; skips if key already set (active, not commented).
+    - TTY-gated: non-interactive environments (CI, piped) skip silently.
+    - Writes the key as an uncommented active line; removes any existing placeholder comment.
+    - Never stores a key that looks like a template (contains '...' or 'sk-or-v1-..')."""
+    import shutil as _shutil
+    import sys as _sys
+    env_file = Path.home() / ".config" / "hub" / "env"
+
+    # Check if already set
+    try:
+        env_text = env_file.read_text(encoding="utf-8")
+    except Exception:
+        env_text = ""
+    active_key = next(
+        (l.split("=", 1)[1].strip() for l in env_text.splitlines()
+         if l.startswith("OPENROUTER_API_KEY=") and not l.startswith("#")),
+        None
+    )
+    litellm_ok = bool(_shutil.which("litellm"))
+
+    print("\n── OpenRouter setup (optional) ─────────────────────────────────────────────")
+    if active_key:
+        masked = active_key[:12] + "..." + active_key[-4:] if len(active_key) > 16 else "****"
+        print(f"  OPENROUTER_API_KEY: ✅ already set ({masked})")
+        print(f"  litellm CLI:        {'✅ found' if litellm_ok else '❌ not found — run: pip install litellm'}")
+        print("─────────────────────────────────────────────────────────────────────────────\n")
+        return
+
+    # Non-interactive: skip prompt
+    if not _sys.stdin.isatty():
+        print(f"  Skipped (non-interactive). Set OPENROUTER_API_KEY in {env_file} manually.")
+        print("─────────────────────────────────────────────────────────────────────────────\n")
+        return
+
+    print("  Enable or-* models (or-kimi-k2, or-grok-3, or-gemini-flash, …)")
+    print("  Get a key at: https://openrouter.ai/keys")
+    try:
+        entered = input("  Enter OpenRouter API key (sk-or-...) or press Enter to skip: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        entered = ""
+
+    if not entered or "..." in entered or entered == "sk-or-v1-..":
+        print("  Skipped — add OPENROUTER_API_KEY manually to:")
+        print(f"    {env_file}")
+        print("─────────────────────────────────────────────────────────────────────────────\n")
+        return
+
+    if not entered.startswith("sk-or-"):
+        print(f"  ⚠  Key doesn't start with 'sk-or-' — saved anyway, but verify it's correct.")
+
+    # Write: remove old placeholder comment, append active key
+    lines = [l for l in env_text.splitlines()
+             if not l.startswith("#OPENROUTER_API_KEY=") and not l.startswith("OPENROUTER_API_KEY=")]
+    lines.append(f"OPENROUTER_API_KEY={entered}")
+    env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"  ✅ OPENROUTER_API_KEY saved to {env_file}")
+    if not litellm_ok:
+        print("  Next: pip install litellm  (hub auto-starts proxy on restart)")
+    else:
+        print("  ✅ litellm installed — restart hub to activate OpenRouter models")
+    print("─────────────────────────────────────────────────────────────────────────────\n")
 
 
 # ── M561: Data collection consent ─────────────────────────────────────────────
