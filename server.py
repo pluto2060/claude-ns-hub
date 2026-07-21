@@ -5342,7 +5342,17 @@ def _get_project_spawn_env(proj_id: str, override_model: str = None) -> dict:
         }
     if model in _OPENROUTER_MODELS:
         # Route to LiteLLM proxy — rewrite or-* to openrouter-* to match proxy's exposed IDs
-        or_key = os.environ.get("OPENROUTER_API_KEY", _OSK_PROXY_KEY)
+        or_key = os.environ.get("OPENROUTER_API_KEY", "")
+        if not or_key:
+            # Hub may have started before key was written; read env file dynamically
+            _env_file = Path.home() / ".config" / "hub" / "env"
+            if _env_file.exists():
+                for _line in _env_file.read_text(encoding="utf-8").splitlines():
+                    if _line.startswith("OPENROUTER_API_KEY=") and not _line.startswith("#"):
+                        or_key = _line.split("=", 1)[1].strip()
+                        break
+        if not or_key:
+            or_key = _OSK_PROXY_KEY
         or_model = ("openrouter-" + model[3:]) if model.startswith("or-") else model
         return {
             "CLAUDE_CODE_OAUTH_TOKEN": "",
@@ -8714,6 +8724,31 @@ async def _update_milestone_locked(proj_id: str, mid: str, data: dict, backgroun
                     # M1257: force server time on every append_message so user (browser TZ/CT ISO) and claude (server local) timestamps line up in the chatbox.
                     msg["ts"] = _dt.datetime.now().isoformat()
                     _m1981_skipped_append = False  # set True when Layer A blocks the append
+                    # M1986: identical-comment dedup — block duplicate claude comments within 90s.
+                    # Unlike M190 (blanket consecutive-claude block), this only rejects when the
+                    # incoming text is ≥80% identical to the last claude comment (prefix match on
+                    # first 200 chars). Allows legitimate follow-up comments from long-form tasks
+                    # while stopping retry storms (Layer A, latency, output_check double-fire).
+                    _m1986_conv_pre = m.get("conversation") or []
+                    _m1986_dedup_blocked = False
+                    if msg.get("role") == "claude" and _m1986_conv_pre:
+                        _m1986_last = _m1986_conv_pre[-1]
+                        if isinstance(_m1986_last, dict) and _m1986_last.get("role") == "claude":
+                            _m1986_last_txt = (str(_m1986_last.get("text") or ""))[:200].strip()
+                            _m1986_new_txt = (str(msg.get("text") or ""))[:200].strip()
+                            _m1986_last_ts_str = _m1986_last.get("ts") or ""
+                            _m1986_age = 9999
+                            try:
+                                _m1986_age = (_dt.datetime.now() - _dt.datetime.fromisoformat(_m1986_last_ts_str)).total_seconds()
+                            except Exception:
+                                pass
+                            if _m1986_last_txt and _m1986_new_txt and _m1986_age < 90:
+                                _m1986_sim = sum(a == b for a, b in zip(_m1986_last_txt, _m1986_new_txt)) / max(len(_m1986_last_txt), len(_m1986_new_txt), 1)
+                                if _m1986_sim >= 0.80:
+                                    _m1981_skipped_append = True
+                                    _m1986_dedup_blocked = True
+                                    _server_log_action(proj_id, mid, "warn:comment_dedup_blocked",
+                                                       f"M1986: duplicate claude comment within {_m1986_age:.0f}s sim={_m1986_sim:.2f} skipped")
                     # M1981: Layer A pre-flight — do NOT write the comment when this PATCH will be
                     # blocked for missing evidence_url. Without this guard, every LAYER_A_BLOCKED
                     # retry appends a new duplicate comment (observed: FromScratch M181 × 5 dupes).
